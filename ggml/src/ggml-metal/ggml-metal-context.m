@@ -477,7 +477,47 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     const int n_main = MAX(64, 0.1*gf->n_nodes);
 
     // number of threads in addition to the main thread
-    const int n_cb = ctx->n_cb;
+    int n_cb = ctx->n_cb;
+
+    // ── RX6800 decode scheduling (ported from Basten7/iRon-Llama-RC2) ──
+    // Fold decode-like graphs into a single command buffer: per token the
+    // 2-CB scheme costs an extra commit + a dispatch_apply worker handoff,
+    // which dominates short graphs. A graph is decode-like when its first
+    // MUL_MAT sees a single activation row (ne11 == 1); prefill batches have
+    // ne11 > 1 and keep the parallel-encode path. Opt-in only:
+    //   GGML_METAL_DECODE_SCHED=1
+    //   GGML_METAL_DECODE_STATS=1  (periodic fold counter)
+    {
+        static bool  sched_init = false;
+        static bool  sched_on   = false;
+        static bool  stats_on   = false;
+        static uint64_t calls = 0, folded = 0;
+        if (!sched_init) {
+            sched_init = true;
+            sched_on   = getenv("GGML_METAL_DECODE_SCHED") != NULL;
+            stats_on   = getenv("GGML_METAL_DECODE_STATS")  != NULL;
+        }
+        if (sched_on) {
+            calls++;
+            bool decode_like = false;
+            for (int i = 0; i < gf->n_nodes; i++) {
+                struct ggml_tensor * t = gf->nodes[i];
+                if (t->op == GGML_OP_MUL_MAT && t->src[1]) {
+                    // first batched matmul reveals the token count of this pass
+                    decode_like = (t->src[1]->ne[1] == 1);
+                    break;
+                }
+            }
+            if (decode_like) {
+                folded++;
+                n_cb = 0;   // single command buffer: existing n_cb==0 path below
+            }
+            if (stats_on && (calls % 512) == 0) {
+                GGML_LOG_INFO("%s: decode_sched graphs=%llu folded=%llu\n", __func__,
+                              (unsigned long long) calls, (unsigned long long) folded);
+            }
+        }
+    }
 
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
@@ -492,8 +532,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     @autoreleasepool {
         ctx->gf = gf;
 
-        if (ctx->n_cb == 0) {
+        if (n_cb == 0) {
             // single-threaded encoding: the whole graph is encoded by one command buffer
+            // (ctx->n_cb==0 config, or decode-folded via GGML_METAL_DECODE_SCHED above)
             ctx->n_nodes_0      = gf->n_nodes;
             ctx->n_nodes_1      = 0;
             ctx->n_nodes_per_cb = 0;
@@ -501,7 +542,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             ctx->n_nodes_0      = MIN(n_main, gf->n_nodes);
             ctx->n_nodes_1      = gf->n_nodes - ctx->n_nodes_0;
 
-            ctx->n_nodes_per_cb = (ctx->n_nodes_1 + ctx->n_cb - 1) / ctx->n_cb;
+            ctx->n_nodes_per_cb = (ctx->n_nodes_1 + n_cb - 1) / n_cb;
         }
 
         if (ctx->capture_compute >= 0) {
@@ -730,7 +771,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         int idx_start = 0;
         int idx_end   = n_nodes_0;
 
-        if (cb_idx < n_cb_l) {
+        // n_nodes_1 == 0 -> single-CB mode (ctx->n_cb==0 config or decode fold):
+        // the whole graph lives in [0, n_nodes_0), there is no worker range.
+        if (n_nodes_1 > 0 && cb_idx < n_cb_l) {
             idx_start = n_nodes_0 + (                                         (cb_idx + 0) * n_nodes_per_cb);
             idx_end   = n_nodes_0 + (MIN((cb_idx == n_cb_l - 1) ? n_nodes_1 : (cb_idx + 1) * n_nodes_per_cb, n_nodes_1));
         }
