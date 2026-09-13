@@ -1782,6 +1782,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 default:
                     return false;
             }
+            // upstream gate keeps FA off on AMD dGPUs (no Apple7 simdgroup-mm);
+            // RC2 proved the tiled kernels run on RDNA2, so allow an opt-in
+            // experiment via GGML_METAL_FA_ENABLE_AMD=1
+            if (!has_simdgroup_mm) {
+                const char * fa_amd = getenv("GGML_METAL_FA_ENABLE_AMD");
+                if (fa_amd && fa_amd[0] && fa_amd[0] != '0') {
+                    return true;
+                }
+            }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_LIGHTNING_INDEXER:
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK ||

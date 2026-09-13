@@ -2859,6 +2859,20 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// ── RX6800 FA experiment (ported idea from Basten7/iRon-Llama-RC2) ──
+// Upstream gates FLASH_ATTN_EXT on has_simdgroup_mm (Apple7+), which keeps it
+// permanently off on AMD dGPUs. RC2 proved the tiled FA kernels do run on
+// RDNA2 (W6800X) with a nsg=8 heuristic. Opt-in experiment:
+//   GGML_METAL_FA_ENABLE_AMD=1  -> opens the gate and forces the tiled path
+static bool ggml_metal_fa_amd_experiment(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * val = getenv("GGML_METAL_FA_ENABLE_AMD");
+        cached = (val && val[0] && val[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -3051,7 +3065,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
         return res;
     }
 
-    const bool is_vec = ggml_metal_op_flash_attn_ext_use_vec(op);
+    const bool is_vec = ggml_metal_op_flash_attn_ext_use_vec(op) && !ggml_metal_fa_amd_experiment();
 
     // this optimization is not useful for the vector kernels
     // note: always reserve the blk buffer to avoid graph reallocations
@@ -3219,7 +3233,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     // sparse path: gather the finite mask entries into index lists and run the vec kernels over them
     const int n_kv_max_sparse = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
-    const bool use_sparse = n_kv_max_sparse > 0;
+    const bool use_sparse = n_kv_max_sparse > 0 && !ggml_metal_fa_amd_experiment();
     const int n_kv_max_padded = use_sparse ? GGML_PAD(n_kv_max_sparse, OP_FLASH_ATTN_EXT_VEC_NCPSG) : 0;
 
     // the vec kernels dequantize the KV inline; no need for the F16 dequant pass in the sparse path
@@ -3328,7 +3342,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    if (!use_sparse && !ggml_metal_op_flash_attn_ext_use_vec(op)) {
+    const bool fa_amd = ggml_metal_fa_amd_experiment();
+
+    if (!use_sparse && (!ggml_metal_op_flash_attn_ext_use_vec(op) || fa_amd)) {
         // half8x8 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG; // cache values per simdgroup
@@ -3440,6 +3456,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // simdgroups per threadgroup (a.k.a. warps)
         //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
         int32_t nsg = ne00 >= 512 ? 8 : 4;
+        // RC2 AMD heuristic: more simdgroups help when the KV cache is deep
+        if (ggml_metal_fa_amd_experiment() && nsg < 8 && ne11 >= 8*ncpsg &&
+            FATTN_SMEM(8) <= props_dev->max_theadgroup_memory_size) {
+            nsg = 8;
+        }
 
         const size_t smem = FATTN_SMEM(nsg);
 

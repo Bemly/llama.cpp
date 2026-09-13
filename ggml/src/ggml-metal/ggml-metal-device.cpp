@@ -932,6 +932,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     suffix = "_short";
                 } else {
                     nsg = std::min(4, (ne00 + 127) / 128);
+                    {
+                        char env_decode[64], env_pp[64], env_global[64];
+                        const char * tn = ggml_type_name(tsrc0);
+                        char tu[8];
+                        for (int ci = 0; tn[ci] && ci < 7; ci++) {
+                            tu[ci] = (char) ((tn[ci] >= 'a' && tn[ci] <= 'z') ? tn[ci] - 32 : tn[ci]);
+                        }
+                        tu[strlen(tn) < 8 ? strlen(tn) : 7] = 0;
+                        snprintf(env_decode, 63, "GGML_METAL_DECODE_%s_NSG", tu);
+                        snprintf(env_pp,     63, "GGML_METAL_PP_%s_NSG",     tu);
+                        snprintf(env_global, 63, "GGML_METAL_%s_NSG",        tu);
+                        nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                        env_decode, env_pp, env_global,
+                                                        nsg, 1, 8);
+                    }
                     nr0 = 2;
                     nr1 = 1;
                     smem = 32*sizeof(float)*nr0;
@@ -1306,6 +1321,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         case GGML_TYPE_BF16:
             {
                 nsg = std::min(4, (ne00 + 127) / 128);
+                    {
+                        char env_decode[64], env_pp[64], env_global[64];
+                        const char * tn = ggml_type_name(tsrc0);
+                        char tu[8];
+                        for (int ci = 0; tn[ci] && ci < 7; ci++) {
+                            tu[ci] = (char) ((tn[ci] >= 'a' && tn[ci] <= 'z') ? tn[ci] - 32 : tn[ci]);
+                        }
+                        tu[strlen(tn) < 8 ? strlen(tn) : 7] = 0;
+                        snprintf(env_decode, 63, "GGML_METAL_DECODE_%s_NSG", tu);
+                        snprintf(env_pp,     63, "GGML_METAL_PP_%s_NSG",     tu);
+                        snprintf(env_global, 63, "GGML_METAL_%s_NSG",        tu);
+                        nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                        env_decode, env_pp, env_global,
+                                                        nsg, 1, 8);
+                    }
                 nr0 = 2;
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0;
