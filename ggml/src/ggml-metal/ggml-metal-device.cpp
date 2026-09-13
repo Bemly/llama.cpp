@@ -6,6 +6,8 @@
 #include "ggml-impl.h"
 
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -821,8 +823,77 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+// RX 6800 (Navi21) tile tuning. Runtime mirror of the GGML_METAL_GPU_RX6800
+// shader macro, keeps host nr0/smem consistent with the compiled kernel.
+static bool ggml_metal_is_rx6800(ggml_metal_library_t lib) {
+    const auto * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+    return props && props->desc[0] && strstr(props->desc, "RX 6800") != nullptr;
+}
+
+static int ggml_metal_env_int(const char * name, int dflt, int lo, int hi) {
+    if (const char * env = getenv(name)) {
+        const int v = atoi(env);
+        if (v >= lo && v <= hi) {
+            return v;
+        }
+    }
+    return dflt;
+}
+
+// ── RX6800 phase-aware NR0/NSG env knobs (ported from Basten7/iRon-Llama-RC2) ──
+// decode-like = mat-vec shape (ne11==1) with light aux batching (ne12*ne13 <= 8);
+// everything else counts as prefill. GGML_METAL_DECODE_* / GGML_METAL_PP_* take
+// precedence over the generic GGML_METAL_<TYPE>_* knob.
+static inline const char * ggml_metal_getenv_pref_(const char * env_specific, const char * env_global) {
+    const char * v = getenv(env_specific);
+    if (v && v[0]) {
+        return v;
+    }
+    v = getenv(env_global);
+    if (v && v[0]) {
+        return v;
+    }
+    return NULL;
+}
+
+static inline const char * ggml_metal_getenv_phase_pref_(
+        bool is_decode_like,
+        const char * env_decode,
+        const char * env_pp,
+        const char * env_global) {
+    if (is_decode_like) {
+        return ggml_metal_getenv_pref_(env_decode, env_global);
+    }
+    return ggml_metal_getenv_pref_(env_pp, env_global);
+}
+
+static inline int ggml_metal_env_phase_int_(bool is_decode_like,
+                                            const char * env_decode,
+                                            const char * env_pp,
+                                            const char * env_global,
+                                            int def, int min, int max) {
+    const char * v = ggml_metal_getenv_phase_pref_(is_decode_like, env_decode, env_pp, env_global);
+    if (v && v[0]) {
+        const int n = atoi(v);
+        if (n >= min && n <= max) {
+            return n;
+        }
+    }
+    return def;
+}
+
+// nr0 is baked into the compiled kernel variant (_nr0_4/_nr0_8 in mul_mv.metal).
+static inline int ggml_metal_nr0_variant_(int v_req) {
+    if (v_req >= 8) {
+        return 8;
+    }
+    if (v_req >= 4) {
+        return 4;
+    }
+    return 2;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
     char base[256];
@@ -840,6 +911,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const char * suffix = "";
 
     bool split = false;
+
+    // decode-like detection must match between mul_mv and mul_mv_id so the
+    // GGML_METAL_DECODE_* knobs affect both pipelines identically (RC2 layer 5).
+    const bool is_decode_strict = (ne11 == 1 && ne12 == 1 && ne13 == 1);
+    const int64_t aux_batch     = (int64_t) ne12 * (int64_t) ne13;
+    const bool is_decode_like   = (ne11 == 1 && aux_batch <= 8);
+    (void) is_decode_strict;
 
     // use custom matrix x vector kernel
     switch (tsrc0) {
@@ -872,8 +950,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q4_0:
             {
-                nsg = N_SG_Q4_0;
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q40_NSG",
+                                                "GGML_METAL_PP_Q40_NSG",
+                                                "GGML_METAL_Q40_NSG", N_SG_Q4_0, 1, 8);
                 nr0 = N_R0_Q4_0;
+                const char * env_nr0_q40 = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_Q40_NR0",
+                                                                         "GGML_METAL_PP_Q40_NR0",
+                                                                         "GGML_METAL_Q40_NR0");
+                if (env_nr0_q40 && env_nr0_q40[0] && ggml_metal_nr0_variant_(atoi(env_nr0_q40)) == 4) {
+                    nr0 = 4;
+                    suffix = "_nr0_4";
+                }
             } break;
         case GGML_TYPE_Q4_1:
             {
@@ -882,8 +971,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q5_0:
             {
-                nsg = N_SG_Q5_0;
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q50_NSG",
+                                                "GGML_METAL_PP_Q50_NSG",
+                                                "GGML_METAL_Q50_NSG", N_SG_Q5_0, 1, 8);
                 nr0 = N_R0_Q5_0;
+                const char * env_nr0_q50 = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_Q50_NR0",
+                                                                         "GGML_METAL_PP_Q50_NR0",
+                                                                         "GGML_METAL_Q50_NR0");
+                if (env_nr0_q50 && env_nr0_q50[0] && ggml_metal_nr0_variant_(atoi(env_nr0_q50)) == 4) {
+                    nr0 = 4;
+                    suffix = "_nr0_4";
+                }
             } break;
         case GGML_TYPE_Q5_1:
             {
@@ -892,9 +992,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q8_0:
             {
-                nsg = N_SG_Q8_0;
-                nr0 = N_R0_Q8_0;
-                smem = 32*sizeof(float)*N_R0_Q8_0;
+                // RX6800: nr0=4 helps PP (+27%) but hurts TG (-9%) -> split by phase.
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q8_NSG",
+                                                "GGML_METAL_PP_Q8_NSG",
+                                                "GGML_METAL_Q8_NSG", N_SG_Q8_0, 1, 8);
+                nr0 = 2;
+                const char * env_nr0_q8 = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                        "GGML_METAL_DECODE_Q8_NR0",
+                                                                        "GGML_METAL_PP_Q8_NR0",
+                                                                        "GGML_METAL_Q8_NR0");
+                if (env_nr0_q8 && env_nr0_q8[0] && ggml_metal_nr0_variant_(atoi(env_nr0_q8)) == 4) {
+                    nr0 = 4;
+                    suffix = "_nr0_4";
+                }
+                smem = 32*sizeof(float)*nr0;
             } break;
         case GGML_TYPE_MXFP4:
             {
@@ -914,8 +1026,34 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q4_K:
             {
-                nsg = N_SG_Q4_K;
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q4K_NSG",
+                                                "GGML_METAL_PP_Q4K_NSG",
+                                                "GGML_METAL_Q4K_NSG", N_SG_Q4_K, 1, 8);
                 nr0 = N_R0_Q4_K;
+                const char * env_nr0_q4k = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_Q4K_NR0",
+                                                                         "GGML_METAL_PP_Q4K_NR0",
+                                                                         "GGML_METAL_Q4K_NR0");
+                if (env_nr0_q4k && env_nr0_q4k[0]) {
+                    nr0 = ggml_metal_nr0_variant_(atoi(env_nr0_q4k));
+                    suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                }
+                // RC2 safety clamp: keep the variant compatible with tiny rows
+                if (nsg < 1) {
+                    nsg = 1;
+                }
+                if (nr0 < 2) {
+                    nr0 = 2;
+                }
+                const int max_nr0 = (int) (ne00 / nsg);
+                if (max_nr0 >= 2) {
+                    const int nr0_clamped = ggml_metal_nr0_variant_(max_nr0);
+                    if (nr0 > nr0_clamped) {
+                        nr0 = nr0_clamped;
+                        suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                    }
+                }
             } break;
         case GGML_TYPE_Q5_K:
             {
@@ -924,8 +1062,33 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q6_K:
             {
-                nsg = N_SG_Q6_K;
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q6K_NSG",
+                                                "GGML_METAL_PP_Q6K_NSG",
+                                                "GGML_METAL_Q6K_NSG", N_SG_Q6_K, 1, 8);
                 nr0 = N_R0_Q6_K;
+                const char * env_nr0_q6k = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_Q6K_NR0",
+                                                                         "GGML_METAL_PP_Q6K_NR0",
+                                                                         "GGML_METAL_Q6K_NR0");
+                if (env_nr0_q6k && env_nr0_q6k[0]) {
+                    nr0 = ggml_metal_nr0_variant_(atoi(env_nr0_q6k));
+                    suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                }
+                if (nsg < 1) {
+                    nsg = 1;
+                }
+                if (nr0 < 2) {
+                    nr0 = 2;
+                }
+                const int max_nr0_q6k = (int) (ne00 / nsg);
+                if (max_nr0_q6k >= 2) {
+                    const int nr0_clamped = ggml_metal_nr0_variant_(max_nr0_q6k);
+                    if (nr0 > nr0_clamped) {
+                        nr0 = nr0_clamped;
+                        suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                    }
+                }
             } break;
         case GGML_TYPE_IQ2_XXS:
             {
@@ -1129,6 +1292,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     bool split = false;
 
+    // decode-like detection must match between mul_mv and mul_mv_id so the
+    // GGML_METAL_DECODE_* knobs affect both pipelines identically (RC2 layer 5).
+    const bool is_decode_strict = (ne11 == 1 && ne12 == 1 && ne13 == 1);
+    const int64_t aux_batch     = (int64_t) ne12 * (int64_t) ne13;
+    const bool is_decode_like   = (ne11 == 1 && aux_batch <= 8);
+    (void) is_decode_strict;
+
         // use custom matrix x vector kernel
     switch (tsrc0) {
         case GGML_TYPE_F32:
@@ -1153,8 +1323,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_Q4_0:
             {
-                nsg = N_SG_Q4_0;
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q40_NSG",
+                                                "GGML_METAL_PP_Q40_NSG",
+                                                "GGML_METAL_Q40_NSG", N_SG_Q4_0, 1, 8);
                 nr0 = N_R0_Q4_0;
+                const char * env_nr0_q40 = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_Q40_NR0",
+                                                                         "GGML_METAL_PP_Q40_NR0",
+                                                                         "GGML_METAL_Q40_NR0");
+                if (env_nr0_q40 && env_nr0_q40[0] && ggml_metal_nr0_variant_(atoi(env_nr0_q40)) == 4) {
+                    nr0 = 4;
+                    suffix = "_nr0_4";
+                }
             } break;
         case GGML_TYPE_Q4_1:
             {
@@ -1163,8 +1344,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_Q5_0:
             {
-                nsg = N_SG_Q5_0;
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q50_NSG",
+                                                "GGML_METAL_PP_Q50_NSG",
+                                                "GGML_METAL_Q50_NSG", N_SG_Q5_0, 1, 8);
                 nr0 = N_R0_Q5_0;
+                const char * env_nr0_q50 = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_Q50_NR0",
+                                                                         "GGML_METAL_PP_Q50_NR0",
+                                                                         "GGML_METAL_Q50_NR0");
+                if (env_nr0_q50 && env_nr0_q50[0] && ggml_metal_nr0_variant_(atoi(env_nr0_q50)) == 4) {
+                    nr0 = 4;
+                    suffix = "_nr0_4";
+                }
             } break;
         case GGML_TYPE_Q5_1:
             {
@@ -1173,9 +1365,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_Q8_0:
             {
-                nsg = N_SG_Q8_0;
-                nr0 = N_R0_Q8_0;
-                smem = 32*sizeof(float)*N_R0_Q8_0;
+                // RX6800: nr0=4 helps PP (+27%) but hurts TG (-9%) -> split by phase.
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q8_NSG",
+                                                "GGML_METAL_PP_Q8_NSG",
+                                                "GGML_METAL_Q8_NSG", N_SG_Q8_0, 1, 8);
+                nr0 = 2;
+                const char * env_nr0_q8 = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                        "GGML_METAL_DECODE_Q8_NR0",
+                                                                        "GGML_METAL_PP_Q8_NR0",
+                                                                        "GGML_METAL_Q8_NR0");
+                if (env_nr0_q8 && env_nr0_q8[0] && ggml_metal_nr0_variant_(atoi(env_nr0_q8)) == 4) {
+                    nr0 = 4;
+                    suffix = "_nr0_4";
+                }
+                smem = 32*sizeof(float)*nr0;
             } break;
         case GGML_TYPE_MXFP4:
             {
@@ -1195,8 +1399,34 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_Q4_K:
             {
-                nsg = N_SG_Q4_K;
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q4K_NSG",
+                                                "GGML_METAL_PP_Q4K_NSG",
+                                                "GGML_METAL_Q4K_NSG", N_SG_Q4_K, 1, 8);
                 nr0 = N_R0_Q4_K;
+                const char * env_nr0_q4k = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_Q4K_NR0",
+                                                                         "GGML_METAL_PP_Q4K_NR0",
+                                                                         "GGML_METAL_Q4K_NR0");
+                if (env_nr0_q4k && env_nr0_q4k[0]) {
+                    nr0 = ggml_metal_nr0_variant_(atoi(env_nr0_q4k));
+                    suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                }
+                // RC2 safety clamp: keep the variant compatible with tiny rows
+                if (nsg < 1) {
+                    nsg = 1;
+                }
+                if (nr0 < 2) {
+                    nr0 = 2;
+                }
+                const int max_nr0 = (int) (ne00 / nsg);
+                if (max_nr0 >= 2) {
+                    const int nr0_clamped = ggml_metal_nr0_variant_(max_nr0);
+                    if (nr0 > nr0_clamped) {
+                        nr0 = nr0_clamped;
+                        suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                    }
+                }
             } break;
         case GGML_TYPE_Q5_K:
             {
@@ -1205,8 +1435,33 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_Q6_K:
             {
-                nsg = N_SG_Q6_K;
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_Q6K_NSG",
+                                                "GGML_METAL_PP_Q6K_NSG",
+                                                "GGML_METAL_Q6K_NSG", N_SG_Q6_K, 1, 8);
                 nr0 = N_R0_Q6_K;
+                const char * env_nr0_q6k = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_Q6K_NR0",
+                                                                         "GGML_METAL_PP_Q6K_NR0",
+                                                                         "GGML_METAL_Q6K_NR0");
+                if (env_nr0_q6k && env_nr0_q6k[0]) {
+                    nr0 = ggml_metal_nr0_variant_(atoi(env_nr0_q6k));
+                    suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                }
+                if (nsg < 1) {
+                    nsg = 1;
+                }
+                if (nr0 < 2) {
+                    nr0 = 2;
+                }
+                const int max_nr0_q6k = (int) (ne00 / nsg);
+                if (max_nr0_q6k >= 2) {
+                    const int nr0_clamped = ggml_metal_nr0_variant_(max_nr0_q6k);
+                    if (nr0 > nr0_clamped) {
+                        nr0 = nr0_clamped;
+                        suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                    }
+                }
             } break;
         case GGML_TYPE_IQ2_XXS:
             {

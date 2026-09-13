@@ -40,6 +40,13 @@
 #define N_SG_Q5_1 2
 
 #define N_R0_Q8_0 2
+// RX 6800 verdict (0.8B-Q8 bench, same tree): nr0=4 gives +27% pp but -9% tg
+// vs nr0=2, so default stays 2. Flip to 1 to re-test (needs rebuild + matching
+// host helper below).
+#if defined(GGML_METAL_GPU_RX6800) && 0
+#undef N_R0_Q8_0
+#define N_R0_Q8_0 4
+#endif
 #define N_SG_Q8_0 4
 
 #define N_R0_MXFP4 2
