@@ -1,5 +1,6 @@
 #import "ggml-metal-device.h"
 #import "ggml-metal-fusion.h"
+#import "ggml-metal-ops.h"
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
@@ -111,6 +112,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
 //   ggml_metallib_<name>_{start,end} embed-symbol stem.
 #define GGML_METAL_LIBS \
     X(FA,              fa)             \
+    X(FA_AMD,          fa_amd)         \
     X(MUL_MV,          mul_mv)         \
     X(MUL_MM,          mul_mm)         \
     X(QUANTIZE,        quantize)       \
@@ -1783,9 +1785,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             // upstream gate keeps FA off on AMD dGPUs (no Apple7 simdgroup-mm);
-            // RC2 proved the tiled kernels run on RDNA2, so allow an opt-in
-            // experiment via GGML_METAL_FA_ENABLE_AMD=1
+            // FA-RDNA2: 自研 AMD 向量化 kernel（env GGML_METAL_FA_AMD=1），覆盖时优先接管
             if (!has_simdgroup_mm) {
+                if (ggml_metal_op_flash_attn_ext_amd_supported(op)) {
+                    return true;
+                }
+                // RC2 解禁实验（负优化定论，留档）：GGML_METAL_FA_ENABLE_AMD=1 强制上游 tile 路径
                 const char * fa_amd = getenv("GGML_METAL_FA_ENABLE_AMD");
                 if (fa_amd && fa_amd[0] && fa_amd[0] != '0') {
                     return true;

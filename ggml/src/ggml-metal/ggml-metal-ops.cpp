@@ -2873,6 +2873,293 @@ static bool ggml_metal_fa_amd_experiment(void) {
     return cached == 1;
 }
 
+// ── RX6800 FA-RDNA2 自研 kernel（kernels/fa_amd.metal）───────────────────────
+// env 总开关 GGML_METAL_FA_AMD=1（默认关）。覆盖范围：F16 KV、dk==dv∈{64,128}、
+// 无 sinks/ALiBi/softcap；不满足时回退上游路径（在 AMD 上默认关闭）。
+// 相位旋钮与 ggml-metal-device.cpp 的 RC2 移植同约定：decode-like = nq==1，
+// GGML_METAL_DECODE_FA_* / GGML_METAL_PP_FA_* 优先于通用 GGML_METAL_FA_*。
+
+static bool ggml_metal_fa_amd_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * val = getenv("GGML_METAL_FA_AMD");
+        cached = (val && val[0] && val[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static int ggml_metal_fa_amd_knob(const ggml_tensor * op, const char * key, int def, int mn, int mx) {
+    const bool decode_like = op->src[0]->ne[1] == 1;
+
+    char env[128];
+    for (int pass = 0; pass < 3; ++pass) {
+        if (pass == 0 && !decode_like) continue;
+        if (pass == 1 &&  decode_like) continue;
+        if (pass == 0) {
+            snprintf(env, sizeof(env), "GGML_METAL_DECODE_FA_%s", key);
+        } else if (pass == 1) {
+            snprintf(env, sizeof(env), "GGML_METAL_PP_FA_%s", key);
+        } else {
+            snprintf(env, sizeof(env), "GGML_METAL_FA_%s", key);
+        }
+        const char * v = getenv(env);
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (n >= mn && n <= mx) {
+                return n;
+            }
+        }
+    }
+    return def;
+}
+
+bool ggml_metal_op_flash_attn_ext_amd_supported(const ggml_tensor * op) {
+    if (!ggml_metal_fa_amd_enabled()) {
+        return false;
+    }
+
+    if (op->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+
+    // 仅 F16 KV（dk==dv∈{64,128}）
+    if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    const int64_t dk = op->src[1]->ne[0];
+    const int64_t dv = op->src[2]->ne[0];
+    if (dk != dv || (dk != 64 && dk != 128)) {
+        return false;
+    }
+
+    // sinks / ALiBi bias / softcap 不支持（回退）
+    if (op->src[4] != nullptr) {
+        return false;
+    }
+    {
+        float max_bias      = 0.0f;
+        float logit_softcap = 0.0f;
+        memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(float));
+        memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(float));
+        if (max_bias != 0.0f || logit_softcap != 0.0f) {
+            return false;
+        }
+    }
+
+    // 直读 VRAM 的连续性/行距护栏（half4 / float4 读）
+    if (op->src[0]->nb[0] != 4 || op->src[0]->nb[1] % 16 != 0) return false;   // Q float4 行读
+    if (op->nb[0]        != 4 || op->nb[1]        % 16 != 0) return false;   // dst float4 行写
+    if (op->src[1]->nb[0] != 2 || op->src[1]->nb[1] % 8 != 0) return false;    // K half4
+    if (op->src[2]->nb[0] != 2 || op->src[2]->nb[1] % 8 != 0) return false;    // V half4/half2
+    if (op->src[3] && op->src[3]->nb[0] != 2) return false;                    // mask half 标量
+
+    return true;
+}
+
+// 数据指针在 buffer 内的对齐护栏（half4/float4 直读），不满足则回退
+static bool ggml_metal_op_flash_attn_ext_amd_align_ok(const ggml_tensor * op) {
+    ggml_metal_buffer_id bq = ggml_metal_get_buffer_id(op->src[0]);
+    ggml_metal_buffer_id bk = ggml_metal_get_buffer_id(op->src[1]);
+    ggml_metal_buffer_id bv = ggml_metal_get_buffer_id(op->src[2]);
+    ggml_metal_buffer_id bd = ggml_metal_get_buffer_id(op);
+
+    if ((bq.offs % 16) != 0 || (bd.offs % 16) != 0) return false;
+    if ((bk.offs %  8) != 0 || (bv.offs %  8) != 0) return false;
+
+    return true;
+}
+
+// vec 路径的 kv split 数（0 = 自动）
+static int ggml_metal_op_flash_attn_ext_amd_split_count(const ggml_tensor * op) {
+    const int knob = ggml_metal_fa_amd_knob(op, "SPLIT", 0, 0, 16);
+    if (knob > 0) {
+        return knob;
+    }
+
+    // 自动：目标 ~96 个 threadgroup，保小模型 decode 占用率
+    const int64_t ntg = op->src[0]->ne[2] * op->src[0]->ne[3];
+    int64_t split = 1;
+    while (split < 16 && ntg*split < 96) {
+        split <<= 1;
+    }
+
+    const int64_t nblocks = (op->src[1]->ne[1] + 127)/128;   // NBC=128
+    return (int) MIN(split, MAX(1, nblocks));
+}
+
+size_t ggml_metal_op_flash_attn_ext_extra_amd(const ggml_tensor * op) {
+    if (!ggml_metal_op_flash_attn_ext_amd_supported(op)) {
+        return 0;
+    }
+    if (op->src[0]->ne[1] != 1) {
+        return 0;   // 只有 vec 路径用 split 部分结果缓冲
+    }
+
+    const int64_t dk    = op->src[1]->ne[0];
+    const int     split = ggml_metal_op_flash_attn_ext_amd_split_count(op);
+
+    return op->src[0]->ne[3] * op->src[0]->ne[2] * split * (dk + 2) * sizeof(float);
+}
+
+static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float scale) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    const bool has_mask = op->src[3] != nullptr;
+
+    const int32_t  ne31 = has_mask ? (int32_t) op->src[3]->ne[1] : 0;
+    const int32_t  ne32 = has_mask ? (int32_t) op->src[3]->ne[2] : 0;
+    const int32_t  ne33 = has_mask ? (int32_t) op->src[3]->ne[3] : 0;
+    const uint64_t nb31 = has_mask ? op->src[3]->nb[1] : 0;
+    const uint64_t nb32 = has_mask ? op->src[3]->nb[2] : 0;
+    const uint64_t nb33 = has_mask ? op->src[3]->nb[3] : 0;
+
+    ggml_metal_buffer_id bid_q   = ggml_metal_get_buffer_id(op->src[0]);
+    ggml_metal_buffer_id bid_k   = ggml_metal_get_buffer_id(op->src[1]);
+    ggml_metal_buffer_id bid_v   = ggml_metal_get_buffer_id(op->src[2]);
+    ggml_metal_buffer_id bid_m   = has_mask ? ggml_metal_get_buffer_id(op->src[3]) : bid_q;
+    ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+
+    // split 部分结果缓冲：追加在上游 extra（pad/blk/tmp/kv_f16/idx）之后
+    ggml_metal_buffer_id bid_part = bid_dst;
+    bid_part.offs += ggml_nbytes(op)
+        + ggml_metal_op_flash_attn_ext_extra_pad(op)
+        + ggml_metal_op_flash_attn_ext_extra_blk(op)
+        + ggml_metal_op_flash_attn_ext_extra_tmp(op)
+        + ggml_metal_op_flash_attn_ext_extra_kv_f16(op)
+        + ggml_metal_op_flash_attn_ext_extra_idx(op);
+
+    const int dk = (int) ne10;   // == dv（门控保证）
+
+    if (ne01 == 1) {
+        // ── decode vec 路径：split-k 部分结果 + reduce 合并 ──
+        const int nbc   = ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
+        const int split = ggml_metal_op_flash_attn_ext_amd_split_count(op);
+        const int chunk = (int) GGML_PAD(((uint64_t) ne11 + split - 1)/split, (uint64_t) nbc);
+
+        ggml_metal_kargs_flash_attn_ext_amd args = {
+            /*.ne01    =*/ ne01,
+            /*.ne02    =*/ ne02,
+            /*.ne03    =*/ ne03,
+            /*.nb01    =*/ nb01,
+            /*.nb02    =*/ nb02,
+            /*.nb03    =*/ nb03,
+            /*.ne11    =*/ ne11,
+            /*.ne_12_2 =*/ ne12,
+            /*.ne_12_3 =*/ ne13,
+            /*.nb11    =*/ nb11,
+            /*.nb12    =*/ nb12,
+            /*.nb13    =*/ nb13,
+            /*.nb21    =*/ nb21,
+            /*.nb22    =*/ nb22,
+            /*.nb23    =*/ nb23,
+            /*.ne31    =*/ ne31,
+            /*.ne32    =*/ ne32,
+            /*.ne33    =*/ ne33,
+            /*.nb31    =*/ nb31,
+            /*.nb32    =*/ nb32,
+            /*.nb33    =*/ nb33,
+            /*.split   =*/ split,
+            /*.chunk   =*/ chunk,
+            /*.scale   =*/ scale,
+        };
+
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_vec(lib, dk, nbc, has_mask);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_q,    1);
+        ggml_metal_encoder_set_buffer  (enc, bid_k,    2);
+        ggml_metal_encoder_set_buffer  (enc, bid_v,    3);
+        ggml_metal_encoder_set_buffer  (enc, bid_m,    4);
+        ggml_metal_encoder_set_buffer  (enc, bid_part, 5);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, (nbc + 8)*sizeof(float), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, split, ne02, ne03, 32, 4, 1);
+
+        ggml_metal_op_concurrency_reset(ctx);
+
+        auto pipeline_r = ggml_metal_library_get_pipeline_flash_attn_ext_amd_reduce(lib, dk);
+
+        ggml_metal_kargs_flash_attn_ext_amd_reduce args_r = {
+            /*.ne02  =*/ ne02,
+            /*.ne03  =*/ ne03,
+            /*.nb02  =*/ nb02,
+            /*.nb03  =*/ nb03,
+            /*.split =*/ split,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline_r);
+        ggml_metal_encoder_set_bytes   (enc, &args_r, sizeof(args_r), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_part, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  2);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 0, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne02, ne03, 1, dk/2, 1, 1);
+
+        return 1;
+    }
+
+    // ── prefill tile 路径（NQ=32, NBC=64, tg 256）──
+    ggml_metal_kargs_flash_attn_ext_amd args = {
+        /*.ne01    =*/ ne01,
+        /*.ne02    =*/ ne02,
+        /*.ne03    =*/ ne03,
+        /*.nb01    =*/ nb01,
+        /*.nb02    =*/ nb02,
+        /*.nb03    =*/ nb03,
+        /*.ne11    =*/ ne11,
+        /*.ne_12_2 =*/ ne12,
+        /*.ne_12_3 =*/ ne13,
+        /*.nb11    =*/ nb11,
+        /*.nb12    =*/ nb12,
+        /*.nb13    =*/ nb13,
+        /*.nb21    =*/ nb21,
+        /*.nb22    =*/ nb22,
+        /*.nb23    =*/ nb23,
+        /*.ne31    =*/ ne31,
+        /*.ne32    =*/ ne32,
+        /*.ne33    =*/ ne33,
+        /*.nb31    =*/ nb31,
+        /*.nb32    =*/ nb32,
+        /*.nb33    =*/ nb33,
+        /*.split   =*/ 1,
+        /*.chunk   =*/ 0,
+        /*.scale   =*/ scale,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, has_mask);
+
+    // 与 fa_amd.metal 的 LDS 布局严格一致：kt + sw + mps + lps + mst + cst + lst
+    const size_t smem = (dk/4)*(64 + 1)*8        // kt half4 × (NBC+1) 行距
+        + 32*64*sizeof(float)                    // sw [NQ][NBC]
+        + 32*8*sizeof(float)*2                   // mps + lps
+        + 32*sizeof(float)*3;                    // mst + cst + lst
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_q,   1);
+    ggml_metal_encoder_set_buffer  (enc, bid_k,   2);
+    ggml_metal_encoder_set_buffer  (enc, bid_v,   3);
+    ggml_metal_encoder_set_buffer  (enc, bid_m,   4);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst, 5);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 31)/32, ne02, ne03, 32, 8, 1);
+
+    return 1;
+}
+
+
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -3218,6 +3505,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src4 = has_sinks ? ggml_metal_get_buffer_id(op->src[4]) : bid_src0;
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+
+    // FA-RDNA2：自研 AMD kernel 接管（env GGML_METAL_FA_AMD=1 + 形状/对齐门控）
+    if (ggml_metal_op_flash_attn_ext_amd_supported(op) && ggml_metal_op_flash_attn_ext_amd_align_ok(op)) {
+        return ggml_metal_op_flash_attn_ext_amd(ctx, idx, scale);
+    }
 
     ggml_metal_buffer_id bid_pad = bid_dst;
     bid_pad.offs += ggml_nbytes(op);

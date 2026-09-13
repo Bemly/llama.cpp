@@ -110,6 +110,7 @@
 #define FC_FLASH_ATTN_EXT              300
 #define FC_FLASH_ATTN_EXT_VEC          400
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   500
+#define FC_FLASH_ATTN_EXT_AMD          700
 #define FC_MUL_MV                      600
 #define FC_MUL_MM                      700
 #define FC_ROPE                        800
@@ -490,6 +491,43 @@ typedef struct {
 typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
+
+// ── RX6800 FA-RDNA2 自研 kernel（decode vec + prefill tile 共用参数）──
+// 仅覆盖 F16 KV、dk==dv∈{64,128}、无 sinks/bias/softcap 的形状（host 门控）
+typedef struct {
+    int32_t  ne01;        // nq
+    int32_t  ne02;        // n_head
+    int32_t  ne03;        // n_batch
+    uint64_t nb01;        // Q strides
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;        // n_kv
+    int32_t  ne_12_2;     // n_head_kv (K 与 V 同形)
+    int32_t  ne_12_3;
+    uint64_t nb11;        // K strides
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;        // V strides
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne31;        // mask dims
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb31;        // mask strides
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  split;       // vec: kv split 数
+    int32_t  chunk;       // vec: 每 split 的 kv token 数（NBC 对齐）
+    float    scale;       // attention scale
+} ggml_metal_kargs_flash_attn_ext_amd;
+
+typedef struct {
+    int32_t  ne02;        // n_head
+    int32_t  ne03;        // n_batch
+    uint64_t nb02;        // dst strides
+    uint64_t nb03;
+    int32_t  split;
+} ggml_metal_kargs_flash_attn_ext_amd_reduce;
 
 typedef struct {
     int32_t  ne00;
