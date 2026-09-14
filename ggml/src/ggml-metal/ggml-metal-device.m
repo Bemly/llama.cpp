@@ -1765,7 +1765,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
-                return false;
+                // FA-RDNA2 mixed KV (F16/Q8_0 pairs): only the AMD branch below
+                // takes these; Apple keeps the old behavior. The gate rechecks shapes.
+                if (!(!has_simdgroup_mm && ggml_metal_op_flash_attn_ext_amd_q8_supported(op))) {
+                    return false;
+                }
             }
             switch (op->src[1]->type) {
                 case GGML_TYPE_F32:
