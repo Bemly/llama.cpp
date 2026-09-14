@@ -1787,7 +1787,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             // upstream gate keeps FA off on AMD dGPUs (no Apple7 simdgroup-mm);
             // FA-RDNA2: 自研 AMD 向量化 kernel（env GGML_METAL_FA_AMD=1），覆盖时优先接管
             if (!has_simdgroup_mm) {
-                if (ggml_metal_op_flash_attn_ext_amd_supported(op)) {
+                if (ggml_metal_op_flash_attn_ext_amd_supported(op) ||
+                    ggml_metal_op_flash_attn_ext_amd_q8_supported(op)) {
                     return true;
                 }
                 // RC2 解禁实验（负优化定论，留档）：GGML_METAL_FA_ENABLE_AMD=1 强制上游 tile 路径
