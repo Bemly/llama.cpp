@@ -7,7 +7,7 @@
 //   - KV 免 LDS 直读（IC 命中 ~1.5TB/s 吸收 GQA 重读），decode 每块仅 3 个 barrier；
 //   - decode（nq==1）：split-k 部分结果 + reduce 合并，保小模型占用率；
 //   - prefill（nq>1）：Q tile 32 行/tg，K 块过 LDS，Q/O 全寄存器化。
-// 仅支持：F16 KV、dk==dv∈{64,128}、无 sinks/bias/softcap；其余形状由 host 门控回退。
+// 仅支持：F16 KV、dk==dv∈{64,128,256}（256 为 P1-A 朴素版，nbc=64）、无 sinks/bias/softcap；其余形状由 host 门控回退。
 
 constant bool HAS_MASK_FA_AMD [[function_constant(FC_FLASH_ATTN_EXT_AMD + 0)]];
 
@@ -375,7 +375,7 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
 }
 
 // ─────────────────────────── 模板实例化 ───────────────────────────
-// vec：dk∈{64,128} × nbc∈{64,128}（DV=DK）；tile：dk∈{64,128}，nbc=64，NQ=32；reduce：dv∈{64,128}
+// vec：dk∈{64,128} × nbc∈{64,128}，dk256 仅 nbc64（P1-A 朴素版）；tile：dk∈{64,128,256}，nbc=64，NQ=32；reduce：dv∈{64,128,256}
 
 typedef decltype(kernel_flash_attn_ext_amd_vec_dk<64, 64, 64>)   flash_attn_ext_amd_vec_t;
 typedef decltype(kernel_flash_attn_ext_amd_reduce_dk<64>)        flash_attn_ext_amd_reduce_t;
@@ -385,9 +385,12 @@ template [[host_name("kernel_flash_attn_ext_amd_vec_dk64_nbc64"  )]] kernel flas
 template [[host_name("kernel_flash_attn_ext_amd_vec_dk64_nbc128" )]] kernel flash_attn_ext_amd_vec_t kernel_flash_attn_ext_amd_vec_dk< 64,  64, 128>;
 template [[host_name("kernel_flash_attn_ext_amd_vec_dk128_nbc64" )]] kernel flash_attn_ext_amd_vec_t kernel_flash_attn_ext_amd_vec_dk<128, 128,  64>;
 template [[host_name("kernel_flash_attn_ext_amd_vec_dk128_nbc128")]] kernel flash_attn_ext_amd_vec_t kernel_flash_attn_ext_amd_vec_dk<128, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_amd_vec_dk256_nbc64"  )]] kernel flash_attn_ext_amd_vec_t kernel_flash_attn_ext_amd_vec_dk<256, 256,  64>;
 
 template [[host_name("kernel_flash_attn_ext_amd_reduce_dk64" )]] kernel flash_attn_ext_amd_reduce_t kernel_flash_attn_ext_amd_reduce_dk< 64>;
 template [[host_name("kernel_flash_attn_ext_amd_reduce_dk128")]] kernel flash_attn_ext_amd_reduce_t kernel_flash_attn_ext_amd_reduce_dk<128>;
+template [[host_name("kernel_flash_attn_ext_amd_reduce_dk256")]] kernel flash_attn_ext_amd_reduce_t kernel_flash_attn_ext_amd_reduce_dk<256>;
 
 template [[host_name("kernel_flash_attn_ext_amd_tile_dk64_nbc64" )]] kernel flash_attn_ext_amd_tile_t kernel_flash_attn_ext_amd_tile_dk< 64,  64, 64, 32>;
 template [[host_name("kernel_flash_attn_ext_amd_tile_dk128_nbc64")]] kernel flash_attn_ext_amd_tile_t kernel_flash_attn_ext_amd_tile_dk<128, 128, 64, 32>;
+template [[host_name("kernel_flash_attn_ext_amd_tile_dk256_nbc64")]] kernel flash_attn_ext_amd_tile_t kernel_flash_attn_ext_amd_tile_dk<256, 256, 64, 32>;

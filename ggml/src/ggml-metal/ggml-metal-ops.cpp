@@ -2922,14 +2922,14 @@ bool ggml_metal_op_flash_attn_ext_amd_supported(const ggml_tensor * op) {
         return false;
     }
 
-    // 仅 F16 KV（dk==dv∈{64,128}）
+    // 仅 F16 KV（dk==dv∈{64,128,256}，256 为 P1-A 朴素版）
     if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
         return false;
     }
 
     const int64_t dk = op->src[1]->ne[0];
     const int64_t dv = op->src[2]->ne[0];
-    if (dk != dv || (dk != 64 && dk != 128)) {
+    if (dk != dv || (dk != 64 && dk != 128 && dk != 256)) {
         return false;
     }
 
@@ -3178,7 +3178,8 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
 
     if (ne01 == 1) {
         // decode vec path: split-k partials + reduce merge (same binds as tile)
-        const int nbc   = ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
+        // P1-A: dk256 只有 nbc64 实例，先钳住（调优见 P4）
+        const int nbc   = (dk == 256) ? 64 : ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
         const int split = ggml_metal_op_flash_attn_ext_amd_split_count(op);
         const int chunk = (int) GGML_PAD(((uint64_t) ne11 + split - 1)/split, (uint64_t) nbc);
 
@@ -3376,7 +3377,8 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
 
     if (ne01 == 1) {
         // ── decode vec 路径：split-k 部分结果 + reduce 合并 ──
-        const int nbc   = ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
+        // P1-A: dk256 只有 nbc64 实例，先钳住（调优见 P4）
+        const int nbc   = (dk == 256) ? 64 : ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
         const int split = ggml_metal_op_flash_attn_ext_amd_split_count(op);
         const int chunk = (int) GGML_PAD(((uint64_t) ne11 + split - 1)/split, (uint64_t) nbc);
 
