@@ -168,18 +168,20 @@ void dequantize_q4_0_t4(device const block_q4_0 * xb, short il, thread type4 & r
 
 template <typename type4x4>
 void dequantize_q4_1(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
-    device const uint16_t * qs = ((device const uint16_t *)xb + 2);
-    // uniform scale (matches CPU dequantize_row_q4_1); the il ? d/16 split was wrong
-    const float d  = xb->d;
-    const float  m = xb->m;
-    const ushort mask0 = il ? 0x00F0 : 0x000F;
-    const ushort mask1 = mask0 << 8;
+    // byte-only nibble select (matches CPU dequantize_row_q4_1)
+    device const uint8_t * qb = ((device const uint8_t *)xb + 4);
+    const float d = xb->d;
+    const float m = xb->m;
 
     float4x4 reg_f;
 
     for (int i = 0; i < 8; i++) {
-        reg_f[i/2][2*(i%2) + 0] = ((qs[i] & mask0) * d) + m;
-        reg_f[i/2][2*(i%2) + 1] = ((qs[i] & mask1) >> 8) * d + m;
+        const uint8_t b0 = qb[2*i + 0];
+        const uint8_t b1 = qb[2*i + 1];
+        const uint8_t n0 = il ? (b0 >> 4) : (b0 & 0xF);
+        const uint8_t n1 = il ? (b1 >> 4) : (b1 & 0xF);
+        reg_f[i/2][2*(i%2) + 0] = n0 * d + m;
+        reg_f[i/2][2*(i%2) + 1] = n1 * d + m;
     }
 
     reg = (type4x4) reg_f;
