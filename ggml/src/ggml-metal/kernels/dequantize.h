@@ -130,18 +130,20 @@ void dequantize_q2_0_t4(device const block_q2_0 * xb, short il, thread type4 & r
 
 template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
-    device const uint16_t * qs = ((device const uint16_t *)xb + 1);
-    const float d1 = il ? (xb->d / 16.h) : xb->d;
-    const float d2 = d1 / 256.f;
-    const float md = -8.h * xb->d;
-    const ushort mask0 = il ? 0x00F0 : 0x000F;
-    const ushort mask1 = mask0 << 8;
+    // byte-only nibble select (matches CPU dequantize_row_q4_0)
+    device const uint8_t * qb = ((device const uint8_t *)xb + 2);
+    const float d  = xb->d;
+    const float md = -8.f * d;
 
     float4x4 reg_f;
 
     for (int i = 0; i < 8; i++) {
-        reg_f[i/2][2*(i%2) + 0] = d1 * (qs[i] & mask0) + md;
-        reg_f[i/2][2*(i%2) + 1] = d2 * (qs[i] & mask1) + md;
+        const uint8_t b0 = qb[2*i + 0];
+        const uint8_t b1 = qb[2*i + 1];
+        const uint8_t n0 = il ? (b0 >> 4) : (b0 & 0xF);
+        const uint8_t n1 = il ? (b1 >> 4) : (b1 & 0xF);
+        reg_f[i/2][2*(i%2) + 0] = d * n0 + md;
+        reg_f[i/2][2*(i%2) + 1] = d * n1 + md;
     }
 
     reg = (type4x4) reg_f;
@@ -167,8 +169,8 @@ void dequantize_q4_0_t4(device const block_q4_0 * xb, short il, thread type4 & r
 template <typename type4x4>
 void dequantize_q4_1(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 2);
-    const float d1 = il ? (xb->d / 16.h) : xb->d;
-    const float d2 = d1 / 256.f;
+    // uniform scale (matches CPU dequantize_row_q4_1); the il ? d/16 split was wrong
+    const float d  = xb->d;
     const float  m = xb->m;
     const ushort mask0 = il ? 0x00F0 : 0x000F;
     const ushort mask1 = mask0 << 8;
@@ -176,8 +178,8 @@ void dequantize_q4_1(device const block_q4_1 * xb, short il, thread type4x4 & re
     float4x4 reg_f;
 
     for (int i = 0; i < 8; i++) {
-        reg_f[i/2][2*(i%2) + 0] = ((qs[i] & mask0) * d1) + m;
-        reg_f[i/2][2*(i%2) + 1] = ((qs[i] & mask1) * d2) + m;
+        reg_f[i/2][2*(i%2) + 0] = ((qs[i] & mask0) * d) + m;
+        reg_f[i/2][2*(i%2) + 1] = ((qs[i] & mask1) >> 8) * d + m;
     }
 
     reg = (type4x4) reg_f;
