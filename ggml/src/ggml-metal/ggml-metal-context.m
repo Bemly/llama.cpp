@@ -17,8 +17,9 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-// max number of MTLCommandBuffer used to submit a graph for processing
-#define GGML_METAL_MAX_COMMAND_BUFFERS 8
+// max number of extra MTLCommandBuffers used to submit a graph for processing
+// (the main thread owns one more on top of n_cb)
+#define GGML_METAL_MAX_COMMAND_BUFFERS 16
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
@@ -745,8 +746,28 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    // opt-in split override.
+    // GGML_METAL_N_CB counts ADDITIONAL async command buffers; the main
+    // thread owns one more on top, so the graph runs on n_cb + 1 buffers.
+    // Large graphs on discrete GPUs can exceed the GPU watchdog when too
+    // much work lands in one buffer (kIOGPUCommandBufferCallbackErrorTimeout);
+    // raising the split count keeps each buffer under the limit.
+    {
+        const char * env = getenv("GGML_METAL_N_CB");
+        if (env && env[0]) {
+            int req = atoi(env);
+            if (req < 1) {
+                req = 1;
+            }
+            if (req > GGML_METAL_MAX_COMMAND_BUFFERS) {
+                req = GGML_METAL_MAX_COMMAND_BUFFERS;
+            }
+            n_cb = req;
+        }
+    }
+
     // when fusion stats are collected the graph must be encoded by a single thread so the
-    // counters are race-free; override whatever the caller requested
+    // counters are race-free; override whatever the caller requested (env included)
     if (ggml_metal_fusion_info_stats(ctx->finfo)) {
         n_cb = 0;
     }
@@ -754,8 +775,12 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 
+        GGML_LOG_INFO("%s: n_cb = %d (plus one main-thread command buffer)\n", __func__, ctx->n_cb);
+
         if (ctx->n_cb > 2) {
-            GGML_LOG_WARN("%s: n_cb = %d, using n_cb > 2 is not recommended and can degrade the performance in some cases\n", __func__, n_cb);
+            // the >2 caution comes from Apple-Silicon tuning; on discrete GPUs
+            // more splits are sometimes required to stay under the GPU watchdog
+            GGML_LOG_INFO("%s: n_cb > 2 adds submit overhead, only use as much as needed\n", __func__);
         }
     }
 
