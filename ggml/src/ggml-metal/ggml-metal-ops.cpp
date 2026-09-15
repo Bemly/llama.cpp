@@ -3011,7 +3011,8 @@ bool ggml_metal_op_flash_attn_ext_amd_quant_supported(const ggml_tensor * op) {
     if (!k_is_quant && !v_is_quant) return false; // F16/F16 stays on the path above
     const int64_t dk = op->src[1]->ne[0];
     const int64_t dv = op->src[2]->ne[0];
-    if (dk != dv || (dk != 64 && dk != 128)) {
+    // P1-B: dk256 开给量化 KV（首验 q4_0/q4_0，其余组合 P1-C 逐个验）
+    if (dk != dv || (dk != 64 && dk != 128 && dk != 256)) {
         return false;
     }
     if (op->src[4] != nullptr) {
