@@ -1765,9 +1765,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
-                // FA-RDNA2 mixed KV (F16/Q8_0 pairs): only the AMD branch below
+                // FA-RDNA2 mixed KV (F16/Q8_0/Q4 pairs): only the AMD branch below
                 // takes these; Apple keeps the old behavior. The gate rechecks shapes.
-                if (!(!has_simdgroup_mm && ggml_metal_op_flash_attn_ext_amd_q8_supported(op))) {
+                if (!(!has_simdgroup_mm && ggml_metal_op_flash_attn_ext_amd_quant_supported(op))) {
                     return false;
                 }
             }
@@ -1792,7 +1792,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             // FA-RDNA2: 自研 AMD 向量化 kernel（env GGML_METAL_FA_AMD=1），覆盖时优先接管
             if (!has_simdgroup_mm) {
                 if (ggml_metal_op_flash_attn_ext_amd_supported(op) ||
-                    ggml_metal_op_flash_attn_ext_amd_q8_supported(op)) {
+                    ggml_metal_op_flash_attn_ext_amd_quant_supported(op)) {
                     return true;
                 }
                 // RC2 解禁实验（负优化定论，留档）：GGML_METAL_FA_ENABLE_AMD=1 强制上游 tile 路径

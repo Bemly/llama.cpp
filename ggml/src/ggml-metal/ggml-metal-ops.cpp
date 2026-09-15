@@ -2970,10 +2970,11 @@ static bool ggml_metal_op_flash_attn_ext_amd_align_ok(const ggml_tensor * op) {
     return true;
 }
 
-// Mixed KV prototype: sides that are Q8_0 are dequantized to scratch F16
-// (same design as upstream #27390), F16 sides are read directly, then the
-// fa_amd kernels run on the result. Covers prefill and decode: keeping FA on
-// Metal for mixed KV avoids spilling the op to another backend.
+// Mixed KV: sides in {F16, Q8_0, Q4_0, Q4_1} (not both F16) are handled here;
+// quantized sides dequantize to scratch F16 (same design as upstream #27390),
+// F16 sides bind directly, then the fa_amd kernels run on the result. Covers
+// prefill and decode: keeping FA on Metal for mixed KV avoids spilling the op
+// to another backend.
 // The F16/F16 path above is untouched.
 // NOTE: gate is pure tensor metadata on purpose: it also runs in supports_op
 // during graph split, where backend buffers are not assigned yet, so it must
@@ -2994,7 +2995,7 @@ static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
     return res;
 }
 
-bool ggml_metal_op_flash_attn_ext_amd_q8_supported(const ggml_tensor * op) {
+bool ggml_metal_op_flash_attn_ext_amd_quant_supported(const ggml_tensor * op) {
     if (!ggml_metal_fa_amd_enabled()) {
         return false;
     }
@@ -3003,11 +3004,11 @@ bool ggml_metal_op_flash_attn_ext_amd_q8_supported(const ggml_tensor * op) {
     }
     const ggml_type ktype = op->src[1]->type;
     const ggml_type vtype = op->src[2]->type;
-    const bool k_is_q8 = ktype == GGML_TYPE_Q8_0;
-    const bool v_is_q8 = vtype == GGML_TYPE_Q8_0;
-    if (!k_is_q8 && ktype != GGML_TYPE_F16) return false;
-    if (!v_is_q8 && vtype != GGML_TYPE_F16) return false;
-    if (!k_is_q8 && !v_is_q8) return false; // F16/F16 stays on the path above
+    const bool k_is_quant = ktype == GGML_TYPE_Q8_0 || ktype == GGML_TYPE_Q4_0 || ktype == GGML_TYPE_Q4_1;
+    const bool v_is_quant = vtype == GGML_TYPE_Q8_0 || vtype == GGML_TYPE_Q4_0 || vtype == GGML_TYPE_Q4_1;
+    if (!k_is_quant && ktype != GGML_TYPE_F16) return false;
+    if (!v_is_quant && vtype != GGML_TYPE_F16) return false;
+    if (!k_is_quant && !v_is_quant) return false; // F16/F16 stays on the path above
     const int64_t dk = op->src[1]->ne[0];
     const int64_t dv = op->src[2]->ne[0];
     if (dk != dv || (dk != 64 && dk != 128)) {
@@ -3029,14 +3030,14 @@ bool ggml_metal_op_flash_attn_ext_amd_q8_supported(const ggml_tensor * op) {
     if (op->nb[0]        != 4 || op->nb[1]        % 16 != 0) return false;
     if (op->src[3] && op->src[3]->nb[0] != 2) return false;
     // F16 sides are read directly, so they need the same row guards as the F16 path
-    if (!k_is_q8 && (op->src[1]->nb[0] != 2 || op->src[1]->nb[1] % 8 != 0)) return false;
-    if (!v_is_q8 && (op->src[2]->nb[0] != 2 || op->src[2]->nb[1] % 8 != 0)) return false;
+    if (!k_is_quant && (op->src[1]->nb[0] != 2 || op->src[1]->nb[1] % 8 != 0)) return false;
+    if (!v_is_quant && (op->src[2]->nb[0] != 2 || op->src[2]->nb[1] % 8 != 0)) return false;
     // scratch is always reserved (upstream keeps the extra) and the kernels
     // read it with the same contiguous-F16 layout they already handle
     return ggml_metal_op_flash_attn_ext_extra_kv_f16(op) != 0;
 }
 
-static int ggml_metal_op_flash_attn_ext_amd_q8(ggml_metal_op_t ctx, int idx, float scale) {
+static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, float scale) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -3078,8 +3079,8 @@ static int ggml_metal_op_flash_attn_ext_amd_q8(ggml_metal_op_t ctx, int idx, flo
 
     const ggml_type ktype = op->src[1]->type;
     const ggml_type vtype = op->src[2]->type;
-    const bool k_is_q8 = ktype == GGML_TYPE_Q8_0;
-    const bool v_is_q8 = vtype == GGML_TYPE_Q8_0;
+    const bool k_is_quant = ktype == GGML_TYPE_Q8_0;
+    const bool v_is_quant = vtype == GGML_TYPE_Q8_0;
     const bool v_is_view_of_k = ggml_metal_op_flash_attn_ext_v_is_view_of_k(op);
 
     const int64_t nblocks1_64 = (ne10/ggml_blck_size(op->src[1]->type))*(int64_t) ne11*ne12*ne13;
@@ -3089,7 +3090,7 @@ static int ggml_metal_op_flash_attn_ext_amd_q8(ggml_metal_op_t ctx, int idx, flo
     ggml_metal_buffer_id bid_v_f16 = bid_kv_f16;
     bid_v_f16.offs += ggml_metal_op_flash_attn_ext_kv_f16_k_size(op);
 
-    if (k_is_q8) {
+    if (k_is_quant) {
         auto pipeline_k = ggml_metal_library_get_pipeline_flash_attn_ext_kv_f16_for_type(lib, ktype);
         const int nth_k = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_k), 256);
 
@@ -3113,7 +3114,7 @@ static int ggml_metal_op_flash_attn_ext_amd_q8(ggml_metal_op_t ctx, int idx, flo
         ggml_metal_encoder_dispatch_threadgroups(enc, (nblocks1 + nth_k - 1)/nth_k, 1, 1, nth_k, 1, 1);
     }
 
-    if (v_is_q8 && !v_is_view_of_k) {
+    if (v_is_quant && !v_is_view_of_k) {
         auto pipeline_v = ggml_metal_library_get_pipeline_flash_attn_ext_kv_f16_for_type(lib, vtype);
         const int nth_v = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_v), 256);
 
@@ -3143,13 +3144,13 @@ static int ggml_metal_op_flash_attn_ext_amd_q8(ggml_metal_op_t ctx, int idx, flo
 
     ggml_metal_op_concurrency_reset(ctx);
 
-    ggml_metal_buffer_id bid_k = k_is_q8 ? bid_kv_f16 : bid_src1;
-    ggml_metal_buffer_id bid_v = v_is_view_of_k ? bid_k : (v_is_q8 ? bid_v_f16 : bid_src2);
+    ggml_metal_buffer_id bid_k = k_is_quant ? bid_kv_f16 : bid_src1;
+    ggml_metal_buffer_id bid_v = v_is_view_of_k ? bid_k : (v_is_quant ? bid_v_f16 : bid_src2);
 
-    const uint64_t nb10_attn = k_is_q8 ? sizeof(ggml_fp16_t) : (uint64_t) nb10;
-    const uint64_t nb11_attn = k_is_q8 ? nb10_attn*(uint64_t) ne10 : (uint64_t) nb11;
-    const uint64_t nb12_attn = k_is_q8 ? nb11_attn*(uint64_t) ne11 : (uint64_t) nb12;
-    const uint64_t nb13_attn = k_is_q8 ? nb12_attn*(uint64_t) ne12 : (uint64_t) nb13;
+    const uint64_t nb10_attn = k_is_quant ? sizeof(ggml_fp16_t) : (uint64_t) nb10;
+    const uint64_t nb11_attn = k_is_quant ? nb10_attn*(uint64_t) ne10 : (uint64_t) nb11;
+    const uint64_t nb12_attn = k_is_quant ? nb11_attn*(uint64_t) ne11 : (uint64_t) nb12;
+    const uint64_t nb13_attn = k_is_quant ? nb12_attn*(uint64_t) ne12 : (uint64_t) nb13;
 
     uint64_t nb20_attn;
     uint64_t nb21_attn;
@@ -3161,7 +3162,7 @@ static int ggml_metal_op_flash_attn_ext_amd_q8(ggml_metal_op_t ctx, int idx, flo
         nb21_attn = nb11_attn;
         nb22_attn = nb12_attn;
         nb23_attn = nb13_attn;
-    } else if (v_is_q8) {
+    } else if (v_is_quant) {
         nb20_attn = sizeof(ggml_fp16_t);
         nb21_attn = nb20_attn*(uint64_t) ne20;
         nb22_attn = nb21_attn*(uint64_t) ne21;
@@ -3316,7 +3317,10 @@ static int ggml_metal_op_flash_attn_ext_amd_split_count(const ggml_tensor * op) 
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_amd(const ggml_tensor * op) {
-    if (!ggml_metal_op_flash_attn_ext_amd_supported(op)) {
+    // vec split partials are needed on both the F16 and the quantized-KV paths;
+    // without this the vec kernel writes past the reserved area (GPU faults)
+    if (!ggml_metal_op_flash_attn_ext_amd_supported(op) &&
+        !ggml_metal_op_flash_attn_ext_amd_quant_supported(op)) {
         return 0;
     }
     if (op->src[0]->ne[1] != 1) {
@@ -3790,9 +3794,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ne00 % 4 == 0);
 
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
-    // mixed F16/Q8_0 KV is handled by the fa_amd mixed branch below (gate rechecks)
+    // mixed quantized KV is handled by the fa_amd mixed branch below (gate rechecks)
     GGML_ASSERT(op->src[1]->type == op->src[2]->type ||
-        ggml_metal_op_flash_attn_ext_amd_q8_supported(op));
+        ggml_metal_op_flash_attn_ext_amd_quant_supported(op));
 
     //GGML_ASSERT(ggml_are_same_shape (src1, src2));
     GGML_ASSERT(ne11 == ne21);
@@ -3839,9 +3843,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     if (ggml_metal_op_flash_attn_ext_amd_supported(op) && ggml_metal_op_flash_attn_ext_amd_align_ok(op)) {
         return ggml_metal_op_flash_attn_ext_amd(ctx, idx, scale);
     }
-    // Q8 prototype: dequant prepass to scratch F16, then fa_amd tile (prefill only)
-    if (ggml_metal_op_flash_attn_ext_amd_q8_supported(op)) {
-        return ggml_metal_op_flash_attn_ext_amd_q8(ctx, idx, scale);
+    // Quantized KV: dequant prepass to scratch F16, then fa_amd vec/tile (any nq)
+    if (ggml_metal_op_flash_attn_ext_amd_quant_supported(op)) {
+        return ggml_metal_op_flash_attn_ext_amd_quant(ctx, idx, scale);
     }
 
     ggml_metal_buffer_id bid_pad = bid_dst;
@@ -3882,11 +3886,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     if (use_kv_f16) {
         assert(ggml_metal_op_flash_attn_ext_extra_kv_f16(op) != 0);
 
-    const ggml_type ktype = op->src[1]->type;
-    const ggml_type vtype = op->src[2]->type;
-    const bool k_is_q8 = ktype == GGML_TYPE_Q8_0;
-    const bool v_is_q8 = vtype == GGML_TYPE_Q8_0;
-    const bool v_is_view_of_k = ggml_metal_op_flash_attn_ext_v_is_view_of_k(op);
+        const bool v_is_view_of_k = ggml_metal_op_flash_attn_ext_v_is_view_of_k(op);
 
         const int64_t nblocks1_64 = (ne10/ggml_blck_size(op->src[1]->type))*(int64_t) ne11*ne12*ne13;
         GGML_ASSERT(nblocks1_64 <= INT32_MAX);
