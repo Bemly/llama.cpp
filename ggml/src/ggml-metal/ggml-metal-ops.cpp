@@ -3079,8 +3079,8 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
 
     const ggml_type ktype = op->src[1]->type;
     const ggml_type vtype = op->src[2]->type;
-    const bool k_is_quant = ktype == GGML_TYPE_Q8_0;
-    const bool v_is_quant = vtype == GGML_TYPE_Q8_0;
+    const bool k_is_quant = ktype == GGML_TYPE_Q8_0 || ktype == GGML_TYPE_Q4_0 || ktype == GGML_TYPE_Q4_1;
+    const bool v_is_quant = vtype == GGML_TYPE_Q8_0 || vtype == GGML_TYPE_Q4_0 || vtype == GGML_TYPE_Q4_1;
     const bool v_is_view_of_k = ggml_metal_op_flash_attn_ext_v_is_view_of_k(op);
 
     const int64_t nblocks1_64 = (ne10/ggml_blck_size(op->src[1]->type))*(int64_t) ne11*ne12*ne13;
