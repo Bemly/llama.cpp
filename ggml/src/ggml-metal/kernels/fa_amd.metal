@@ -49,7 +49,7 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
     half2 qh[DK/2];
     {
         device const float4 * qv4 = (device const float4 *)(q + ib*args.nb03 + ih*args.nb02);
-        FOR_UNROLL (int i = 0; i < DK/8; ++i) {
+        FOR_UNROLL (int i = 0; i < DK/4; ++i) {
             float4 f = qv4[i];
             qh[2*i + 0] = half2(f.x*qs, f.y*qs);
             qh[2*i + 1] = half2(f.z*qs, f.w*qs);
@@ -75,8 +75,8 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
             if (t < kv1) {
                 device const half4 * kh4 = (device const half4 *)(kp + (size_t) t*args.nb11);
                 float acc = 0.0f;
-                FOR_UNROLL (int i = 0; i < DK/8; ++i) {
-                    half4 q4 = half4(qh[4*i + 0], qh[4*i + 1]);
+                FOR_UNROLL (int i = 0; i < DK/4; ++i) {
+                    half4 q4 = half4(qh[2*i + 0], qh[2*i + 1]);
                     float4 p = float4(q4 * kh4[i]);
                     acc += p.x + p.y + p.z + p.w;
                 }
@@ -240,7 +240,7 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
     half2 qh[DK/2];
     {
         device const float4 * qv4 = (device const float4 *)(q + ib*args.nb03 + ih*args.nb02 + (size_t) r_glob*args.nb01);
-        FOR_UNROLL (int i = 0; i < DK/8; ++i) {
+        FOR_UNROLL (int i = 0; i < DK/4; ++i) {
             if (r_valid) {
                 float4 f = qv4[i];
                 qh[2*i + 0] = half2(f.x*qs, f.y*qs);
