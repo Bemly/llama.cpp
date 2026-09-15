@@ -281,7 +281,9 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             if (status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
                 if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                    NSError * cb_err = [cmd_buf error];
+                    GGML_LOG_ERROR("%s: Metal CB error: status=%d domain=%s code=%ld desc=%s\n", __func__, (int) status,
+                        [[cb_err domain] UTF8String], (long) [cb_err code], [[cb_err localizedDescription] UTF8String]);
                 }
                 ctx->has_error = true;
                 return;
@@ -298,7 +300,9 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             if (status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
                 if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                    NSError * cb_err = [cmd_buf error];
+                    GGML_LOG_ERROR("%s: Metal CB error: status=%d domain=%s code=%ld desc=%s\n", __func__, (int) status,
+                        [[cb_err domain] UTF8String], (long) [cb_err code], [[cb_err localizedDescription] UTF8String]);
                 }
 
                 // release this and all remaining command buffers before returning
