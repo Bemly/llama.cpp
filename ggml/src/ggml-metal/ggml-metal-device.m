@@ -1791,7 +1791,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             // upstream gate keeps FA off on AMD dGPUs (no Apple7 simdgroup-mm);
-            // FA-RDNA2: 自研 AMD 向量化 kernel（env GGML_METAL_FA_AMD=1），覆盖时优先接管
+            // FA-RDNA2: self-written AMD vector kernel (env GGML_METAL_FA_AMD=1), takes over when gates pass
             if (!has_simdgroup_mm) {
                 if (ggml_metal_op_flash_attn_ext_amd_supported(op) ||
                     ggml_metal_op_flash_attn_ext_amd_quant_supported(op)) {

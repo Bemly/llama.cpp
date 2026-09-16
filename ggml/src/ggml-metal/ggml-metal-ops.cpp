@@ -3050,6 +3050,7 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nbd, op,         nb); // dst [DV,H,N,B]: head stride is nbd1
 
     const bool has_mask = op->src[3] != nullptr;
 
@@ -3217,6 +3218,9 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
             /*.split   =*/ split,
             /*.chunk   =*/ chunk,
             /*.scale   =*/ scale,
+            /*.nbq_d   =*/ nbd2,
+            /*.nbh_d   =*/ nbd1,
+            /*.nbb_d   =*/ nbd3,
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_vec(lib, dk, nbc, has_mask);
@@ -3234,6 +3238,11 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
         ggml_metal_op_concurrency_reset(ctx);
 
         auto pipeline_r = ggml_metal_library_get_pipeline_flash_attn_ext_amd_reduce(lib, dk);
+
+        // Hard guard: reduce reuses Q strides for the dst write, which coincides
+        // with dst strides only for single-query layout with dk == dv.
+        GGML_ASSERT(op->src[0]->ne[1] == 1);
+        GGML_ASSERT(op->src[1]->ne[0] == op->src[2]->ne[0]);
 
         ggml_metal_kargs_flash_attn_ext_amd_reduce args_r = {
             /*.ne02  =*/ ne02,
@@ -3278,7 +3287,10 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
         /*.split   =*/ 1,
         /*.chunk   =*/ 0,
         /*.scale   =*/ scale,
-    };
+        /*.nbq_d   =*/ nbd2,
+        /*.nbh_d   =*/ nbd1,
+        /*.nbb_d   =*/ nbd3,
+        };
 
     auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, has_mask);
 
@@ -3408,6 +3420,9 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
             /*.split   =*/ split,
             /*.chunk   =*/ chunk,
             /*.scale   =*/ scale,
+            /*.nbq_d   =*/ nb2,
+            /*.nbh_d   =*/ nb1,
+            /*.nbb_d   =*/ nb3,
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_vec(lib, dk, nbc, has_mask);
@@ -3425,6 +3440,11 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
         ggml_metal_op_concurrency_reset(ctx);
 
         auto pipeline_r = ggml_metal_library_get_pipeline_flash_attn_ext_amd_reduce(lib, dk);
+
+        // Hard guard: reduce reuses Q strides for the dst write, which coincides
+        // with dst strides only for single-query layout with dk == dv.
+        GGML_ASSERT(op->src[0]->ne[1] == 1);
+        GGML_ASSERT(op->src[1]->ne[0] == op->src[2]->ne[0]);
 
         ggml_metal_kargs_flash_attn_ext_amd_reduce args_r = {
             /*.ne02  =*/ ne02,
@@ -3470,6 +3490,9 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
         /*.split   =*/ 1,
         /*.chunk   =*/ 0,
         /*.scale   =*/ scale,
+        /*.nbq_d   =*/ nb2,
+        /*.nbh_d   =*/ nb1,
+        /*.nbb_d   =*/ nb3,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, has_mask);

@@ -519,13 +519,16 @@ typedef struct {
     int32_t  split;       // vec: kv split 数
     int32_t  chunk;       // vec: 每 split 的 kv token 数（NBC 对齐）
     float    scale;       // attention scale
+    uint64_t nbq_d;       // dst strides by role (dst is [DV,H,N,B], Q is [DK,N,H,B])
+    uint64_t nbh_d;       // nbq_d = dst nb[2], nbh_d = dst nb[1], nbb_d = dst nb[3]
+    uint64_t nbb_d;
 } ggml_metal_kargs_flash_attn_ext_amd;
 
 typedef struct {
     int32_t  ne02;        // n_head
     int32_t  ne03;        // n_batch
-    uint64_t nb02;        // dst strides
-    uint64_t nb03;
+    uint64_t nb02;        // dst strides (Q strides reused: valid only when nq == 1 && dk == dv,
+    uint64_t nb03;        // see hard guard at the reduce encode sites, do not reuse for nq > 1)
     int32_t  split;
 } ggml_metal_kargs_flash_attn_ext_amd_reduce;
 

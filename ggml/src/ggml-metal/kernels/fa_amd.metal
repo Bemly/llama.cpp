@@ -126,10 +126,12 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
             device const half2 * vh2 = (device const half2 *) vp;
             for (int j = 0; j < NBC; ++j) {
                 if (t0 + j >= kv1) break;
-                const float2 vv = float2(vh2[(size_t) j*(args.nb21/4) + lane]);
+                const float2 vv = float2(vh2[(size_t) (t0 + j)*(args.nb21/4) + lane]);
                 o_run += ss[j]*vv;
             }
         }
+        // ss holds this block's weights; the next block overwrites it after this barrier
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ── 写 split 部分结果：[b][h][split][DV+2] f32（o、m、l）──
@@ -363,11 +365,11 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // ── 输出：out = o / l ──
+    // out = o / l (dst is [DV,H,N,B], Q is [DK,N,H,B], use dst strides)
     if (r_valid) {
         const float l = lst[r_loc];
         const float inv = l > 0.0f ? 1.0f/l : 0.0f;
-        device float * d = (device float *)(dst + ib*args.nb03 + ih*args.nb02 + (size_t) r_glob*args.nb01);
+        device float * d = (device float *)(dst + ib*args.nbb_d + ih*args.nbh_d + (size_t) r_glob*args.nbq_d);
         FOR_UNROLL (int jj = 0; jj < OGRPS; ++jj) {
             *(device float4 *)(d + (sub*OGRPS + jj)*4) = o4[jj]*inv;
         }
