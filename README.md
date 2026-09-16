@@ -1,4 +1,7 @@
-# llama.cpp
+# llama.cpp (RX 6800 / RDNA2 Metal fork)
+
+> This fork targets AMD RX 6800 (RDNA2) on Metal. Default branch is `rx6800-fa-q8`.
+> Upstream README continues below. Full notes in Chinese: [readme.zh.md](readme.zh.md).
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -16,6 +19,68 @@
 [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
 
 </div>
+
+## RX 6800 / RDNA2 Metal fork notes (`rx6800-fa-q8`)
+
+Self-written Metal flash attention for AMD RDNA2 plus discrete-GPU hardening.
+Upstream gates `FLASH_ATTN_EXT` on `has_simdgroup_mm`, which RDNA2 lacks
+(`simdgroup_matrix` 8x8 fails in the Metal compiler), so attention falls back
+to CPU on this card. This branch replaces that path with VALU kernels.
+
+### What is added (vs upstream master)
+
+- `ggml/src/ggml-metal/kernels/fa_amd.metal` (new): decode vec kernel
+  (`nq == 1`, split-k with reduce merge), prefill tile kernel (`nq > 1`),
+  for `dk == dv` in `{64, 128, 256}`. Packed `half2` math, register-side
+  online softmax, KV block over LDS with padded stride.
+- Quantized-KV path: dequant prepass to scratch F16 (existing `kv_*_f16`
+  kernels plus a new `iq4_nl` instantiation), then vec/tile on scratch.
+  Each K/V side accepts `F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL`
+  (not both F16). Mixed pairs work.
+- Gate (default off): `GGML_METAL_FA_AMD=1`, no sinks/bias/softcap, stride
+  and alignment guards. Anything outside the gate falls back to upstream.
+- Phase knobs: `GGML_METAL_{DECODE_FA,PP_FA,FA}_{SPLIT,NBC}`. `SPLIT=0`
+  targets ~96 threadgroups automatically; `NBC` defaults to 128.
+- Dequant fixes: `dequantize_q4_0` / `dequantize_q4_1` 4x4 rewritten
+  byte-explicit to match the CPU rows (old `d/16` + mask form was wrong
+  for the high half).
+- RX 6800 tile tuning: phase-aware `NR0`/`NSG` env knobs with extra
+  `mul_mv` variants (`Q8_0` `nr0=4` gains ~28% pp; default stays `nr0=2`).
+- Discrete-GPU hardening: private VRAM mirror with budget
+  (`GGML_METAL_VRAM_BUDGET_MB`, `GGML_METAL_VRAM_RESERVE_MB`, opt-out via
+  `GGML_METAL_MMAP_PRIVATE_DISABLE`), concurrency off on dGPUs unless
+  `GGML_METAL_CONCURRENCY_FORCE=1`, command-buffer `NSError`
+  (domain/code/desc) logging, configurable `GGML_METAL_N_CB`
+  (max 16, for GPU-watchdog slicing).
+- Bench harness: `test_gen` syncs every 32 tokens instead of every token
+  (per-token sync under-reports Metal decode throughput).
+- Negative results kept behind off-by-default gates: upstream FA forced on
+  AMD (`GGML_METAL_FA_ENABLE_AMD=1`, much slower) and single-CB decode
+  scheduling (`GGML_METAL_DECODE_SCHED=1`, -4% tg).
+
+### Measured (RX 6800, Metal, `-ngl 99`)
+
+- 14B Qwen3 `Q4_K_M`: `pp8192` 43.3 -> 70.1 (+62%), short-ctx tg +3~5%;
+  32k prefill unlocked at 61.1 t/s (non-FA path OOMs). Second 14B
+  (`Q6_K`): `pp8192` +42%. Small/hybrid models: neutral (attention share
+  too small to matter). Note: end-to-end re-verification after the tile
+  store-index fix (`ba42cb1`) is still pending; treat these as pre-fix
+  numbers.
+- Correctness: `test-backend-ops -o FLASH_ATTN_EXT` mask=0 fully green on
+  F16 and all quantized KV types; random-block-mask cases carry a known
+  ~0.026 fixture artifact (half-dot adversarial input, also fails on the
+  vec path; neutral/causal masks pass).
+
+### Use
+
+```sh
+GGML_METAL_FA_AMD=1 ./build/bin/llama-server -m <14B-model> -ngl 99 \
+  -c 65536 -fa on ...
+```
+
+Known limits: Metal faults on prompt batches >= 256 tokens for some large
+models (GPU watchdog, unrelated to FA; raise `GGML_METAL_N_CB` toward 16);
+sampler and embedding lookup stay on CPU by design.
 
 ## Quick start
 
