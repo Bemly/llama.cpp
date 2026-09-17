@@ -2488,11 +2488,9 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
         bid_src.offs += offset;
 
-        // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // dst: use a temp shared buffer, host ptr may not be page aligned
+        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithLength:size
+                                                                  options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_dst);
 
@@ -2512,6 +2510,9 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        memcpy(data, [buf_dst contents], size);
+        [buf_dst release];
     }
 }
 
