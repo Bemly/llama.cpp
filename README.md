@@ -1,6 +1,6 @@
 # llama.cpp (RX 6800 / RDNA2 Metal fork)
 
-> This fork targets AMD RX 6800 (RDNA2) on Metal. Default branch is `rx6800-fa-q8`.
+> This fork targets AMD RX 6800 (RDNA2) on Metal. Default branch is `rx6800-fa-q8-pq2`.
 > Upstream README continues below. Full notes in Chinese: [readme.zh.md](readme.zh.md).
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
@@ -20,7 +20,7 @@
 
 </div>
 
-## RX 6800 / RDNA2 Metal fork notes (`rx6800-fa-q8`)
+## RX 6800 / RDNA2 Metal fork notes (`rx6800-fa-q8-pq2`)
 
 Self-written Metal flash attention for AMD RDNA2 plus discrete-GPU hardening.
 Upstream gates `FLASH_ATTN_EXT` on `has_simdgroup_mm`, which RDNA2 lacks
@@ -81,6 +81,39 @@ GGML_METAL_FA_AMD=1 ./build/bin/llama-server -m <14B-model> -ngl 99 \
 Known limits: Metal faults on prompt batches >= 256 tokens for some large
 models (GPU watchdog, unrelated to FA; raise `GGML_METAL_N_CB` toward 16);
 sampler and embedding lookup stay on CPU by design.
+
+### PQ2_0 ternary (PrismML port, Metal-only)
+
+Runs ternary `PQ2_0` GGUFs (ggml type 142, group-128 2-bit, e.g.
+Bonsai-2-27B). Stock llama.cpp rejects the type and has no Hadamard
+activation runtime, so three pieces were ported from the PrismML fork:
+
+- Core: type plumbing (`ggml.h`, traits, quant/dequant/vecdot incl. ARM
+  NEON and x86 VNNI, ftype names), `prism.hadamard.*` metadata parsing,
+  rotation/sign buffers, and graph wiring through `build_lora_mm`
+  (plus a verifier that throws instead of silently computing wrong math).
+- Metal: FWHT upgrade (f16 inputs, threadgroup-staged kernels up to
+  width 8192, fused sign-flip support in the kernel), `PQ2_0` kernels
+  for `mul_mv`/`mul_mm`/`ext`/`id`/`get_rows`/`cpy`, host dispatch and
+  op-support entries, `N_R0=8/N_SG=2` defaults.
+- Left out: `fwht_signed` fusion (this tree uses the newer fusion-table
+  framework; unfused path is correct, fusion is perf-only) and `PTQ1_0`.
+
+FA is required, not optional, for these models: the 16 full-attention
+layers (head dim 256) spill to CPU without it.
+
+```sh
+GGML_METAL_FA_AMD=1 ./build-q8/bin/llama-server \
+  -m Bonsai-2-27B-PQ2_0-CRACK.gguf -ngl 99 -c 32768 -fa on \
+  --temp 1.0 --top-p 0.95 --top-k 20 --port 8082
+```
+
+Measured (RX 6800, Metal, `-ngl 99`, `llama-bench -p 512 -n 64 -r 2`,
+F16 KV): FA off pp 75.07 / tg 17.37, FA on pp 80.31 (+7%) /
+tg 31.29 (+80%). Correctness: identical greedy output with FA on/off;
+`test-backend-ops -o MUL_MAT` green on Metal (1265) and BLAS (11).
+Tuning knob: `GGML_METAL_{DECODE,PP}_PQ2_0_NSG`
+(`GGML_METAL_PQ2_0_NSG` fallback).
 
 ## Quick start
 

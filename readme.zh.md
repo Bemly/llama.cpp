@@ -1,7 +1,7 @@
-# llama.cpp RX 6800 / RDNA2 Metal 分支说明（`rx6800-fa-q8`，默认分支）
+# llama.cpp RX 6800 / RDNA2 Metal 分支说明（`rx6800-fa-q8-pq2`，默认分支）
 
 英文摘要见 [README.md](README.md) 顶部。本文件是完整中文版，与分支相对
-`ggml-org/llama.cpp master` 的增量（14 个文件、18 个提交）逐项对应。
+`ggml-org/llama.cpp master` 的增量逐项对应；PQ2_0 部分见第九节。
 
 ## 一、为什么自写 FA
 
@@ -98,8 +98,10 @@ decode-like 判据：第一个 MUL_MAT 的 `ne11==1`（FA 旋钮另要求 `ne12*
 - `rx6800-tile`：RC2 二层 tile 调优（NR0/NSG）。
 - `rx6800-fa`：FA-RDNA2 主线（dk128 时代）。
 - `rx6800-fa-dk128`：dk128 验证分支。
-- **`rx6800-fa-q8`：默认分支**，本说明描述的对象（含 Q8/Q4/Q5/iq4 全门＋DK256＋
-  vec 双 fix＋dst-stride 修复 `ba42cb1`）。
+- **`rx6800-fa-q8`**：Q8/Q4/Q5/iq4 全门＋DK256＋vec 双 fix＋dst-stride 修复
+ （`ba42cb1`），上一代默认分支。
+- **`rx6800-fa-q8-pq2`：默认分支**，= fa-q8 ＋第九节的 PQ2_0 ternary 移植
+  （1 个提交，30 文件）。
 - `rx6800-fa-q8-bak-20250915`：tile 根因定位前的快照备份。
 - `rx6800-spec`：投机解码判定（ngram 无增益，draft 双墙判死，留档）。
 
@@ -115,3 +117,45 @@ F16 KV、dk=dv 128/64 自动接管，其余形状自动回退。单测：
 ```sh
 GGML_METAL_FA_AMD=1 ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -b MTL0
 ```
+
+## 九、PQ2_0 ternary 适配（Prism 移植，Metal only）
+
+背景：Bonsai-2-27B 这类 ternary 模型权重存在旋转基里（block 1024
+Hadamard 折叠），原版没有对应类型（ggml type 142）也没有 activation
+变换，官方说法是直接不可用。本节就是把 Prism fork 的这套搬过来，
+只搬 PQ2_0（PTQ1_0 没要）。
+
+搬了什么（30 文件，+1162）：
+- core 类型全套：`ggml.h` 加类型＋ftype、`ggml.c` traits、`quants`
+  quant/dequant、CPU vecdot（NEON 和 x86-VNNI 照抄 Prism，保证逐位
+  一致）、`gguf` 名、`llama-model-loader` ftype 映射。
+- Hadamard：`prism.hadamard.*` 元数据解析（白名单只放行 LLAMA/QWEN3/
+  QWEN35/QWEN3NEXT 系）、rotation/sign 常驻 buffer、graph 在
+  `build_lora_mm(/_id)` 中央注入变换＋embedding 逆变换，另有 graph
+  verifier——缺变换直接抛错，不静默算错。
+- Metal：FWHT 升级（f16 输入、宽块 TG kernel 到 8192、kernel 内融
+  sign 位）、`mul_mv/mul_mm/ext/id/get_rows/cpy` 的 PQ2_0 kernel＋分发，
+  `N_R0=8/N_SG=2` 默认。
+- 没搬的：`fwht_signed` 融合（本树 fusion 已表驱动，旧写法接不上；
+  非融合正确，融合只是省一次 elementwise）、PTQ1_0。
+
+实测（RX 6800，Metal，`-ngl 99`，Bonsai-2-27B-PQ2_0-CRACK 7.2G，
+`llama-bench -p 512 -n 64 -r 2`，F16 KV）：
+- FA 关：pp 75.07 / tg 17.37——16 个 full-attn 层（head 256）spill 到
+  CPU，tg 腰斩。
+- FA 开：pp 80.31（+7%）/ tg 31.29（+80%）。所以跑这类模型 FA 必开，
+  且 KV 必须 F16（`iq4_nl` 会让 FA 脱钩）。
+- 正确性：FA 开关同题同答（Paris）；`test-backend-ops -o MUL_MAT`
+  Metal 1265＋BLAS 11 全绿；0.8B 日常模型 smoke 正常。
+
+用法：
+
+```sh
+GGML_METAL_FA_AMD=1 ./build-q8/bin/llama-server \
+  -m Bonsai-2-27B-PQ2_0-CRACK.gguf -ngl 99 -c 32768 -fa on \
+  --temp 1.0 --top-p 0.95 --top-k 20 --port 8082
+```
+
+扫参旋钮：`GGML_METAL_{DECODE,PP}_PQ2_0_NSG`（`GGML_METAL_PQ2_0_NSG`
+兜底），NR0 先定死 8。待做：DK256 朴素版挂服务前跑 128-token 贪心
+diff＋PPL 对 Prism 二进制；8k＋ 长 ctx 的 PP 收益未知。
