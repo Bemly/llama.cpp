@@ -2278,12 +2278,6 @@ int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// supported FWHT sizes, must stay in sync with the
-// kernel_fwht_f32_<N> templates in ggml-metal.metal
-static bool ggml_metal_fwht_supported_size(int64_t n) {
-    return n == 64 || n == 128 || n == 256 || n == 512;
-}
-
 int ggml_metal_op_fwht(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2297,17 +2291,30 @@ int ggml_metal_op_fwht(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_kargs_fwht args = {
         /*.nrows = */ (int32_t) nrows,
+        /*.n_blk = */ 0,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_fwht(lib, n);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+
+    auto pipeline = ggml_metal_library_get_pipeline_fwht(lib, n, src1->type == GGML_TYPE_F16);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src1), 1);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 2);
+    // buffer 3 is never read when n_blk == 0; bind src so the slot is always valid
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src1), 3);
 
     const int th_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
     const int simd_size = 32;
+
+    if (n >= GGML_METAL_FWHT_TG_MIN_N) {
+        GGML_ASSERT(th_max >= GGML_METAL_FWHT_TG_NT);
+        ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, GGML_METAL_FWHT_TG_NT, 1, 1);
+
+        return 1;
+    }
 
     int sg_per_tg = 2;
     sg_per_tg = std::min(sg_per_tg, th_max/simd_size);
@@ -2388,7 +2395,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int32_t hint = ggml_get_op_params_i32(op, 1);
 
     if (hint == GGML_HINT_SRC0_IS_HADAMARD) {
-        if (op->src[1]->type == GGML_TYPE_F32 &&
+        if ((op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
             op->type == GGML_TYPE_F32 &&
             ggml_is_contiguous(op->src[1]) &&
             ggml_is_contiguous(op) &&
@@ -2425,6 +2432,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_BF16 ||
            op->src[0]->type == GGML_TYPE_Q1_0 ||
            op->src[0]->type == GGML_TYPE_Q2_0 ||
+           op->src[0]->type == GGML_TYPE_PQ2_0 ||
            op->src[0]->type == GGML_TYPE_Q4_0 ||
            op->src[0]->type == GGML_TYPE_Q4_1 ||
            op->src[0]->type == GGML_TYPE_Q5_0 ||
