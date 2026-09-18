@@ -88,6 +88,12 @@ if (LLAMA_KVMEM)
         if (DEFINED CMAKE_CUDA_ARCHITECTURES)
             set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
         endif()
+    elseif (GGML_METAL)
+        # Metal stage-in backend (no CUDA): host slab + CPU transforms,
+        # ggml-API transfers, host fallbacks. See the file header.
+        target_sources(llama PRIVATE
+            ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-stagein-metal.cpp)
+        target_compile_definitions(llama PRIVATE LLAMA_KVMEM_METAL=1)
     endif()
     target_include_directories(llama PRIVATE
         ${LLAMA_KVMEM_ROOT}/kvmem/include
