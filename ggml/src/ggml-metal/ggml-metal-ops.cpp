@@ -2933,8 +2933,9 @@ static bool ggml_metal_fa_amd_experiment(void) {
 }
 
 // ── RX6800 FA-RDNA2 自研 kernel（kernels/fa_amd.metal）───────────────────────
-// env 总开关 GGML_METAL_FA_AMD=1（默认关）。覆盖范围：F16 KV、dk==dv∈{64,128}、
-// 无 sinks/ALiBi/softcap；不满足时回退上游路径（在 AMD 上默认关闭）。
+// env 总开关 GGML_METAL_FA_AMD（默认开，=0 关闭）。DK256 朴素版已对 CPU 全注意力
+// token-identical（40 token 贪心），且量化 KV 下关闭即错（34 splits + PPL 4507），
+// 故默认接管；形状/对齐不满足时仍回退上游路径。
 // 相位旋钮与 ggml-metal-device.cpp 的 RC2 移植同约定：decode-like = nq==1，
 // GGML_METAL_DECODE_FA_* / GGML_METAL_PP_FA_* 优先于通用 GGML_METAL_FA_*。
 
@@ -2942,7 +2943,7 @@ static bool ggml_metal_fa_amd_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char * val = getenv("GGML_METAL_FA_AMD");
-        cached = (val && val[0] && val[0] != '0') ? 1 : 0;
+        cached = (!val || !val[0] || val[0] != '0') ? 1 : 0;
     }
     return cached == 1;
 }

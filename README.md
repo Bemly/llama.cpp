@@ -1,6 +1,6 @@
 # llama.cpp (RX 6800 / RDNA2 Metal fork)
 
-> This fork targets AMD RX 6800 (RDNA2) on Metal. Default branch is `rx6800-fa-q8-pq2`.
+> This fork targets AMD RX 6800 (RDNA2) on Metal. Default branch is `kvmem-eval`.
 > Upstream README continues below. Full notes in Chinese: [readme.zh.md](readme.zh.md).
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
@@ -20,7 +20,7 @@
 
 </div>
 
-## RX 6800 / RDNA2 Metal fork notes (`rx6800-fa-q8-pq2`)
+## RX 6800 / RDNA2 Metal fork notes (`kvmem-eval`)
 
 Self-written Metal flash attention for AMD RDNA2 plus discrete-GPU hardening.
 Upstream gates `FLASH_ATTN_EXT` on `has_simdgroup_mm`, which RDNA2 lacks
@@ -37,8 +37,11 @@ to CPU on this card. This branch replaces that path with VALU kernels.
   kernels plus a new `iq4_nl` instantiation), then vec/tile on scratch.
   Each K/V side accepts `F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL`
   (not both F16). Mixed pairs work.
-- Gate (default off): `GGML_METAL_FA_AMD=1`, no sinks/bias/softcap, stride
-  and alignment guards. Anything outside the gate falls back to upstream.
+- Gate (default on, `GGML_METAL_FA_AMD=0` opts out): no sinks/bias/softcap,
+  stride and alignment guards. Anything outside the gate falls back to
+  upstream. DK256 naive is token-identical to CPU full attention over 40
+  greedy tokens (Bonsai-27B, q8 KV); with the gate off, quantized KV
+  degrades (34 graph splits, PPL 4507 vs 3.9), so the gate stays on.
 - Phase knobs: `GGML_METAL_{DECODE_FA,PP_FA,FA}_{SPLIT,NBC}`. `SPLIT=0`
   targets ~96 threadgroups automatically; `NBC` defaults to 128.
 - Dequant fixes: `dequantize_q4_0` / `dequantize_q4_1` 4x4 rewritten
@@ -74,7 +77,7 @@ to CPU on this card. This branch replaces that path with VALU kernels.
 ### Use
 
 ```sh
-GGML_METAL_FA_AMD=1 ./build/bin/llama-server -m <14B-model> -ngl 99 \
+./build/bin/llama-server -m <14B-model> -ngl 99 \
   -c 65536 -fa on ...
 ```
 
@@ -103,7 +106,7 @@ FA is required, not optional, for these models: the 16 full-attention
 layers (head dim 256) spill to CPU without it.
 
 ```sh
-GGML_METAL_FA_AMD=1 ./build-q8/bin/llama-server \
+./build-q8/bin/llama-server \
   -m Bonsai-2-27B-PQ2_0-CRACK.gguf -ngl 99 -c 32768 -fa on \
   --temp 1.0 --top-p 0.95 --top-k 20 --port 8082
 ```
@@ -114,6 +117,35 @@ tg 31.29 (+80%). Correctness: identical greedy output with FA on/off;
 `test-backend-ops -o MUL_MAT` green on Metal (1265) and BLAS (11).
 Tuning knob: `GGML_METAL_{DECODE,PP}_PQ2_0_NSG`
 (`GGML_METAL_PQ2_0_NSG` fallback).
+
+### KVMem eval (`kvmem-eval`: this branch)
+
+KVMem (KV-context virtualization, https://github.com/kvmem/kvmem-llama.cpp)
+wired for Metal, evaluated with Bonsai-2-27B. Adapter sources are compiled
+from `LLAMA_KVMEM_ROOT` (a local `kvmem-llama.cpp` checkout, CUDA upstream);
+this branch holds the llama.cpp-side Metal pieces:
+
+- `ggml-metal-device.{h,m}`: synchronous batched D2D blit
+  (`ggml_metal_blit_batched`), private scratch alloc, shared staging alloc
+  for harvest D2H. Same blit-encoder pattern as `buffer_cpy_tensor`.
+- `llama-kvmem-stagein-metal.cpp` + adapter (in `LLAMA_KVMEM_ROOT`,
+  not pushed here): layout gather/scatter via blit instead of the host
+  round-trip, per-block batched harvest D2H with zero extra copies.
+  Default on, `KVMEM_METAL_BLIT=0` restores the host fallbacks.
+
+Build: `cmake -B build-kvmem-on -DLLAMA_KVMEM=ON
+-DLLAMA_KVMEM_ROOT=../kvmem-llama.cpp`, target `llama-kvmem-cli`
+(same flags as upstream: `--kvmem --kvmem-budget N --kv-dtype f16|q8_0`).
+
+Measured (RX 6800, Metal, `-ngl 99`, Bonsai-27B, q8 KV, budget 512):
+
+- Reselect layout 40ms -> 4ms (`layout_d2h+h2d`), retrieval total 89ms ->
+  52ms; needle BLUEBIRD-7 correct at 2.5k and 7.3k prompts
+  (`KVMEM_PERF=1` for the breakdown, `KVMEM_METAL_BLIT=0` for A/B).
+- q8 KV + retrieval validated (P1-C): FA quant path engaged
+  (`kv_q8_0_f16` prepass + `fa_amd` dk256 kernels, 65/65 layers on GPU).
+- 7.3k needle vs full-context baseline: pp +14%, tg +40%, and the
+  correct answer (baseline answers vaguely).
 
 ## Quick start
 

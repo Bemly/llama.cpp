@@ -378,6 +378,23 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
 
+// KVMem Metal blit: synchronous batched device-to-device copies for the
+// KVMem layout fast path (discrete GPUs have no CPU-visible device memory,
+// so the adapter cannot memcpy device rows on the host). All buffers in one
+// call must belong to the same MTLDevice as the queue. void* values are
+// id<MTLBuffer> / id<MTLCommandQueue>. Returns false (loud) on any failure.
+//
+void * ggml_metal_queue_for_buf(void * buf_ctx);
+bool   ggml_metal_blit_batched(void * queue,
+                               const void * const * src_buf, const size_t * src_off,
+                               void * const * dst_buf, const size_t * dst_off,
+                               const size_t * nbytes, int n);
+void * ggml_metal_scratch_alloc(void * queue, size_t nbytes); // StorageModePrivate, +1 retain
+void   ggml_metal_scratch_free(void * buf);
+// Shared staging for harvest D2H (CPU-visible after blit + wait).
+void * ggml_metal_staging_alloc(void * queue, size_t nbytes); // StorageModeShared, +1 retain
+const void * ggml_metal_staging_bytes(const void * buf); // [buf contents]
+
 #ifdef __cplusplus
 }
 #endif

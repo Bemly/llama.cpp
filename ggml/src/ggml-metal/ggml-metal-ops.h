@@ -48,7 +48,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_amd(const struct ggml_tensor * op);
 
-// FA-RDNA2：自研 AMD kernel 门控（env GGML_METAL_FA_AMD=1 + 形状护栏），供 supports_op 调用
+// FA-RDNA2：自研 AMD kernel 门控（env GGML_METAL_FA_AMD，默认开，=0 关 + 形状护栏），供 supports_op 调用
 bool ggml_metal_op_flash_attn_ext_amd_supported(const struct ggml_tensor * op);
 
 // Quantized-KV gate: same env, K/V in {F16, Q8_0, Q4_0, Q4_1} (not both F16)

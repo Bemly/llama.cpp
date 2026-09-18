@@ -1791,7 +1791,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             // upstream gate keeps FA off on AMD dGPUs (no Apple7 simdgroup-mm);
-            // FA-RDNA2: self-written AMD vector kernel (env GGML_METAL_FA_AMD=1), takes over when gates pass
+            // FA-RDNA2: self-written AMD vector kernel (env GGML_METAL_FA_AMD, default on), takes over when gates pass
             if (!has_simdgroup_mm) {
                 if (ggml_metal_op_flash_attn_ext_amd_supported(op) ||
                     ggml_metal_op_flash_attn_ext_amd_quant_supported(op)) {
@@ -2557,6 +2557,100 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
     }
 
     return true;
+}
+
+// KVMem Metal blit fast path: batched D2D copies + private scratch.
+// Same blit-encoder pattern as ggml_metal_buffer_cpy_tensor above.
+void * ggml_metal_queue_for_buf(void * buf_ctx) {
+    ggml_metal_buffer_t buf = (ggml_metal_buffer_t) buf_ctx;
+    if (!buf || !buf->dev) {
+        return NULL;
+    }
+    return buf->dev->mtl_queue;
+}
+
+bool ggml_metal_blit_batched(void * queue,
+                             const void * const * src_buf, const size_t * src_off,
+                             void * const * dst_buf, const size_t * dst_off,
+                             const size_t * nbytes, int n) {
+    if (!queue || !src_buf || !src_off || !dst_buf || !dst_off || !nbytes || n <= 0) {
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (!src_buf[i] || !dst_buf[i] || nbytes[i] == 0) {
+            return false;
+        }
+    }
+    @autoreleasepool {
+        id<MTLCommandQueue> q = (id<MTLCommandQueue>) queue;
+        id<MTLCommandBuffer> cmd_buf = [q commandBufferWithUnretainedReferences];
+        if (cmd_buf == nil) {
+            return false;
+        }
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        if (encoder == nil) {
+            return false;
+        }
+        for (int i = 0; i < n; ++i) {
+            [encoder copyFromBuffer:(id<MTLBuffer>) src_buf[i]
+                       sourceOffset:src_off[i]
+                           toBuffer:(id<MTLBuffer>) dst_buf[i]
+                  destinationOffset:dst_off[i]
+                               size:nbytes[i]];
+        }
+        [encoder endEncoding];
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+        if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+            GGML_LOG_ERROR("%s: blit failed, status = %ld\n", __func__, (long) [cmd_buf status]);
+            return false;
+        }
+    }
+    return true;
+}
+
+void * ggml_metal_scratch_alloc(void * queue, size_t nbytes) {
+    if (!queue || nbytes == 0) {
+        return NULL;
+    }
+    @autoreleasepool {
+        id<MTLDevice> dev = [(id<MTLCommandQueue>) queue device];
+        if (dev == nil) {
+            return NULL;
+        }
+        id<MTLBuffer> buf = [dev newBufferWithLength:nbytes options:MTLResourceStorageModePrivate];
+        return (void *) buf; // +1 retain, caller owns (ggml_metal_scratch_free)
+    }
+}
+
+void ggml_metal_scratch_free(void * buf) {
+    if (!buf) {
+        return;
+    }
+    @autoreleasepool {
+        [(id<MTLBuffer>) buf release];
+    }
+}
+
+void * ggml_metal_staging_alloc(void * queue, size_t nbytes) {
+    if (!queue || nbytes == 0) {
+        return NULL;
+    }
+    @autoreleasepool {
+        id<MTLDevice> dev = [(id<MTLCommandQueue>) queue device];
+        if (dev == nil) {
+            return NULL;
+        }
+        id<MTLBuffer> buf = [dev newBufferWithLength:nbytes options:MTLResourceStorageModeShared];
+        return (void *) buf; // +1 retain, caller owns (ggml_metal_scratch_free)
+    }
+}
+
+const void * ggml_metal_staging_bytes(const void * buf) {
+    if (!buf) {
+        return NULL;
+    }
+    return [(id<MTLBuffer>) buf contents];
 }
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {

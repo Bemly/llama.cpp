@@ -1,4 +1,4 @@
-# llama.cpp RX 6800 / RDNA2 Metal 分支说明（`rx6800-fa-q8-pq2`，默认分支）
+# llama.cpp RX 6800 / RDNA2 Metal 分支说明（`kvmem-eval`，默认分支）
 
 英文摘要见 [README.md](README.md) 顶部。本文件是完整中文版，与分支相对
 `ggml-org/llama.cpp master` 的增量逐项对应；PQ2_0 部分见第九节。
@@ -46,7 +46,9 @@
 
 ## 三、门控规则（不满足就回退上游，一律安全默认关）
 
-1. 总开关 `GGML_METAL_FA_AMD=1`（默认关）。
+1. 总开关 `GGML_METAL_FA_AMD`（默认开，`=0` 关闭）。DK256 朴素版已对 CPU
+   全注意力 token-identical（Bonsai-27B q8 KV，40 token 贪心）；关闭时量化
+   KV 即错（34 splits＋PPL 4507 对 3.9），故默认接管。
 2. F16 路：K、V 同为 F16 且 `dk==dv` ∈ {64,128,256}。
 3. 量化路：K/V 每侧独立取 {F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL}（不许双 F16，
    双 F16 走第 2 条），形状同上；量化侧先 cast 到 scratch F16 再跑同一套 kernel。
@@ -56,7 +58,8 @@
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `GGML_METAL_FA_AMD` | 关 | 自研 FA 总开关 |
+| `GGML_METAL_FA_AMD` | 开 | 自研 FA 总开关（`=0` 关） |
+| `KVMEM_METAL_BLIT` | 开 | KVMem Metal blit 快路径（`=0` 回 host 回退） |
 | `GGML_METAL_{DECODE_FA,PP_FA,FA}_{SPLIT,NBC}` | SPLIT 0=自动，NBC 128 | vec split 数（0=自动凑 ~96 tg，上限16）/ KV 块大小（dk256 钳 64） |
 | `GGML_METAL_{DECODE,PP}_*_NR0/NSG`（+全局兜底） | nr0=2，nsg=4 | mul_mv 变体与 NSG 相位旋钮；Q8 `nr0=4` pp+28% 但 tg-3.6%，默认不动 |
 | `GGML_METAL_N_CB` | 1（+主线程1个） | 大 graph 切分防 watchdog，上限 16；27B ub512 只有 16 能过 |
@@ -108,14 +111,13 @@ decode-like 判据：第一个 MUL_MAT 的 `ne11==1`（FA 旋钮另要求 `ne12*
 ## 八、用法
 
 ```sh
-GGML_METAL_FA_AMD=1 ./build/bin/llama-server -m <14B模型> -ngl 99 \
-  -c 65536 -fa on ...
+./build/bin/llama-server -m <14B模型> -ngl 99 \
 ```
 
 F16 KV、dk=dv 128/64 自动接管，其余形状自动回退。单测：
 
 ```sh
-GGML_METAL_FA_AMD=1 ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -b MTL0
+./build/bin/test-backend-ops -o FLASH_ATTN_EXT -b MTL0
 ```
 
 ## 九、PQ2_0 ternary 适配（Prism 移植，Metal only）
@@ -151,11 +153,44 @@ Hadamard 折叠），原版没有对应类型（ggml type 142）也没有 activa
 用法：
 
 ```sh
-GGML_METAL_FA_AMD=1 ./build-q8/bin/llama-server \
+./build-q8/bin/llama-server \
   -m Bonsai-2-27B-PQ2_0-CRACK.gguf -ngl 99 -c 32768 -fa on \
   --temp 1.0 --top-p 0.95 --top-k 20 --port 8082
 ```
 
 扫参旋钮：`GGML_METAL_{DECODE,PP}_PQ2_0_NSG`（`GGML_METAL_PQ2_0_NSG`
-兜底），NR0 先定死 8。待做：DK256 朴素版挂服务前跑 128-token 贪心
-diff＋PPL 对 Prism 二进制；8k＋ 长 ctx 的 PP 收益未知。
+兜底），NR0 先定死 8。DK256 验证已做：40 token 贪心与 CPU 全注意力
+逐字一致；同二进制 PPL 开 3.9 / 关 4507（q8 KV，关=34 splits 坏路径）。
+
+## 十、KVMem eval（本分支 `kvmem-eval`）
+
+KVMem（KV 上下文虚拟化，https://github.com/kvmem/kvmem-llama.cpp）的
+Metal 接线，Bonsai-2-27B 上跑通 retrieval 全链路。adapter 源码从
+`LLAMA_KVMEM_ROOT`（本地 `kvmem-llama.cpp`，CUDA 上游）直接编译；
+本分支只放 llama.cpp 侧的 Metal 件：
+
+- `ggml-metal-device.{h,m}`：同步批量 D2D blit
+  （`ggml_metal_blit_batched`）、private scratch、harvest D2H 用的
+  shared staging；与 `buffer_cpy_tensor` 同一 blit 范式。
+- stagein-metal＋adapter（在 `LLAMA_KVMEM_ROOT`，不在本分支 push
+  范围）：layout gather/scatter 走 blit（原 host round-trip），
+  harvest 按 block 批量 D2H、零多余拷贝。默认全开，
+  `KVMEM_METAL_BLIT=0` 回 host 回退。
+
+构建：`cmake -B build-kvmem-on -DLLAMA_KVMEM=ON
+-DLLAMA_KVMEM_ROOT=../kvmem-llama.cpp`，目标 `llama-kvmem-cli`
+（用法同上游：`--kvmem --kvmem-budget N --kv-dtype f16|q8_0`）。
+
+实测（RX 6800，Metal，`-ngl 99`，Bonsai-27B，q8 KV，budget 512）：
+
+- reselect layout 40ms→4ms（`layout_d2h+h2d`），retrieval 总计 89ms→
+  52ms；2.5k 与 7.3k prompt 的 BLUEBIRD-7 needle 均命中
+  （`KVMEM_PERF=1` 看分项，`KVMEM_METAL_BLIT=0` 做 A/B）。
+- q8 KV＋retrieval 验证（P1-C）：FA 量化路径接管
+  （`kv_q8_0_f16` 预通道＋`fa_amd` dk256 kernel，65/65 层在 GPU）。
+- 7.3k needle 对无 kvmem 全量基线：pp +14%、tg +40%，且答案正确
+  （基线含糊其辞）。
+
+注意：GPU mean-K kernel 与 capture 批化经实测为噪音级（capture 抓
+的是 ubatch 切片，decode 仅 1 行），没做；tg 缺口主因是 reselect 按
+query 摊销，长回答自动稀释。
