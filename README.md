@@ -128,14 +128,16 @@ this branch holds the llama.cpp-side Metal pieces:
 - `ggml-metal-device.{h,m}`: synchronous batched D2D blit
   (`ggml_metal_blit_batched`), private scratch alloc, shared staging alloc
   for harvest D2H. Same blit-encoder pattern as `buffer_cpy_tensor`.
-- `llama-kvmem-stagein-metal.cpp` + adapter (in `LLAMA_KVMEM_ROOT`,
-  not pushed here): layout gather/scatter via blit instead of the host
-  round-trip, per-block batched harvest D2H with zero extra copies.
-  Default on, `KVMEM_METAL_BLIT=0` restores the host fallbacks.
+- `llama-kvmem-stagein-metal.cpp` + adapter (vendored under
+  `kvmem-upstream/`, snapshot of `kvmem-llama.cpp` @ `81d03d8`): layout
+  gather/scatter via blit instead of the host round-trip, per-block
+  batched harvest D2H with zero extra copies. Default on,
+  `KVMEM_METAL_BLIT=0` restores the host fallbacks.
 
-Build: `cmake -B build-kvmem-on -DLLAMA_KVMEM=ON
--DLLAMA_KVMEM_ROOT=../kvmem-llama.cpp`, target `llama-kvmem-cli`
+Build (self-contained, no extra checkout needed):
+`cmake -B build-kvmem-on -DLLAMA_KVMEM=ON`, target `llama-kvmem-cli`
 (same flags as upstream: `--kvmem --kvmem-budget N --kv-dtype f16|q8_0`).
+Pass `-DLLAMA_KVMEM_ROOT=...` to build against a live checkout instead.
 
 Measured (RX 6800, Metal, `-ngl 99`, Bonsai-27B, q8 KV, budget 512):
 

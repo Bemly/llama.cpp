@@ -132,6 +132,11 @@ option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE
 # submodule build stays bit-identical to upstream.
 option(LLAMA_KVMEM "llama: compile KVMem memory adapter" OFF)
 set(LLAMA_KVMEM_ROOT "" CACHE PATH "kvmem_llamacpp root (libkvmem + src/adapter)")
+if (LLAMA_KVMEM AND LLAMA_KVMEM_ROOT STREQUAL "")
+    # Vendored snapshot in this fork; pass -DLLAMA_KVMEM_ROOT=... to
+    # build against a live kvmem-llama.cpp checkout instead.
+    set(LLAMA_KVMEM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/kvmem-upstream")
+endif()
 
 # extra artifacts
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})

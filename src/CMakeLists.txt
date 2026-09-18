@@ -72,7 +72,7 @@ target_link_libraries(llama PUBLIC ggml)
 
 if (LLAMA_KVMEM)
     if (LLAMA_KVMEM_ROOT STREQUAL "")
-        message(FATAL_ERROR "LLAMA_KVMEM=ON requires LLAMA_KVMEM_ROOT")
+        message(FATAL_ERROR "LLAMA_KVMEM=ON requires LLAMA_KVMEM_ROOT (top-level default covers this)")
     endif()
     target_sources(llama PRIVATE
         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem.cpp

@@ -172,14 +172,15 @@ Metal 接线，Bonsai-2-27B 上跑通 retrieval 全链路。adapter 源码从
 - `ggml-metal-device.{h,m}`：同步批量 D2D blit
   （`ggml_metal_blit_batched`）、private scratch、harvest D2H 用的
   shared staging；与 `buffer_cpy_tensor` 同一 blit 范式。
-- stagein-metal＋adapter（在 `LLAMA_KVMEM_ROOT`，不在本分支 push
-  范围）：layout gather/scatter 走 blit（原 host round-trip），
-  harvest 按 block 批量 D2H、零多余拷贝。默认全开，
-  `KVMEM_METAL_BLIT=0` 回 host 回退。
+- stagein-metal＋adapter（已 vendor 到本分支 `kvmem-upstream/`，
+  快照自 `kvmem-llama.cpp` @ `81d03d8`）：layout gather/scatter 走
+  blit（原 host round-trip），harvest 按 block 批量 D2H、零多余拷贝。
+  默认全开，`KVMEM_METAL_BLIT=0` 回 host 回退。
 
-构建：`cmake -B build-kvmem-on -DLLAMA_KVMEM=ON
--DLLAMA_KVMEM_ROOT=../kvmem-llama.cpp`，目标 `llama-kvmem-cli`
-（用法同上游：`--kvmem --kvmem-budget N --kv-dtype f16|q8_0`）。
+构建（自包含，不需额外 checkout）：`cmake -B build-kvmem-on
+-DLLAMA_KVMEM=ON`，目标 `llama-kvmem-cli`（用法同上游：`--kvmem
+--kvmem-budget N --kv-dtype f16|q8_0`）。传
+`-DLLAMA_KVMEM_ROOT=...` 可改连 live checkout。
 
 实测（RX 6800，Metal，`-ngl 99`，Bonsai-27B，q8 KV，budget 512）：
 
