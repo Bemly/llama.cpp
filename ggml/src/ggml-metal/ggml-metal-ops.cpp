@@ -2421,6 +2421,73 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
+    // RDNA2 VALU blocked mm (kernels/mmq_amd.metal): dense prefill would
+    // otherwise run as per-row mul_mv dispatches re-reading weights.
+    // Default on, GGML_METAL_MMQ_AMD=0 opts out.
+    {
+        static int mmq_cached = -1;
+        if (mmq_cached < 0) {
+            const char * val = getenv("GGML_METAL_MMQ_AMD");
+            mmq_cached = (!val || !val[0] || val[0] != '0') ? 1 : 0;
+        }
+        const bool mmq_gate =
+            mmq_cached == 1 &&
+            (op->src[0]->type == GGML_TYPE_IQ3_S ||
+             op->src[0]->type == GGML_TYPE_Q4_K) &&
+            op->src[1]->type == GGML_TYPE_F32 &&
+            op->type == GGML_TYPE_F32 &&
+            ne00 % 256 == 0 &&
+            !ggml_is_transposed(op->src[0]) &&
+            !ggml_is_transposed(op->src[1]) &&
+            ne11 > 8;
+        if (mmq_gate) {
+            struct mmq_amd_args {
+                ggml_metal_kargs_mul_mm base;
+                int32_t ne12;
+                int32_t ne13;
+                int32_t r2;
+                int32_t r3;
+            } args = {
+                {
+                    /*.ne00 =*/ ne00,
+                    /*.ne02 =*/ ne02,
+                    /*.nb01 =*/ nb01,
+                    /*.nb02 =*/ nb02,
+                    /*.nb03 =*/ nb03,
+                    /*.ne12 =*/ ne12,
+                    /*.nb10 =*/ nb10,
+                    /*.nb11 =*/ nb11,
+                    /*.nb12 =*/ nb12,
+                    /*.nb13 =*/ nb13,
+                    /*.ne0  =*/ ne0,
+                    /*.ne1  =*/ ne1,
+                    /*.r2   =*/ r2,
+                    /*.r3   =*/ r3,
+                },
+                ne12, ne13, r2, r3,
+            };
+            char mmq_name[256];
+            snprintf(mmq_name, sizeof(mmq_name), "kernel_mul_mm_%s_f32_amd",
+                     ggml_type_name(op->src[0]->type));
+            auto pipeline = ggml_metal_library_get_pipeline(lib, mmq_name);
+            if (!pipeline.pipeline) {
+                pipeline = ggml_metal_library_compile_pipeline(
+                    lib, mmq_name, mmq_name, nullptr);
+            }
+            if (pipeline.pipeline) {
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, (64*32 + 64*32)*sizeof(float) + 512*sizeof(uint32_t), 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne0 + 63)/64, (ne1 + 63)/64, ne12*ne13, 256, 1, 1);
+                return 1;
+            }
+            // else fall through to the normal paths
+        }
+    }
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&

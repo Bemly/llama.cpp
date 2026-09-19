@@ -2583,6 +2583,30 @@ kernel void kernel_mul_mv_iq3_s_f32(
     kernel_mul_mv_iq3_s_f32_disp<constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+kernel void kernel_mul_mv_iq3_s_f32_nr0_2(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq3_s_f32_impl<2, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_iq3_s_f32_nr0_8(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq3_s_f32_impl<8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_iq2_s_f32_impl(
         args_t args,
@@ -3648,4 +3672,101 @@ kernel void kernel_mul_mv_q5_0_f32_nr0_4(
     mul_vec_q_n_f32_impl<block_q5_0, 4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+
+
+// MMQ-style IQ3_S matvec (Vulkan mul_mat_vec_iq3_s port): one TG per output
+// row, 256 threads, TPB=16 threads per K-block, vec4 y loads, FMA chains,
+// simd+shared reduce. Decode path (ne11==1); opt-in via dispatch suffix.
+// Grid tables staged once per TG (2KB).
+kernel void kernel_mul_mv_iq3_s_f32_mmq(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    // One TG per output row (wr), 256 threads. Each thread owns one 16-elem
+    // aligned chunk (16c is 32-aligned within subgroup s=c/2 for even c and
+    // offset 16 for odd c; the 16 elems never cross a 32-elem boundary).
+    // Reduce via simd + shared. Decode path (ne11==1).
+    // NOTE dispatch grid: x = tokens, y = weight rows (see encode site).
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im % FC_mul_mv_ne12;
+    const uint i13 = im / FC_mul_mv_ne12;
+
+    // One TG covers 8 weight rows (dispatch packs nr0*nsg rows per TG);
+    // all 256 threads collaborate on each row in turn.
+    for (int rr = 0; rr < 8; ++rr) {
+        const int wr = tgpig.x*8 + rr;
+        if (wr >= args.ne01) {
+            break;
+        }
+            device const block_iq3_s * xbase =
+                (device const block_iq3_s *)(src0 + (uint64_t)wr*args.nb01 +
+                    (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03);
+            device const float * y =
+                (device const float *)(src1 + (uint64_t)r1*args.nb11 + i12*args.nb12 + i13*args.nb13);
+
+            const int nb = args.ne00 / 256;
+
+            threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
+            {
+                const uint tid0 = sgitg * 32u + tiisg;
+                for (int k = tid0*2; k < 512; k += 512) {
+                    svalues[k+0] = iq3s_grid[k+0];
+                    svalues[k+1] = iq3s_grid[k+1];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            const uint tid = sgitg * 32u + tiisg;
+            const uint c = tid % 16;   // 16-elem chunk index within block
+            const uint ix = tid / 16;  // block group (16 in flight)
+
+            float temp = 0.f;
+            for (int bi = ix; bi < nb; bi += 16) {
+                device const block_iq3_s * xr = xbase + bi;
+                device const half * dh = (device const half *)&xr->d;
+                const float d = float(dh[0]);
+                // chunk elems [16c, 16c+16): subgroup s, scale nibble, qh byte
+                const uint s = c / 2;
+                const uint h = c % 2;
+                const uint8_t scb = xr->scales[s/2];
+                const float dscale = d * (1.f + 2.f * (float)((scb >> (4*(s%2))) & 0xf));
+                const uint8_t qh = xr->qh[s];
+                float bsum = 0.f;
+                for (uint li = 0; li < 4; ++li) {
+                    const uint l = 4*h + li;   // qs index 0..7 in subgroup
+                    const uint8_t qs0 = xr->qs[8*s + l];
+                    const uint sbyte = xr->signs[4*s + l/2];
+                    const uint32_t g0 = svalues[qs0 | (((qh >> l) & 1) << 8)];
+                    const uint sh = (l & 1) ? 4 : 0;
+                    for (uint j = 0; j < 4; ++j) {
+                        float yv = y[bi*256 + 32*s + 16*h + 4*li + j];
+                        float gv = (float)((g0 >> (8*j)) & 0xff);
+                        float sv = ((sbyte >> (sh + j)) & 1u) ? -1.f : 1.f;
+                        bsum += yv * gv * sv;
+                    }
+                }
+                temp += dscale * bsum;
+            }
+
+            threadgroup float * sht = (threadgroup float *)(shmem + 2048);
+            sht[tid] = temp;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                float sum = 0.f;
+                for (int k = 0; k < 256; ++k) {
+                    sum += sht[k];
+                }
+                device float * dst_f32 = (device float *)dst + im*args.ne0*args.ne1 + r1*args.ne0;
+                dst_f32[wr] = sum;
+            }
+
+    }
+}
 

@@ -104,9 +104,12 @@ if (GGML_METAL_EMBED_LIBRARY)
             COMMAND echo .incbin "\"${EMBED}\""                                  >> "${ASM}"
             COMMAND echo ".globl _ggml_metallib_${kind_sym}_end"                 >> "${ASM}"
             COMMAND echo "_ggml_metallib_${kind_sym}_end:"                       >> "${ASM}"
-            DEPENDS ../ggml-common.h ggml-metal-impl.h
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-common.h ggml-metal-impl.h
                     kernels/common.h kernels/dequantize.h kernels/quantize.h
-                    kernels/${kind}.metal
+                    # NOTE: absolute path is required here; a relative
+                    # kernels/<kind>.metal silently stops retriggering the
+                    # embed on source edits (stale-metallib footgun).
+                    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kind}.metal
             COMMENT "Generate embedded Metal library for ${kind}"
             VERBATIM
         )
@@ -181,7 +184,7 @@ else()
         add_custom_command(
             OUTPUT ${AIR}
             COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -I ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} -c ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${src} -o ${AIR}
-            DEPENDS ${src} kernels/common.h kernels/dequantize.h kernels/quantize.h ${METALLIB_COMMON} ggml-metal-impl.h
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${src} kernels/common.h kernels/dequantize.h kernels/quantize.h ${METALLIB_COMMON} ggml-metal-impl.h
             COMMENT "Compiling ${src}"
             VERBATIM
         )
@@ -197,7 +200,7 @@ else()
         add_custom_command(
             OUTPUT ${AIR_MM_TENSOR}
             COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS_TENSOR} -DGGML_METAL_HAS_TENSOR -I ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} -c ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/kernels/mul_mm.metal -o ${AIR_MM_TENSOR}
-            DEPENDS kernels/mul_mm.metal kernels/common.h kernels/dequantize.h ${METALLIB_COMMON} ggml-metal-impl.h
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/mul_mm.metal kernels/common.h kernels/dequantize.h ${METALLIB_COMMON} ggml-metal-impl.h
             COMMENT "Compiling kernels/mul_mm.metal (tensor API)"
             VERBATIM
         )

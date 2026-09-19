@@ -1152,14 +1152,47 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_IQ3_S:
             {
-                nsg = N_SG_IQ3_S;
+                // RX6800 IQ3_S sweep (Q8 precedent): phase-split NR0/NSG.
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_IQ3S_NSG",
+                                                "GGML_METAL_PP_IQ3S_NSG",
+                                                "GGML_METAL_IQ3S_NSG", N_SG_IQ3_S, 1, 8);
                 nr0 = N_R0_IQ3_S;
+                const char * env_nr0_iq3s = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_IQ3S_NR0",
+                                                                         "GGML_METAL_PP_IQ3S_NR0",
+                                                                         "GGML_METAL_IQ3S_NR0");
+                if (env_nr0_iq3s && env_nr0_iq3s[0]) {
+                    const int v = ggml_metal_nr0_variant_(atoi(env_nr0_iq3s));
+                    if (v == 2 || v == 4 || v == 8) {
+                        nr0 = v;
+                        suffix = v == 4 ? "" : (v == 8 ? "_nr0_8" : "_nr0_2");
+                    }
+                }
                 smem = 512*4;
 
                 const int nb32 = ne00/32;
                 if (nb32 < 32 && (32 % nb32) == 0) {
                     nr0 = N_R0_IQ3_S_SPLIT;
                     split = true;
+                }
+                // MMQ-style port (Vulkan matvec translation): one TG per
+                // output row, 256 threads. Decode only (ne11==1), opt-in via
+                // GGML_METAL_MMQ_MV=1 until validated, then default-on.
+                {
+                    static int mmq_mv = -2;
+                    if (mmq_mv == -2) {
+                        const char * e = getenv("GGML_METAL_MMQ_MV");
+                        mmq_mv = (e && e[0] && e[0] != '0') ? 1 : 0;
+                    }
+                    if (mmq_mv == 1 && !split && ne11 == 1 &&
+                        tsrc1 == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+                        suffix = "_mmq";
+                        nsg = 8;
+                        nr0 = 1;
+                        nr1 = 1;
+                        smem = 2048 + 1024;
+                    }
                 }
             } break;
         case GGML_TYPE_IQ2_S:
@@ -1582,8 +1615,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_IQ3_S:
             {
-                nsg = N_SG_IQ3_S;
+                // RX6800 IQ3_S sweep (Q8 precedent): phase-split NR0/NSG.
+                nsg = ggml_metal_env_phase_int_(is_decode_like,
+                                                "GGML_METAL_DECODE_IQ3S_NSG",
+                                                "GGML_METAL_PP_IQ3S_NSG",
+                                                "GGML_METAL_IQ3S_NSG", N_SG_IQ3_S, 1, 8);
                 nr0 = N_R0_IQ3_S;
+                const char * env_nr0_iq3s = ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                                         "GGML_METAL_DECODE_IQ3S_NR0",
+                                                                         "GGML_METAL_PP_IQ3S_NR0",
+                                                                         "GGML_METAL_IQ3S_NR0");
+                if (env_nr0_iq3s && env_nr0_iq3s[0]) {
+                    const int v = ggml_metal_nr0_variant_(atoi(env_nr0_iq3s));
+                    if (v == 2 || v == 4 || v == 8) {
+                        nr0 = v;
+                        suffix = v == 4 ? "" : (v == 8 ? "_nr0_8" : "_nr0_2");
+                    }
+                }
                 smem = 512*4;
 
                 const int nb32 = ne00/32;

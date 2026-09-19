@@ -44,7 +44,7 @@
 - `tools/llama-bench/llama-bench.cpp`：`test_gen` 每 32 token 同步一次（原来每
   token 同步，14B tg 被低估 2.8%）。
 
-## 三、门控规则（不满足就回退上游，一律安全默认关）
+## 三、门控规则（不满足就回退上游；默认开关见环境变量表）
 
 1. 总开关 `GGML_METAL_FA_AMD`（默认开，`=0` 关闭）。DK256 朴素版已对 CPU
    全注意力 token-identical（Bonsai-27B q8 KV，40 token 贪心）；关闭时量化
@@ -59,6 +59,9 @@
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `GGML_METAL_FA_AMD` | 开 | 自研 FA 总开关（`=0` 关） |
+| `GGML_METAL_MMQ_AMD` | 开 | VALU blocked mul_mm（IQ3_S/Q4_K prefill，`=0` 关） |
+| `GGML_METAL_MMQ_MV` | 关 | IQ3_S matvec 移植版（正确但暂无增益，`=1` 开） |
+| `GGML_METAL_{DECODE,PP}_IQ3S_{NR0,NSG}` | NR0 4 / NSG 2 | IQ3_S mul_mv 扫参（`nr0_2/8` 变体已备） |
 | `KVMEM_METAL_BLIT` | 开 | KVMem Metal blit 快路径（`=0` 回 host 回退） |
 | `GGML_METAL_{DECODE_FA,PP_FA,FA}_{SPLIT,NBC}` | SPLIT 0=自动，NBC 128 | vec split 数（0=自动凑 ~96 tg，上限16）/ KV 块大小（dk256 钳 64） |
 | `GGML_METAL_{DECODE,PP}_*_NR0/NSG`（+全局兜底） | nr0=2，nsg=4 | mul_mv 变体与 NSG 相位旋钮；Q8 `nr0=4` pp+28% 但 tg-3.6%，默认不动 |
@@ -196,7 +199,7 @@ Metal 接线，Bonsai-2-27B 上跑通 retrieval 全链路。adapter 源码从
 的是 ubatch 切片，decode 仅 1 行），没做；tg 缺口主因是 reselect 按
 query 摊销，长回答自动稀释。
 
-### 十一、KVMem server（`llama-kvmem-server`，Qwen3.8-27B）
+## 十一、KVMem server（`llama-kvmem-server`，Qwen3.8-27B）
 
 `tools/kvmem-server` 从 vendor 源码编 OpenAI 兼容 server（文本＋tools，
 vision 走 `--mmproj`）。RX 6800 上用自带 MTP 头的
@@ -214,3 +217,20 @@ Metal 必备（已在树内改默认）：`--kvmem-mtp-state snapshots`（replay
 Metal 下算出垃圾）、`-b 128`＋`GGML_METAL_N_CB=16`（大 prefill 图触
 watchdog）。端到端验证：2.5k prompt needle 经 HTTP 返回 BLUEBIRD-7，
 MTP 接受率 ~67%。
+
+## 十二、MMQ for Metal（`GGML_METAL_MMQ_AMD`，默认开）
+
+上游 dense `mul_mm` 要 `simdgroup_mm`（Apple 独占），RDNA2 上 dense
+prefill 全走逐行 `mul_mv`（权重每行重读一遍，Qwen3.8-27B IQ3_M 只有
+pp 4.25）。`mul_mm.metal` 加 VALU blocked kernel
+（`kernel_mul_mm_{iq3_s,q4_K}_f32_amd`，64x64 tile，K 步长 32，在线
+dequant，不要 tensor core）：pp 4.25→42.7，同卡 stock
+Vulkan/MoltenVK 是 25.1，已超。门控：IQ3_S/Q4_K＋F32 activation＋
+K%256==0＋M>8 行；`=0` 可关。`test-backend-ops -o MUL_MAT` 3/3＋端到
+端 needle 背书。
+
+decode（`mul_mv`）另算：原版 Metal tg 3.65 对 Vulkan 9.15；移植版
+（`kernel_mul_mv_iq3_s_f32_mmq`，`GGML_METAL_MMQ_MV=1` opt-in）正确
+（套件全绿）但性能持平，先保持 opt-in。旋钮全扫过（`IQ3S_NR0/NSG`、
+`nr0_2/8` 变体），tg 波动 <5%——差的是结构不是参数。0.8B 小模型
+tg Metal 176 对 Vulkan 157，无固定开销问题。

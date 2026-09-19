@@ -118,6 +118,25 @@ tg 31.29 (+80%). Correctness: identical greedy output with FA on/off;
 Tuning knob: `GGML_METAL_{DECODE,PP}_PQ2_0_NSG`
 (`GGML_METAL_PQ2_0_NSG` fallback).
 
+### MMQ for Metal (`GGML_METAL_MMQ_AMD`, default on)
+
+Upstream dense `mul_mm` needs `simdgroup_mm` (Apple-only), so on RDNA2
+every dense prefill matmul ran as per-row `mul_mv` dispatches re-reading
+weights once per row (Qwen3.8-27B IQ3_M: pp 4.25). `kernels/mul_mm.metal`
+gains VALU blocked kernels (`kernel_mul_mm_{iq3_s,q4_K}_f32_amd`, tile
+64x64, K step 32, on-the-fly dequant, no tensor cores): pp 4.25 -> 42.7,
+ beating stock Vulkan/MoltenVK on the same card (25.1). Gate: IQ3_S/Q4_K,
+ F32 activations, K % 256 == 0, M > 8 rows; `=0` opts out. Validated by
+ `test-backend-ops -o MUL_MAT` (3/3) and end-to-end needle runs.
+
+Decode (`mul_mv`) is a separate story: stock Metal tg 3.65 vs Vulkan 9.15,
+ and our port (`kernel_mul_mv_iq3_s_f32_mmq`, opt-in via
+ `GGML_METAL_MMQ_MV=1`) is correct (suite green) but performance-neutral,
+ so it stays opt-in. Knob sweeps (`GGML_METAL_{DECODE,PP}_IQ3S_{NR0,NSG}`,
+ `nr0_2`/`nr0_8` variants) move tg <5%: the gap needs deeper surgery,
+ not tuning. Small-model sanity: 0.8B tg Metal 176 vs Vulkan 157 (no
+ fixed-overhead gap).
+
 ### KVMem eval (`kvmem-eval`: this branch)
 
 KVMem (KV-context virtualization, https://github.com/kvmem/kvmem-llama.cpp)

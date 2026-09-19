@@ -968,3 +968,268 @@ template [[host_name("kernel_mul_mm_id_iq1_m_f16")]]   kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_iq4_nl_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_xs_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
+
+// VALU blocked matmul for IQ3_S on AMD RDNA2 (no simdgroup_mm there, so a
+// dense prefill would otherwise run as per-row mul_mv dispatches re-reading
+// the weights once per row).
+//
+// C[N][M] = A[N][K] x B[K][M], A rows are IQ3_S blocks, B/D are F32.
+// Tile 64(N) x 64(M), K step 32, 256 threads/TG, shared 18KB
+// (8KB dequant A + 8KB B + 2KB grid). Gate requires K % 256 == 0.
+struct mmq_amd_kargs {
+    ggml_metal_kargs_mul_mm base;
+    int32_t ne12;
+    int32_t ne13;
+    int32_t r2;
+    int32_t r3;
+};
+
+kernel void kernel_mul_mm_iq3_s_f32_amd(
+        constant mmq_amd_kargs & args_,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constant ggml_metal_kargs_mul_mm & args = args_.base;
+    const int K = args.ne00;
+    const int N = args.ne0;
+    const int M = args.ne1;
+
+    const int im = tgpig.z;
+    const int i12 = im % args_.ne12;
+    const int i13 = im / args_.ne12;
+    const uint64_t offA = (i12/args_.r2)*args.nb02 + (i13/args_.r3)*args.nb03;
+    device const char * srcB = src1 + args.nb12*i12 + args.nb13*i13;
+    device float * dstB = (device float *)(dst + (uint64_t)im * (uint64_t)N * (uint64_t)M * sizeof(float));
+
+    const int n0 = tgpig.x * 64;
+    const int m0 = tgpig.y * 64;
+
+    threadgroup float *    sA    = (threadgroup float *)shmem;
+    threadgroup float *    sB    = (threadgroup float *)(shmem + 64*32*sizeof(float));
+    threadgroup uint32_t * sgrid = (threadgroup uint32_t *)(shmem + 2*64*32*sizeof(float));
+
+    for (int i = tiitg; i < 512; i += 256) {
+        sgrid[i] = iq3s_grid[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 16 outputs per thread: 4 N x 4 M
+    const int tn = tiitg % 16;
+    const int tm = tiitg / 16;
+    float acc[16];
+    for (int i = 0; i < 16; ++i) {
+        acc[i] = 0.f;
+    }
+
+    // dequant/load rows: 64 rows x 8 elems per thread
+    const int  r = tiitg / 4;
+    const int  q = tiitg % 4;
+
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        // --- dequant A tile: row r, K-coords [k0+q*8, +8) ---
+        {
+            const int e0 = k0 + q*8;
+            const int b   = e0 / 256;
+            const int sub = (e0 % 256) / 32;
+            const int l0  = 2*q;
+            const int n = n0 + r;
+            if (n < N) {
+                device const block_iq3_s * xr =
+                    (device const block_iq3_s *)(src0 + args.nb01*(uint64_t)n + offA) + b;
+                device const half * dh = (device const half *)&xr->d;
+                const float d = float(dh[0]);
+                const uint8_t scb = xr->scales[sub/2];
+                const float dsc = d * (1.f + 2.f * (float)((scb >> (4*(sub%2))) & 0xf));
+                const uint8_t qh = xr->qh[sub];
+                const uint8_t sbyte = xr->signs[4*sub + q];
+                for (int jj = 0; jj < 2; ++jj) {
+                    const int l = l0 + jj;
+                    const uint8_t qs = xr->qs[8*sub + l];
+                    // grid-select bit uses the l_iter index (q .. q, one per
+                    // 8-elem half): bit (2*q+jj), not the qs index l = 2*q+jj
+                    // scaled by 2.
+                    const uint32_t g = sgrid[qs | (((qh >> (2*q + jj)) & 1) << 8)];
+                    for (int j = 0; j < 4; ++j) {
+                        const float gb = (float)((g >> (8*j)) & 0xff);
+                        const float s = ((sbyte >> (j + 4*jj)) & 1) ? -1.f : 1.f;
+                        sA[r*32 + q*8 + jj*4 + j] = dsc * gb * s;
+                    }
+                }
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    sA[r*32 + q*8 + j] = 0.f;
+                }
+            }
+        }
+        // --- load B tile: sB[m][k], same thread decomposition ---
+        {
+            const int m = m0 + r;
+            if (m < M) {
+                device const char * Brow = srcB + args.nb11*(uint64_t)m;
+                for (int j = 0; j < 8; ++j) {
+                    sB[r*32 + q*8 + j] =
+                        *(device const float *)(Brow + args.nb10*(uint64_t)(k0 + q*8 + j));
+                }
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    sB[r*32 + q*8 + j] = 0.f;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < 32; ++kk) {
+            for (int a = 0; a < 4; ++a) {
+                const float av0 = sA[(tn*4+a)*32 + kk];
+                for (int b = 0; b < 4; ++b) {
+                    acc[a*4+b] += av0 * sB[(tm*4+b)*32 + kk];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int a = 0; a < 4; ++a) {
+        for (int b = 0; b < 4; ++b) {
+            const int n = n0 + tn*4 + a;
+            const int m = m0 + tm*4 + b;
+            if (n < N && m < M) {
+                dstB[(uint64_t)n + (uint64_t)m * (uint64_t)N] = acc[a*4+b];
+            }
+        }
+    }
+}
+// VALU blocked matmul for Q4_K on AMD RDNA2 (no simdgroup_mm there, so a
+// dense prefill would otherwise run as per-row mul_mv dispatches re-reading
+// the weights once per row).
+//
+// C[N][M] = A[N][K] x B[K][M], A rows are Q4_K blocks, B/D are F32.
+// Tile 64(N) x 64(M), K step 32, 256 threads/TG, shared 16KB
+// (8KB dequant A + 8KB B; no grid tables needed). Gate requires K % 256 == 0.
+
+kernel void kernel_mul_mm_q4_K_f32_amd(
+        constant mmq_amd_kargs & args_,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constant ggml_metal_kargs_mul_mm & args = args_.base;
+    const int K = args.ne00;
+    const int N = args.ne0;
+    const int M = args.ne1;
+
+    const int im = tgpig.z;
+    const int i12 = im % args_.ne12;
+    const int i13 = im / args_.ne12;
+    const uint64_t offA = (i12/args_.r2)*args.nb02 + (i13/args_.r3)*args.nb03;
+    device const char * srcB = src1 + args.nb12*i12 + args.nb13*i13;
+    device float * dstB = (device float *)(dst + (uint64_t)im * (uint64_t)N * (uint64_t)M * sizeof(float));
+
+    const int n0 = tgpig.x * 64;
+    const int m0 = tgpig.y * 64;
+
+    threadgroup float *    sA    = (threadgroup float *)shmem;
+    threadgroup float *    sB    = (threadgroup float *)(shmem + 64*32*sizeof(float));
+
+    // 16 outputs per thread: 4 N x 4 M
+    const int tn = tiitg % 16;
+    const int tm = tiitg / 16;
+    float acc[16];
+    for (int i = 0; i < 16; ++i) {
+        acc[i] = 0.f;
+    }
+
+    // dequant/load rows: 64 rows x 8 elems per thread
+    const int  r = tiitg / 4;
+    const int  q = tiitg % 4;
+
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        // --- dequant A tile: row r, K-coords [k0+q*8, +8) ---
+        {
+            const int e0 = k0 + q*8;
+            const int b   = e0 / 256;
+            const int sub = (e0 % 256) / 32;
+            const int l0  = 2*q; (void) l0;
+            const int n = n0 + r;
+            if (n < N) {
+                device const block_q4_K * xr =
+                    (device const block_q4_K *)(src0 + args.nb01*(uint64_t)n + offA) + b;
+                device const half * dh = (device const half *)&xr->d;
+                device const half * mh = (device const half *)&xr->dmin;
+                const float d0 = float(dh[0]);
+                const float m0 = float(mh[0]);
+                // 8 elems at [e0, e0+8) stay inside one 32-half (e0 = k0+8q,
+                // k0 % 32 == 0): pick its (d, m) scale pair once.
+                const int e_in = (e0 % 256);
+                const int j = e_in / 64;
+                const int l = e_in % 64;
+                const int is = 2*j + (l < 32 ? 0 : 1);
+                uint8_t sc, m;
+                if (is < 4) {
+                    sc = xr->scales[is] & 63; m = xr->scales[is + 4] & 63;
+                } else {
+                    sc = (xr->scales[is+4] & 0xF) | ((xr->scales[is-4] >> 6) << 4);
+                    m  = (xr->scales[is+4] >>  4) | ((xr->scales[is-0] >> 6) << 4);
+                }
+                const float dd = d0 * (float)sc;
+                const float ml = m0 * (float)m;
+                // Q4_K nibbles are NOT interleaved: low 32 elems are the low
+                // nibbles of bytes 0..31, high 32 the high nibbles.
+                const int P = (l < 32 ? l : l - 32);
+                const int lowhalf = (l < 32) ? 1 : 0;
+                for (int t = 0; t < 8; ++t) {
+                    const uint8_t qb = xr->qs[32*j + P + t];
+                    const uint8_t qv = lowhalf ? (qb & 0xF) : (qb >> 4);
+                    sA[r*32 + q*8 + t] = dd * (float)qv - ml;
+                }
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    sA[r*32 + q*8 + j] = 0.f;
+                }
+            }
+        }
+        // --- load B tile: sB[m][k], same thread decomposition ---
+        {
+            const int m = m0 + r;
+            if (m < M) {
+                device const char * Brow = srcB + args.nb11*(uint64_t)m;
+                for (int j = 0; j < 8; ++j) {
+                    sB[r*32 + q*8 + j] =
+                        *(device const float *)(Brow + args.nb10*(uint64_t)(k0 + q*8 + j));
+                }
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    sB[r*32 + q*8 + j] = 0.f;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < 32; ++kk) {
+            for (int a = 0; a < 4; ++a) {
+                const float av0 = sA[(tn*4+a)*32 + kk];
+                for (int b = 0; b < 4; ++b) {
+                    acc[a*4+b] += av0 * sB[(tm*4+b)*32 + kk];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int a = 0; a < 4; ++a) {
+        for (int b = 0; b < 4; ++b) {
+            const int n = n0 + tn*4 + a;
+            const int m = m0 + tm*4 + b;
+            if (n < N && m < M) {
+                dstB[(uint64_t)n + (uint64_t)m * (uint64_t)N] = acc[a*4+b];
+            }
+        }
+    }
+}
