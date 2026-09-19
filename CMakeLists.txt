@@ -135,7 +135,7 @@ set(LLAMA_KVMEM_ROOT "" CACHE PATH "kvmem_llamacpp root (libkvmem + src/adapter)
 if (LLAMA_KVMEM AND LLAMA_KVMEM_ROOT STREQUAL "")
     # Vendored snapshot in this fork; pass -DLLAMA_KVMEM_ROOT=... to
     # build against a live kvmem-llama.cpp checkout instead.
-    set(LLAMA_KVMEM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/kvmem-upstream")
+    set(LLAMA_KVMEM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/kvmem-upstream" CACHE PATH "kvmem_llamacpp root (libkvmem + src/adapter)" FORCE)
 endif()
 
 # extra artifacts

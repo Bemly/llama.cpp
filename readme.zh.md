@@ -195,3 +195,22 @@ Metal 接线，Bonsai-2-27B 上跑通 retrieval 全链路。adapter 源码从
 注意：GPU mean-K kernel 与 capture 批化经实测为噪音级（capture 抓
 的是 ubatch 切片，decode 仅 1 行），没做；tg 缺口主因是 reselect 按
 query 摊销，长回答自动稀释。
+
+### 十一、KVMem server（`llama-kvmem-server`，Qwen3.8-27B）
+
+`tools/kvmem-server` 从 vendor 源码编 OpenAI 兼容 server（文本＋tools，
+vision 走 `--mmproj`）。RX 6800 上用自带 MTP 头的
+`Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_M` 跑通：
+
+```sh
+GGML_METAL_N_CB=16 ./build-kvmem-on/bin/llama-kvmem-server \
+  -m Qwen3.8-27B-IQ3_M.gguf --port 18204 -c 4096 -ngl 99 -b 128 \
+  --kvmem-budget 1024 --kvmem-gen-reserve 512 --kv-dtype q8_0 \
+  --spec-type draft-mtp --kvmem-mtp-state snapshots
+```
+
+Metal 必备（已在树内改默认）：`--kvmem-mtp-state snapshots`（replay
+只要 CUDA，直接拒绝启动）、MTP KV 继承 `--kv-dtype`（F16 MTP KV 在
+Metal 下算出垃圾）、`-b 128`＋`GGML_METAL_N_CB=16`（大 prefill 图触
+watchdog）。端到端验证：2.5k prompt needle 经 HTTP 返回 BLUEBIRD-7，
+MTP 接受率 ~67%。

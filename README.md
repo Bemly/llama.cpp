@@ -149,6 +149,26 @@ Measured (RX 6800, Metal, `-ngl 99`, Bonsai-27B, q8 KV, budget 512):
 - 7.3k needle vs full-context baseline: pp +14%, tg +40%, and the
   correct answer (baseline answers vaguely).
 
+### KVMem server (`llama-kvmem-server`, Qwen3.8-27B)
+
+`tools/kvmem-server` builds the OpenAI-compatible server from vendored
+sources (text + tools; vision via `--mmproj`). Verified on RX 6800 with
+`Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_M` (has blk.64 MTP head):
+
+```sh
+GGML_METAL_N_CB=16 ./build-kvmem-on/bin/llama-kvmem-server \
+  -m Qwen3.8-27B-IQ3_M.gguf --port 18204 -c 4096 -ngl 99 -b 128 \
+  --kvmem-budget 1024 --kvmem-gen-reserve 512 --kv-dtype q8_0 \
+  --spec-type draft-mtp --kvmem-mtp-state snapshots
+```
+
+Notes (all required on Metal, defaults fixed in-tree): `--kvmem-mtp-state
+snapshots` (replay mode is CUDA-only and refuses to start), MTP KV inherits
+`--kv-dtype` (F16 MTP KV computes garbage on Metal), `-b 128` with
+`GGML_METAL_N_CB=16` (large prefill graphs trip the GPU watchdog).
+Retrieval + MTP verified end to end: 2.5k-prompt needle returns BLUEBIRD-7
+over HTTP with MTP accept ~67%.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
