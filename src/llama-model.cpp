@@ -1917,6 +1917,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
+            // Metal splits a range larger than one chunk with an overlap of the largest tensor, so a single
+            // range per file wastes budget. split at tensor borders instead, one buffer per segment.
+            // set GGML_METAL_SEGMENTED_MMAP=0 for the old single range per file.
+            bool do_segment = strncmp(ggml_backend_buft_name(buft), "MTL", 3) == 0;
+            if (const char * env = getenv("GGML_METAL_SEGMENTED_MMAP")) {
+                do_segment = do_segment && strcmp(env, "0") != 0;
+            }
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
@@ -1928,13 +1935,65 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (first >= last) {
                     continue;
                 }
-                const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                if (!do_segment) {
+                    const size_t max_size = ggml_get_max_tensor_size(ctx);
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                    bufs.emplace_back(buf);
+                    buf_map.emplace(idx, std::vector<ggml_backend_buffer_t>{buf});
+                    continue;
                 }
-                bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
+                struct seg_range {
+                    size_t first;
+                    size_t len;
+                    size_t max_tensor;
+                };
+                std::vector<std::pair<size_t, size_t>> ranges;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    const auto * w = ml.get_weight(ggml_get_name(t));
+                    if (!w || w->idx != idx) {
+                        continue;
+                    }
+                    ranges.emplace_back(w->offs, w->offs + ggml_nbytes(t));
+                }
+                if (ranges.empty()) {
+                    continue;
+                }
+                std::sort(ranges.begin(), ranges.end());
+                // greedy cut: seal before a tensor that would push past one Metal chunk, or past a gap (offloaded layers leave holes)
+                const size_t seg_cap = ggml_backend_buft_get_max_size(buft);
+                const size_t seg_gap = 64 * 1024;
+                std::vector<seg_range> segs;
+                size_t seg_first = ranges[0].first;
+                size_t seg_end   = ranges[0].second;
+                size_t seg_max   = ranges[0].second - ranges[0].first;
+                for (size_t i = 1; i < ranges.size(); i++) {
+                    const size_t t_offs = ranges[i].first;
+                    const size_t t_end  = ranges[i].second;
+                    if (t_end - seg_first > seg_cap || (t_offs > seg_end && t_offs - seg_end > seg_gap)) {
+                        segs.push_back({seg_first, seg_end - seg_first, seg_max});
+                        seg_first = t_offs;
+                        seg_end   = t_end;
+                        seg_max   = t_end - t_offs;
+                    } else {
+                        seg_end = std::max(seg_end, t_end);
+                        seg_max = std::max(seg_max, t_end - t_offs);
+                    }
+                }
+                segs.push_back({seg_first, seg_end - seg_first, seg_max});
+                std::vector<ggml_backend_buffer_t> seg_bufs;
+                for (const auto & seg : segs) {
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + seg.first, seg.len, seg.max_tensor);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                    bufs.emplace_back(buf);
+                    seg_bufs.push_back(buf);
+                }
+                LLAMA_LOG_DEBUG("%s: file %u split into %zu Metal segments\n", __func__, idx, segs.size());
+                buf_map.emplace(idx, std::move(seg_bufs));
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -1957,7 +2016,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
+                buf_map.emplace(idx, std::vector<ggml_backend_buffer_t>{buf});
             }
         }
 
@@ -2004,7 +2063,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!ml.use_mmap) {
         std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
             const auto & buf_map = ctx_buf_map.second;
-            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+            return !buf_map.empty() && !buf_map.begin()->second.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second.front());
         });
     }
 

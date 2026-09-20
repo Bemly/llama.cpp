@@ -1532,7 +1532,10 @@ bool llama_model_loader::load_all_data(
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
         // First determine if the backend supports the necessary features for async uploads.
-        auto * buf = bufs.count(0) ? bufs.at(0) : nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        if (bufs.count(0) && !bufs.at(0).empty()) {
+            buf = bufs.at(0).front();
+        }
         if (!buf) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
@@ -1603,7 +1606,7 @@ bool llama_model_loader::load_all_data(
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
+            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0).front())),
             ggml_backend_name(upload_backend));
     }
 
@@ -1644,11 +1647,18 @@ bool llama_model_loader::load_all_data(
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
+            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
-                buf_mmap = bufs.at(weight->idx);
+                // one file can own several buffers (segmented mmap): use the one holding this tensor
+                for (auto * b : bufs.at(weight->idx)) {
+                    const auto * base = (uint8_t *) ggml_backend_buffer_get_base(b);
+                    if (data >= base && data + n_size <= base + ggml_backend_buffer_get_size(b)) {
+                        buf_mmap = b;
+                        break;
+                    }
+                }
             }
-            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
