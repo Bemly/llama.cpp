@@ -1,4 +1,4 @@
-# llama.cpp RX 6800 / RDNA2 Metal 分支说明（`kvmem-eval`，默认分支）
+# llama.cpp RX 6800 / RDNA2 Metal 分支说明（`metal-exact-alloc`，默认分支）
 
 英文摘要见 [README.md](README.md) 顶部。本文件是完整中文版，与分支相对
 `ggml-org/llama.cpp master` 的增量逐项对应；PQ2_0 部分见第九节。
@@ -234,3 +234,32 @@ decode（`mul_mv`）另算：原版 Metal tg 3.65 对 Vulkan 9.15；移植版
 （套件全绿）但性能持平，先保持 opt-in。旋钮全扫过（`IQ3S_NR0/NSG`、
 `nr0_2/8` 变体），tg 波动 <5%——差的是结构不是参数。0.8B 小模型
 tg Metal 176 对 Vulkan 157，无固定开销问题。
+（2026-09-20 追记：上面这段根因找错了。Hauhau 的 tg 缺口不是
+kernel 问题，是 loader 的单区间账本把一块 3.5GB chunk 挤进 shared，
+每 token 重读 PCIe。见第十三节；修完 Metal tg 21.05，反超 Vulkan。）
+
+## 十三、Metal 精确分配（segmented mmap，本分支 `metal-exact-alloc`）
+
+Vulkan 的精确分配是白送的：它的 `buffer_from_host_ptr` 上限是
+`false`，loader 直接走逐张量分配。Metal 走 mmap 快捷方式：每个文件
+一个 `[首张量, 尾张量]` 区间，按 3584MiB 切块，每块带
+`max_tensor_size` 重叠。Serenity-27B-Q4_K_M 的 15.4GiB 权重在账面上
+变成 20.49GiB（7 块），14.3GB 的 private 预算只够 3 块半，compute
+一碰 shared 就 `e00002bd` fault。Hauhau-27B 没死但暗亏：一块
+3.5GB 的 chunk 被挤进 shared，每 token 重读 PCIe，tg 只有 3.95。
+
+改法（`src/llama-model.cpp`＋`src/llama-model-loader.{h,cpp}`，
+只动 Metal，kernel 不动）：贪心按张量边界切段（超出一块就封段，
+CPU offload 层留下的 >64KiB 空洞也封段），每段单独
+`buffer_from_host_ptr`，load 时按 data 指针找所属段。每段走单块
+分支，重叠账≈0，段字节之和＝精确权重字节。
+
+- 门控：`GGML_METAL_SEGMENTED_MMAP=0` 回退旧单区间（同二进制精确
+  复现旧数字）。
+- 实测（RX 6800，`-ngl 99`）：Serenity 在
+  `GGML_METAL_VRAM_RESERVE_MB=100` 下 0 `budget exceeded`（5 段全
+  private），pp512 44.5 / tg64 22.3（Vulkan 26.1 / 20.8）；
+  Hauhau tg64 3.95→21.05（Vulkan 9.2）；9B/14B/GSQ 原样不动；
+  `-ngl 60` 的 Metal 映射重新缩小（15.1→13.7GiB 常驻）。
+- `test-backend-ops -o MUL_MAT` 3/3（MTL0 1265/1265）。
+- kvmem 联动：KV 扔内存后 `-c 65536`＋q8 KV 一次分配成功，可跑。

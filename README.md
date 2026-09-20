@@ -1,6 +1,6 @@
 # llama.cpp (RX 6800 / RDNA2 Metal fork)
 
-> This fork targets AMD RX 6800 (RDNA2) on Metal. Default branch is `kvmem-eval`.
+> This fork targets AMD RX 6800 (RDNA2) on Metal. Default branch is `metal-exact-alloc`.
 > Upstream README continues below. Full notes in Chinese: [readme.zh.md](readme.zh.md).
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
@@ -20,7 +20,7 @@
 
 </div>
 
-## RX 6800 / RDNA2 Metal fork notes (`kvmem-eval`)
+## RX 6800 / RDNA2 Metal fork notes (`metal-exact-alloc`)
 
 Self-written Metal flash attention for AMD RDNA2 plus discrete-GPU hardening.
 Upstream gates `FLASH_ATTN_EXT` on `has_simdgroup_mm`, which RDNA2 lacks
@@ -73,6 +73,36 @@ to CPU on this card. This branch replaces that path with VALU kernels.
   F16 and all quantized KV types; random-block-mask cases carry a known
   ~0.026 fixture artifact (half-dot adversarial input, also fails on the
   vec path; neutral/causal masks pass).
+
+### Metal exact allocation (segmented mmap, this branch)
+
+Vulkan gets exact per-tensor placement for free: its
+`buffer_from_host_ptr` cap is `false`, so the loader falls through to
+per-tensor allocation. Metal takes the mmap shortcut instead: one
+`[first tensor, last tensor]` range per file, split into 3584 MiB chunks
+with a `max_tensor_size` overlap per chunk. For Serenity-27B-Q4_K_M that
+turns 15.4 GiB of weights into 20.49 GiB on the books (7 chunks), so the
+14.3 GB private budget covers only 3.5 chunks and compute faults on the
+shared remainder (`e00002bd`). Hauhau-27B never faulted but silently ran
+one 3.5 GiB chunk shared: every decode token re-read it over PCIe
+(3.95 t/s vs 21 t/s fixed).
+
+The fix (`src/llama-model.cpp` + `src/llama-model-loader.{h,cpp}`,
+Metal only, kernels untouched): cut the range at tensor borders with a
+greedy pass (seal before a tensor that would exceed one Metal chunk, or
+past a >64 KiB gap left by CPU-offloaded layers), one
+`buffer_from_host_ptr` per segment, per-tensor buffer lookup at load.
+Each segment takes the single-chunk path, so overlap accounting drops to
+~0 and segment bytes sum to exact weight bytes.
+
+- Gate: `GGML_METAL_SEGMENTED_MMAP=0` restores the old single range per
+  file (same binary reproduces the old numbers exactly).
+- Measured (RX 6800, `-ngl 99`): Serenity-27B-Q4_K_M loads with 0
+  `budget exceeded` at `GGML_METAL_VRAM_RESERVE_MB=100` (all 5 segments
+  private), pp512 44.5 / tg64 22.3 (Vulkan: 26.1 / 20.8);
+  Hauhau-27B tg64 3.95 -> 21.05 (Vulkan: 9.2); 9B/14B/GSQ unchanged;
+  `-ngl 60` shrinks the Metal mapping again (15.1 -> 13.7 GiB resident).
+- `test-backend-ops -o MUL_MAT`: 3/3 backends pass (MTL0 1265/1265).
 
 ### Use
 
