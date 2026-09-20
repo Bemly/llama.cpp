@@ -1,17 +1,18 @@
 name: fork-sync-upstream
 
-# Keeps this fork's default branch up to date with ggml-org/llama.cpp.
-# The target branch is resolved dynamically every run, so renaming the
-# default branch (e.g. kvmem-eval -> metal-exact-alloc) needs no edits here.
+# The ONLY automation in this fork. All other files under
+# .github/workflows/ were removed on purpose: upstream CI needs
+# runners/secrets this fork does not have, and every push spammed
+# failure notifications (e.g. build-cann.yml has zero active jobs
+# but still triggers on push).
 #
-# Behavior:
-# - nothing new upstream            -> no-op, green
-# - fast-forward or clean merge      -> merge commit + push to default branch
-# - merge conflicts                   -> abort, open an issue, fail the job
-# - default branch is push-protected  -> push to auto/sync-<date> + open a PR
-#
-# NOTE: this workflow only ever writes to THIS fork (Bemly/llama.cpp).
-# It never touches ggml-org/llama.cpp.
+# What this does, daily + on demand:
+#   1. merge upstream/master into the current default branch (resolved
+#      dynamically, so renaming the default branch needs no edits here)
+#   2. compile-check the result (Metal + kvmem)
+#   3. push only if the build passes
+# Any failure (conflict or red build) fails the job, which is the
+# notification. Nothing is ever pushed half-done.
 
 on:
   schedule:
@@ -20,8 +21,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
-  pull-requests: write
 
 concurrency:
   group: fork-sync-upstream
@@ -29,98 +28,45 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: macos-26-intel
+    timeout-minutes: 180
     steps:
       - name: Check out full history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Resolve default branch dynamically
-        id: def
+      - name: Merge upstream master into default branch
         run: |
-          echo "branch=${{ github.event.repository.default_branch }}" >> "$GITHUB_OUTPUT"
-
-      - name: Fetch upstream master
-        run: |
-          git remote add upstream https://github.com/ggml-org/llama.cpp.git 2>/dev/null || true
-          git fetch upstream master --prune --tags
-
-      - name: Update local default branch
-        run: |
-          git checkout "${{ steps.def.outputs.branch }}"
-          git pull --ff-only origin "${{ steps.def.outputs.branch }}"
-
-      - name: Check how far behind we are
-        id: chk
-        run: |
-          BEHIND=$(git rev-list --count HEAD..upstream/master)
-          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
-          echo "upstream is $BEHIND commits ahead"
-
-      - name: Merge upstream
-        id: merge
-        if: steps.chk.outputs.behind != '0'
-        run: |
+          set -e
+          BRANCH="${{ github.event.repository.default_branch }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BRANCH="${{ steps.def.outputs.branch }}"
-          if git merge --no-edit -m "fork-sync: merge upstream master into $BRANCH" upstream/master; then
-            echo "status=merged" >> "$GITHUB_OUTPUT"
-          else
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
-            git diff --name-only --diff-filter=U > /tmp/conflicted.txt || true
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git 2>/dev/null || true
+          git fetch upstream master --prune
+          git checkout "$BRANCH"
+          git pull --ff-only origin "$BRANCH"
+          BEHIND=$(git rev-list --count HEAD..upstream/master)
+          echo "upstream is $BEHIND commits ahead of $BRANCH"
+          if [ "$BEHIND" = "0" ]; then
+            echo "UP_TO_DATE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          git merge --no-edit -m "fork-sync: merge upstream master into $BRANCH" upstream/master || {
             git merge --abort
-          fi
+            echo "MERGE CONFLICT, resolve manually"
+            exit 1
+          }
 
-      - name: Push to default branch
-        id: push
-        if: steps.merge.outputs.status == 'merged'
+      - name: Compile check (Metal + kvmem)
+        if: env.UP_TO_DATE != '1'
         run: |
-          BRANCH="${{ steps.def.outputs.branch }}"
-          if git push origin "$BRANCH"; then
-            echo "status=pushed" >> "$GITHUB_OUTPUT"
-          else
-            echo "status=protected" >> "$GITHUB_OUTPUT"
-            SYNCBR="auto/sync-$(date +%Y%m%d)"
-            git checkout -b "$SYNCBR"
-            git push -u origin "$SYNCBR"
-            echo "syncbr=$SYNCBR" >> "$GITHUB_OUTPUT"
-          fi
+          set -e
+          cmake -S . -B build-fork-sync -DGGML_METAL=ON -DLLAMA_KVMEM=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-fork-sync --target llama-kvmem-cli -j "$(sysctl -n hw.ncpu)"
 
-      - name: Open PR when direct push is blocked
-        if: steps.push.outputs.status == 'protected'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        if: env.UP_TO_DATE != '1'
         run: |
-          BRANCH="${{ steps.def.outputs.branch }}"
-          SYNCBR="${{ steps.push.outputs.syncbr }}"
-          N=$(git rev-list --count "$BRANCH".."$SYNCBR")
-          gh pr create --base "$BRANCH" --head "$SYNCBR" \
-            --title "fork-sync: upstream master ($N commits) into $BRANCH" \
-            --body "Direct push to \`$BRANCH\` is blocked (branch protection). Merge this PR after review. Auto-generated by fork-sync-upstream."
-
-      - name: Open issue on merge conflict
-        if: steps.merge.outputs.status == 'conflict'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          BRANCH="${{ steps.def.outputs.branch }}"
-          HEAD_SHA=$(git rev-parse --short upstream/master)
-          {
-            echo "Auto-merge of \`upstream/master\` (@ \`$HEAD_SHA\`) into \`$BRANCH\` hit conflicts and was aborted. Nothing was pushed."
-            echo ""
-            echo "Conflicted files:"
-            echo '```'
-            cat /tmp/conflicted.txt
-            echo '```'
-            echo ""
-            echo "Resolve locally, e.g.:"
-            echo '```sh'
-            echo "git checkout $BRANCH && git pull"
-            echo "git fetch upstream && git merge upstream/master"
-            echo "# fix conflicts, then push"
-            echo '```'
-          } > /tmp/issue.md
-          gh issue create --title "fork-sync: upstream merge conflict on $BRANCH" --body-file /tmp/issue.md
-          exit 1
+          set -e
+          git push origin "${{ github.event.repository.default_branch }}"
