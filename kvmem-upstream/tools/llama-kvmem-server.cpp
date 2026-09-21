@@ -1297,7 +1297,7 @@ struct StreamChatOut {
     }
 };
 
-static json stream_choice_chunk(const std::string & cid, const json & delta, const char * finish) {
+static json stream_choice_chunk(const std::string & cid, const std::string & model, const json & delta, const char * finish) {
     json choice = {
         {"index", 0},
         {"delta", delta},
@@ -1306,6 +1306,7 @@ static json stream_choice_chunk(const std::string & cid, const json & delta, con
     return json{
         {"id", cid},
         {"object", "chat.completion.chunk"},
+        {"model", model},
         {"choices", json::array({std::move(choice)})},
     };
 }
@@ -1337,10 +1338,11 @@ static json usage_json(int n_prompt, int n_gen, int n_cache_hit) {
 }
 
 // OpenAI: last stream chunk has empty choices + usage, no finish_reason.
-static json stream_usage_chunk(const std::string & cid, int n_prompt, int n_gen, int n_cache_hit) {
+static json stream_usage_chunk(const std::string & cid, const std::string & model, int n_prompt, int n_gen, int n_cache_hit) {
     return json{
         {"id", cid},
         {"object", "chat.completion.chunk"},
+        {"model", model},
         {"choices", json::array()},
         {"usage", usage_json(n_prompt, n_gen, n_cache_hit)},
     };
@@ -2088,7 +2090,14 @@ int main(int argc, char ** argv) {
             return [timings, t_turn0, t_pf1, prefill_ms, n_prompt](int n_gen) {
                 const auto now = std::chrono::steady_clock::now();
                 const double gen_ms = std::chrono::duration<double, std::milli>(now - t_pf1).count();
-                *timings = {{"predicted_n", n_gen}, {"predicted_ms", gen_ms}};
+                *timings = {
+                    {"prompt_n", n_prompt},
+                    {"prompt_ms", prefill_ms},
+                    {"prompt_per_second", prefill_ms > 0.0 ? 1000.0 * (double) n_prompt / prefill_ms : 0.0},
+                    {"predicted_n", n_gen},
+                    {"predicted_ms", gen_ms},
+                    {"predicted_per_second", gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0},
+                };
                 const double wall_ms = std::chrono::duration<double, std::milli>(now - t_turn0).count();
                 const double tps = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
                 fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, tps);
@@ -2156,7 +2165,7 @@ int main(int argc, char ** argv) {
                         }
                         return true;
                     };
-                    send(stream_choice_chunk(cid, json{{"role", "assistant"}}, nullptr).dump());
+                    send(stream_choice_chunk(cid, st.model_name, json{{"role", "assistant"}}, nullptr).dump());
                     const auto t_turn0 = std::chrono::steady_clock::now();
                     int n_cache_hit = 0;
                     if (!run_prefill_retrieval(st, toks, &io, &n_cache_hit)) {
@@ -2188,7 +2197,7 @@ int main(int argc, char ** argv) {
                                 gen.push_back(id);
                                 content += piece;
                                 for (const auto & delta : sco.set_text(content, true)) {
-                                    send(stream_choice_chunk(cid, delta, nullptr).dump());
+                                    send(stream_choice_chunk(cid, st.model_name, delta, nullptr).dump());
                                 }
                             },
                             [&]() { return !stream_heartbeat(&io); },
@@ -2242,7 +2251,7 @@ int main(int argc, char ** argv) {
                             gen.push_back(id);
                             hit_stop = strip_stop(content, stops);
                             for (const auto & delta : sco.set_text(content, !hit_stop)) {
-                                send(stream_choice_chunk(cid, delta, nullptr).dump());
+                                send(stream_choice_chunk(cid, st.model_name, delta, nullptr).dump());
                             }
                             if (hit_stop) {
                                 break;
@@ -2257,7 +2266,7 @@ int main(int argc, char ** argv) {
                         }
                         const bool hit_limit = !stopped && !hit_stop && (int) gen.size() >= max_tokens;
                         for (const auto & delta : sco.set_text(content, false)) {
-                            send(stream_choice_chunk(cid, delta, nullptr).dump());
+                            send(stream_choice_chunk(cid, st.model_name, delta, nullptr).dump());
                         }
                         const char * finish = sco.finish_reason(hit_limit);
                         fprintf(stderr,
@@ -2268,8 +2277,8 @@ int main(int argc, char ** argv) {
                         llama_kvmem_decode_mean_flush();
                         emit_gen_wall((int) gen.size());
                         commit_cached(st, toks, gen);
-                        send(stream_choice_chunk(cid, json::object(), finish).dump());
-                        auto usage = stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit);
+                        send(stream_choice_chunk(cid, st.model_name, json::object(), finish).dump());
+                        auto usage = stream_usage_chunk(cid, st.model_name, (int) toks.size(), (int) gen.size(), n_cache_hit);
                         usage["timings"] = *timings;
                         send(usage.dump());
                         sink.write("data: [DONE]\n\n", 14);
@@ -2286,7 +2295,7 @@ int main(int argc, char ** argv) {
                     }
                     const bool hit_limit = (int) gen.size() >= max_tokens;
                     for (const auto & delta : sco.set_text(content, false)) {
-                        send(stream_choice_chunk(cid, delta, nullptr).dump());
+                        send(stream_choice_chunk(cid, st.model_name, delta, nullptr).dump());
                     }
                     const char * finish = sco.finish_reason(hit_limit);
                     fprintf(stderr,
@@ -2296,8 +2305,8 @@ int main(int argc, char ** argv) {
                             sco.prev.content.size(), sco.prev.reasoning_content.size());
                     emit_gen_wall((int) gen.size());
                     commit_cached(st, toks, gen);
-                    send(stream_choice_chunk(cid, json::object(), finish).dump());
-                    auto usage = stream_usage_chunk(cid, (int) toks.size(), (int) gen.size(), n_cache_hit);
+                    send(stream_choice_chunk(cid, st.model_name, json::object(), finish).dump());
+                    auto usage = stream_usage_chunk(cid, st.model_name, (int) toks.size(), (int) gen.size(), n_cache_hit);
                     usage["timings"] = *timings;
                     send(usage.dump());
                     sink.write("data: [DONE]\n\n", 14);
