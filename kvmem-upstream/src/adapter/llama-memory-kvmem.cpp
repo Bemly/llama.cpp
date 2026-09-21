@@ -379,6 +379,82 @@ struct kvmem_pool_plan {
     uint64_t gpu_total = 0;
 };
 
+// P0 startup resource planner (NInfer-absorb): loud ledger, no silent fallback.
+// Runs once per process, after weights are resident and before KV is allocated.
+// Weights come from the model object (file bytes scaled by offload fraction):
+// Metal currentAllocatedSize double-counts residency sets (~2x, measured), so it
+// is printed for cross-check only, never used for the fit decision.
+// Policy: explicit --kvmem-budget that does not fit -> fatal; budget=0 (auto)
+// keeps the old ratio-cap shrink but logs it loud with before/after numbers;
+// weights alone over the cap -> fatal either way. Opt out: KVMEM_NO_PLANNER=1.
+static void kvmem_planner_check(
+        const llama_model & model,
+        const kvmem_pool_plan & p,
+        uint32_t ask_tokens,
+        uint32_t pre_cap_tokens,
+        uint32_t pool_tokens,
+        bool explicit_budget) {
+    static bool done = false;
+    if (done || getenv("KVMEM_NO_PLANNER") != nullptr) {
+        return;
+    }
+    done = true;
+
+    const uint64_t GIB = 1024ull * 1024ull * 1024ull;
+    const uint64_t HARD_CAP = 15ull * GIB; // RX6800 is also the display GPU: weights + KV + compute < 15G
+    const uint64_t SAFETY = 1536ull * 1024ull * 1024ull; // 1.5 GiB for WindowServer + sizing headroom
+    const uint64_t SCRATCH = 512ull * 1024ull * 1024ull; // v1 estimate: FA workspace + CB + ubatch scratch
+
+    size_t free_m = 0, total_m = 0;
+    const size_t ndev = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ggml_backend_dev_memory(dev, &free_m, &total_m);
+            break;
+        }
+    }
+    if (total_m == 0) {
+        return; // no GPU backend visible (CPU runs, host tests): nothing to plan
+    }
+    const uint64_t total = (uint64_t) total_m; // Metal: recommendedMaxWorkingSetSize
+    const uint64_t metal_cur = total > free_m ? total - (uint64_t) free_m : total;
+    const uint32_t n_gl = model.n_gpu_layers();
+    const uint32_t n_all = model.hparams.n_layer() + 1; // +1 for the output layer
+    const double frac = n_all ? std::min(1.0, (double) n_gl / (double) n_all) : 1.0;
+    const uint64_t weights = (uint64_t) ((double) model.size() * frac);
+    const uint64_t cap = total < HARD_CAP ? total : HARD_CAP;
+    const uint64_t reserve = SAFETY + SCRATCH;
+    const uint64_t kv_fit = cap > weights + reserve ? cap - weights - reserve : 0;
+    const uint64_t per_tok = p.block_tokens ? p.block_bytes / p.block_tokens : 0;
+    const uint64_t ask_bytes = per_tok ? (uint64_t) ask_tokens * per_tok : 0;
+    const unsigned long long fit_toks = per_tok ? (unsigned long long) (kv_fit / per_tok) : 0ull;
+
+    LLAMA_LOG_INFO("%s: ledger total=%.2fG metal_cur=%.2fG weights=%.2fG(frac=%.2f) cap=%.2fG safety=%.2fG scratch=%.2fG kv_fit=%.2fG(%llu toks) ask=%u toks pool=%u toks per_tok=%lluB\n",
+            __func__, (double) total / GIB, (double) metal_cur / GIB, (double) weights / GIB, frac,
+            (double) cap / GIB,
+            (double) SAFETY / GIB, (double) SCRATCH / GIB, (double) kv_fit / GIB,
+            fit_toks, ask_tokens, pool_tokens, (unsigned long long) per_tok);
+
+    if (per_tok == 0 || kv_fit < p.block_bytes) {
+        LLAMA_LOG_ERROR("%s: refusing startup: weights (%.2fG) leave no KV room under cap %.2fG; free GPU memory or lower -ngl\n",
+                __func__, (double) weights / GIB, (double) cap / GIB);
+        throw std::runtime_error("KVMem planner: weights exceed GPU cap, startup refused");
+    }
+    if (explicit_budget && ask_bytes > kv_fit) {
+        unsigned long long suggest = fit_toks > p.gen_reserve ? fit_toks - p.gen_reserve : 0ull;
+        suggest = suggest / p.block_tokens * p.block_tokens; // floor to whole blocks
+        LLAMA_LOG_ERROR("%s: refusing startup: explicit ask %u toks (%.2fG) exceeds kv_fit %llu toks (%.2fG); retry with --kvmem-budget %llu\n",
+                __func__, ask_tokens, (double) ask_bytes / GIB, fit_toks,
+                (double) kv_fit / GIB, suggest);
+        throw std::runtime_error("KVMem planner: explicit budget exceeds GPU cap, startup refused");
+    }
+    if (pool_tokens < pre_cap_tokens) {
+        LLAMA_LOG_WARN("%s: auto shrink (was silent): pool %u -> %u toks under ratio cap %.2fG; set --kvmem-budget explicitly to fail instead\n",
+                __func__, pre_cap_tokens, pool_tokens, (double) p.cap_blocks * p.block_bytes / GIB);
+    }
+}
+
 static kvmem_pool_plan kvmem_compute_pool(
         const llama_model & model,
         const llama_memory_params & params,
@@ -413,9 +489,11 @@ static kvmem_pool_plan kvmem_compute_pool(
     }
 
     uint32_t pool = budget + gen_reserve;
+    const uint32_t ask_tokens = pool;
     if (pool > cparams.n_ctx_seq && g_kvmem_params.budget == 0) {
         pool = cparams.n_ctx_seq;
     }
+    const uint32_t pre_cap_tokens = pool;
     if (p.cap_blocks > 0) {
         const uint32_t cap_tokens = p.cap_blocks * p.block_tokens;
         if (pool > cap_tokens) {
@@ -441,6 +519,7 @@ static kvmem_pool_plan kvmem_compute_pool(
     if (p.n_slots * p.block_tokens < p.kv_size) {
         p.n_slots += 1;
     }
+    kvmem_planner_check(model, p, ask_tokens, pre_cap_tokens, pool, g_kvmem_params.budget != 0);
     return p;
 }
 
