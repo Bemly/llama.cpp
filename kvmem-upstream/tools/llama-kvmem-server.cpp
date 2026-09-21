@@ -86,6 +86,8 @@ static void print_usage(const char * argv0) {
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (must match K when quantized)\n"
+            "  --kv-dtype-host NAME     host (CPU/NVMe) K/V row type: f16 | q8_0 | q4_0\n"
+            "                            (default: follow GPU type; P2 split: GPU f16 + host q8_0)\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
             "  --spec-kv-dtype TYPE       MTP K/V type (default: inherit --kv-dtype)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 3)\n"
@@ -1652,6 +1654,15 @@ int main(int argc, char ** argv) {
                 st.cache_type_k = t;
                 st.cache_type_v = t;
             }
+        } else if (eq(arg, "--kv-dtype-host")) {
+            bool ok = false;
+            const ggml_type t = kvmem_parse_cache_type(need(arg), &ok);
+            if (!ok) {
+                fprintf(stderr, "unsupported host cache type (want f16|q8_0|q4_0|f32)\n");
+                return 1;
+            }
+            st.kparams.host_type_k = (int32_t) t;
+            st.kparams.host_type_v = (int32_t) t;
         } else if (eq(arg, "--spec-kv-dtype")) {
             bool ok = false;
             st.spec_cache_type = kvmem_parse_cache_type(need(arg), &ok);

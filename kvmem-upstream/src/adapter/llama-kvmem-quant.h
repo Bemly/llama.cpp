@@ -119,7 +119,7 @@ inline bool kvmem_cache_pack_rows(ggml_type ty, const float * src, void * dst,
 }
 
 inline bool kvmem_cache_unpack_rows(ggml_type ty, const void * src, float * dst,
-                                    int64_t n_rows, int64_t n_per_row) {
+                                   int64_t n_rows, int64_t n_per_row) {
     if (!src || !dst || n_rows <= 0 || n_per_row <= 0) {
         return false;
     }
@@ -141,5 +141,43 @@ inline bool kvmem_cache_unpack_rows(ggml_type ty, const void * src, float * dst,
         return false;
     }
     tt->to_float(src, dst, n);
+    return true;
+}
+
+// P2 host/GPU split: convert between F16 GPU rows and host-dtype rows.
+// Token-major [nrows][dim], plain domain (no Hadamard: the GPU side stays F16
+// so FA runs its native path; the Hadamard rotation only exists inside the
+// quantized-GPU-FA pipeline this split bypasses). False when dim is not a
+// multiple of the quant block; callers fail loud.
+inline bool kvmem_rows_f16_to_host(ggml_type host_ty, const uint8_t * f16, uint8_t * out,
+                                   uint32_t nrows, uint32_t dim) {
+    if (!f16 || !out || nrows == 0 || dim == 0) {
+        return false;
+    }
+    if (host_ty == GGML_TYPE_F16) {
+        std::memcpy(out, f16, static_cast<size_t>(nrows) * dim * sizeof(ggml_fp16_t));
+        return true;
+    }
+    std::vector<float> f32(static_cast<size_t>(nrows) * dim);
+    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(f16), f32.data(),
+                          static_cast<int64_t>(nrows) * dim);
+    return kvmem_cache_pack_rows(host_ty, f32.data(), out, nrows, dim);
+}
+
+inline bool kvmem_rows_host_to_f16(ggml_type host_ty, const uint8_t * in, uint8_t * f16,
+                                   uint32_t nrows, uint32_t dim) {
+    if (!in || !f16 || nrows == 0 || dim == 0) {
+        return false;
+    }
+    if (host_ty == GGML_TYPE_F16) {
+        std::memcpy(f16, in, static_cast<size_t>(nrows) * dim * sizeof(ggml_fp16_t));
+        return true;
+    }
+    std::vector<float> f32(static_cast<size_t>(nrows) * dim);
+    if (!kvmem_cache_unpack_rows(host_ty, in, f32.data(), nrows, dim)) {
+        return false;
+    }
+    ggml_fp32_to_fp16_row(f32.data(), reinterpret_cast<ggml_fp16_t *>(f16),
+                          static_cast<int64_t>(nrows) * dim);
     return true;
 }

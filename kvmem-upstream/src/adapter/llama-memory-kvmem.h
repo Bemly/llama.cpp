@@ -194,6 +194,11 @@ public:
     const kvmem::RopeConfig & rope() const { return rope_; }
     ggml_type type_k() const { return type_k_; }
     ggml_type type_v() const { return type_v_; }
+    // P2: host-resident row types (tiers/NVMe). Equal to GPU types unless
+    // --kv-dtype-host splits them; GPU hot set stays F16, FA native.
+    ggml_type host_type_k() const { return host_type_k_; }
+    ggml_type host_type_v() const { return host_type_v_; }
+    bool host_split() const { return host_split_; }
     bool v_trans() const { return v_trans_; }
     uint32_t n_embd_k() const { return n_embd_k_; }
     uint32_t n_embd_v() const { return n_embd_v_; }
@@ -397,6 +402,12 @@ private:
     uint32_t n_embd_head_ = 0;
     ggml_type type_k_ = GGML_TYPE_F16;
     ggml_type type_v_ = GGML_TYPE_F16;
+    ggml_type host_type_k_ = GGML_TYPE_F16;
+    ggml_type host_type_v_ = GGML_TYPE_F16;
+    size_t host_krow_ = 0;
+    size_t host_vrow_ = 0;
+    uint64_t host_block_bytes_ = 0;
+    bool host_split_ = false;
     bool v_trans_ = false;
     bool replay_ = false;
     bool retrieval_pinned_ = false;

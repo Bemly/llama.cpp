@@ -1,7 +1,9 @@
 #include "kvmem/kvmem_runtime.hpp"
 #include "kvmem/kvmem_page_table.hpp"
+#include "llama-kvmem-quant.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -297,6 +299,34 @@ static void test_page_table_sessions() {
     CHECK(b0.slot >= 0);
 }
 
+// P2: F16 <-> Q8 host-row round trip stays within quant noise; identity and
+// bad-dims behave.
+static void test_p2_host_row_roundtrip() {
+    const uint32_t nrows = 5, dim = 1024;
+    std::vector<float> orig(nrows * dim);
+    for (uint32_t i = 0; i < nrows * dim; ++i) {
+        orig[i] = 0.02f * std::sin(i * 0.11f) * std::cos(i * 0.031f);
+    }
+    std::vector<uint8_t> f16(nrows * dim * 2), q8(nrows * 1088), back(nrows * dim * 2);
+    ggml_fp32_to_fp16_row(orig.data(), reinterpret_cast<ggml_fp16_t *>(f16.data()),
+                          (int64_t) nrows * dim);
+    CHECK(kvmem_rows_f16_to_host(GGML_TYPE_Q8_0, f16.data(), q8.data(), nrows, dim));
+    CHECK(kvmem_rows_host_to_f16(GGML_TYPE_Q8_0, q8.data(), back.data(), nrows, dim));
+    std::vector<float> rt(nrows * dim);
+    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(back.data()), rt.data(),
+                          (int64_t) nrows * dim);
+    double se = 0.0;
+    for (uint32_t i = 0; i < nrows * dim; ++i) {
+        const double d = (double) rt[i] - orig[i];
+        se += d * d;
+    }
+    CHECK(std::sqrt(se / (nrows * dim)) < 0.05);
+    CHECK(kvmem_rows_f16_to_host(GGML_TYPE_F16, f16.data(), back.data(), nrows, dim));
+    CHECK(std::memcmp(f16.data(), back.data(), f16.size()) == 0);
+    CHECK(!kvmem_rows_f16_to_host(GGML_TYPE_Q8_0, f16.data(), q8.data(), nrows, 1000));
+    CHECK(!kvmem_rows_host_to_f16(GGML_TYPE_Q8_0, q8.data(), back.data(), 0, dim));
+}
+
 int main() {
     test_selection_preview_and_resident_commit();
     test_stage_out_before_stage_in();
@@ -306,6 +336,7 @@ int main() {
     test_cpu_full_spills_to_nvme_and_roundtrips();
     test_cpu_ptr_extent_checks();
     test_page_table_sessions();
+    test_p2_host_row_roundtrip();
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);
         return 1;

@@ -36,6 +36,8 @@ struct llama_kvmem_params {
     bool     raw_k_nvme;           // put raw-K/V authority on NVMe (qw3-style)
     bool     harvest_v;            // prefill D2H V with K (default off; not implied by raw_k_nvme)
     int32_t  mtp_state;            // 0 snapshots, 1 auto, 2 replay
+    int32_t  host_type_k;          // P2: ggml_type for host-resident K rows; 0 = follow GPU type
+    int32_t  host_type_v;          // P2: ggml_type for host-resident V rows; 0 = follow GPU type
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults

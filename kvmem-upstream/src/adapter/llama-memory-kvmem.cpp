@@ -589,10 +589,34 @@ llama_memory_kvmem::llama_memory_kvmem(
     kv_size_ = pool.kv_size;
     n_slots_ = pool.n_slots;
 
+    // P2 host/GPU dtype split: cold pages live quantized on host, the GPU hot
+    // set stays F16 so FA runs its native path (no per-op dequant prepass).
+    // Resolved here (before rt_cfg) so tier arenas size by host rows.
+    {
+        const uint32_t il0e = kvmem_first_attn_layer(model);
+        const uint32_t neke = model.hparams.n_embd_k_gqa(il0e);
+        const uint32_t neve = model.hparams.n_embd_v_gqa(il0e);
+        host_type_k_ = g_kvmem_params.host_type_k ? (ggml_type) g_kvmem_params.host_type_k : params.type_k;
+        host_type_v_ = g_kvmem_params.host_type_v ? (ggml_type) g_kvmem_params.host_type_v : params.type_v;
+        host_split_ = (host_type_k_ != params.type_k) || (host_type_v_ != params.type_v);
+        if (host_split_ && (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16)) {
+            throw std::runtime_error(
+                    "KVMem P2 split needs an F16 GPU cache (use --kv-dtype f16 with --kv-dtype-host q8_0)");
+        }
+        host_krow_ = ggml_row_size(host_type_k_, neke);
+        host_vrow_ = ggml_row_size(host_type_v_, neve);
+        host_block_bytes_ = static_cast<uint64_t>(kvmem_n_attn_layers(model)) *
+                (host_krow_ + host_vrow_) * block_tokens_;
+    }
+
     auto rt_cfg = make_runtime_cfg(
             block_tokens_, pool.budget, g_kvmem_params.sink_tokens, g_kvmem_params.recent_tokens,
             pool.block_bytes);
     rt_cfg.store.estimated_gpu_block_capacity = pool.cap_blocks;
+    if (host_split_) {
+        // Tiers/NVMe store host-dtype rows; GPU-resident accounting keeps GPU bytes.
+        rt_cfg.store.estimated_block_bytes = host_block_bytes_;
+    }
     runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg, &backend_);
 
     if (ext_kv) {
@@ -682,12 +706,13 @@ llama_memory_kvmem::llama_memory_kvmem(
         }
     }
     LLAMA_LOG_INFO(
-            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s\n",
+            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s host_k=%s host_v=%s n_embd_k=%u attn_layers=%u%s\n",
             __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
             rt_cfg.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
             (int) g_kvmem_params.harvest_v,
             ggml_type_name(type_k_), ggml_type_name(type_v_),
+            ggml_type_name(host_type_k_), ggml_type_name(host_type_v_),
             n_embd_k_, kvmem_n_attn_layers(model),
             ext_kv ? " hybrid_attn" : "");
     fprintf(stderr,
@@ -3124,11 +3149,37 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
     uint64_t off = 0;
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    // P2: host spans use host-dtype rows (equal to GPU rows unless split).
+    const size_t hkrow = host_split_ ? host_krow_ : krow;
+    const size_t hvrow = host_split_ ? host_vrow_ : vrow;
     const uint32_t cell0 = static_cast<uint32_t>(gpu_slot) * block_tokens_;
     const uint32_t nget = (cell0 < kv_size_)
             ? std::min(block_tokens_, kv_size_ - cell0) : 0;
-    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
-    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
+    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * hkrow;
+    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * hvrow;
+    std::vector<uint8_t> grow;
+    if (host_split_) {
+        grow.reserve(static_cast<size_t>(block_tokens_) * std::max(krow, vrow));
+    }
+    // Split needs an F16 GPU cache (enforced in ctor): convert F16 rows once
+    // per spill; FA keeps eating native F16 with no per-op prepass.
+    auto spill_side = [&](ggml_tensor * t, uint8_t * d, size_t grow_bytes, size_t hrow,
+                          ggml_type host_ty, uint32_t dim, const char * what) -> bool {
+        if (!t || nget == 0) {
+            return true;
+        }
+        if (!host_split_ || hrow == grow_bytes) {
+            kvmem_tensor_get(t, d, cell0 * grow_bytes, nget * grow_bytes);
+            return true;
+        }
+        grow.assign(grow_bytes * nget, 0);
+        kvmem_tensor_get(t, grow.data(), cell0 * grow_bytes, nget * grow_bytes);
+        if (!kvmem_rows_f16_to_host(host_ty, grow.data(), d, nget, dim)) {
+            fprintf(stderr, "KVMEM_P2 spill %s convert failed (dim=%u)\n", what, dim);
+            return false;
+        }
+        return true;
+    };
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
@@ -3138,15 +3189,17 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
         if (off + kspan > bytes) {
             return;
         }
-        if (kt && nget > 0) {
-            kvmem_tensor_get(kt, dst + off, cell0 * krow, nget * krow);
+        if (!spill_side(kt, dst + off, krow, hkrow, host_type_k_, n_embd_k_, "K")) {
+            return;
         }
         off += kspan;
         if (off + vspan > bytes) {
             return;
         }
-        if (vt && !v_trans_ && nget > 0) {
-            kvmem_tensor_get(vt, dst + off, cell0 * vrow, nget * vrow);
+        if (vt && !v_trans_) {
+            if (!spill_side(vt, dst + off, vrow, hvrow, host_type_v_, n_embd_v_, "V")) {
+                return;
+            }
         }
         off += vspan;
     }
@@ -3162,11 +3215,37 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     uint64_t off = 0;
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    // P2: host spans use host-dtype rows (equal to GPU rows unless split).
+    const size_t hkrow = host_split_ ? host_krow_ : krow;
+    const size_t hvrow = host_split_ ? host_vrow_ : vrow;
     const uint32_t cell0 = static_cast<uint32_t>(gpu_slot) * block_tokens_;
     const uint32_t nset = (cell0 < kv_size_)
             ? std::min(block_tokens_, kv_size_ - cell0) : 0;
-    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
-    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
+    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * hkrow;
+    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * hvrow;
+    std::vector<uint8_t> grow;
+    if (host_split_) {
+        grow.reserve(static_cast<size_t>(block_tokens_) * std::max(krow, vrow));
+    }
+    // Recall converts quantized host rows back to F16 once per block; the GPU
+    // hot set (and FA) never sees quantized rows.
+    auto recall_side = [&](ggml_tensor * t, const uint8_t * s, size_t grow_bytes, size_t hrow,
+                           ggml_type host_ty, uint32_t dim, const char * what) -> bool {
+        if (!t || nset == 0) {
+            return true;
+        }
+        if (!host_split_ || hrow == grow_bytes) {
+            kvmem_tensor_set(t, s, cell0 * grow_bytes, nset * grow_bytes);
+            return true;
+        }
+        grow.assign(grow_bytes * nset, 0);
+        if (!kvmem_rows_host_to_f16(host_ty, s, grow.data(), nset, dim)) {
+            fprintf(stderr, "KVMEM_P2 recall %s convert failed (dim=%u)\n", what, dim);
+            return false;
+        }
+        kvmem_tensor_set(t, grow.data(), cell0 * grow_bytes, nset * grow_bytes);
+        return true;
+    };
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
@@ -3176,15 +3255,17 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
         if (off + kspan > bytes) {
             return;
         }
-        if (kt && nset > 0) {
-            kvmem_tensor_set(kt, src + off, cell0 * krow, nset * krow);
+        if (!recall_side(kt, src + off, krow, hkrow, host_type_k_, n_embd_k_, "K")) {
+            return;
         }
         off += kspan;
         if (off + vspan > bytes) {
             return;
         }
-        if (vt && !v_trans_ && nset > 0) {
-            kvmem_tensor_set(vt, src + off, cell0 * vrow, nset * vrow);
+        if (vt && !v_trans_) {
+            if (!recall_side(vt, src + off, vrow, hvrow, host_type_v_, n_embd_v_, "V")) {
+                return;
+            }
         }
         off += vspan;
     }
