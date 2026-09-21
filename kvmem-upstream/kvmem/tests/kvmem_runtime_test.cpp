@@ -1,4 +1,5 @@
 #include "kvmem/kvmem_runtime.hpp"
+#include "kvmem/kvmem_page_table.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -244,6 +245,58 @@ static void test_selection_preview_and_resident_commit() {
     CHECK(rt.commit_resident_selection(selected));
 }
 
+// P1: host arena extent geometry. make_cfg gives 16 slots of 1024B.
+namespace kvmem {
+struct kvmem_runtime_test_access {
+    static const uint8_t *cpu_ptr(const KvMemRuntime & rt, int32_t slot) {
+        return rt.cpu_ptr(slot);
+    }
+};
+} // namespace kvmem
+static void test_cpu_ptr_extent_checks() {
+    RecordingBackend be;
+    KvMemRuntime rt(make_cfg(), &be);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, -1) == nullptr);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 0) != nullptr);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 15) != nullptr);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 16) == nullptr); // upper bound (was OOB before P1)
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 1000000) == nullptr);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 2147483647) == nullptr); // multiply-overflow shape
+}
+
+// P1: page table generations, ownership, session release.
+static void test_page_table_sessions() {
+    KvmemPageTable t;
+    t.reset(4);
+    CHECK(t.valid());
+    CHECK(t.n_free() == 4);
+    const KvmemPageAlloc a0 = t.alloc(0, 10);
+    const KvmemPageAlloc a1 = t.alloc(1, 20);
+    CHECK(a0.slot >= 0 && a1.slot >= 0 && a0.slot != a1.slot);
+    CHECK(a0.gen >= 1 && a1.gen >= 1);
+    CHECK(t.valid());
+    CHECK(!t.free(a0.slot, 1, a0.gen)); // wrong owner rejected
+    CHECK(!t.free(a0.slot, 0, a0.gen + 1)); // stale generation rejected
+    CHECK(t.valid());
+    CHECK(t.free(a0.slot, 0, a0.gen));
+    CHECK(t.double_free_drops() == 0);
+    CHECK(!t.free(a0.slot, -2, 0)); // double free rejected, not re-pushed
+    CHECK(t.double_free_drops() == 1);
+    CHECK(t.n_free() == 3);
+    const KvmemPageAlloc a2 = t.alloc(1, 30);
+    CHECK(a2.slot == a0.slot); // LIFO reuse
+    CHECK(a2.gen != a0.gen); // generation bumped: old handles are stale
+    CHECK(t.note_resident(a1.slot, 21, 1)); // live page: logical refresh ok
+    CHECK(t.release_session(0) == 0); // session 0 holds nothing now
+    CHECK(t.release_session(1) == 2); // both live pages belong to session 1
+    CHECK(t.valid());
+    CHECK(t.n_free() == 4);
+    const KvmemPageAlloc b0 = t.alloc(-1, 5);
+    CHECK(t.release_session(-1) == 1); // negative releases the whole pool
+    CHECK(t.valid());
+    CHECK(b0.slot >= 0);
+}
+
 int main() {
     test_selection_preview_and_resident_commit();
     test_stage_out_before_stage_in();
@@ -251,6 +304,8 @@ int main() {
     test_pressure_keeps_sink_and_tail();
     test_maybe_offload_evicts_before_stage_in();
     test_cpu_full_spills_to_nvme_and_roundtrips();
+    test_cpu_ptr_extent_checks();
+    test_page_table_sessions();
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);
         return 1;

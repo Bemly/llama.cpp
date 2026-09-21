@@ -50,18 +50,31 @@ KvMemRuntime::KvMemRuntime(KvMemRuntimeConfig cfg, KvMemBackend *backend)
     }
 }
 
-uint8_t *KvMemRuntime::cpu_ptr(int32_t slot) {
-    if (slot < 0 || cpu_arena_.empty()) {
+// P1: bounded extent geometry for the host arena. The old code only rejected
+// slot < 0; a slot >= slot count (or a wrapped offset) read/wrote past the end.
+// Returns nullptr on any out-of-range access instead of an OOB pointer.
+static const uint8_t *cpu_slot_checked(
+        const std::vector<uint8_t> & arena, uint64_t slot_bytes, int32_t slot) {
+    if (slot < 0 || slot_bytes == 0 || arena.empty()) {
         return nullptr;
     }
-    return cpu_arena_.data() + static_cast<size_t>(slot) * slot_bytes_;
+    // Division first: immune to multiply overflow for absurd configs.
+    if (static_cast<uint64_t>(slot) >= arena.size() / slot_bytes) {
+        return nullptr;
+    }
+    const size_t off = static_cast<size_t>(slot) * static_cast<size_t>(slot_bytes);
+    if (off >= arena.size() || slot_bytes > arena.size() - off) {
+        return nullptr;
+    }
+    return arena.data() + off;
+}
+
+uint8_t *KvMemRuntime::cpu_ptr(int32_t slot) {
+    return const_cast<uint8_t *>(cpu_slot_checked(cpu_arena_, slot_bytes_, slot));
 }
 
 const uint8_t *KvMemRuntime::cpu_ptr(int32_t slot) const {
-    if (slot < 0 || cpu_arena_.empty()) {
-        return nullptr;
-    }
-    return cpu_arena_.data() + static_cast<size_t>(slot) * slot_bytes_;
+    return cpu_slot_checked(cpu_arena_, slot_bytes_, slot);
 }
 
 void KvMemRuntime::trace_tier(const char *tag, uint32_t block_id, int32_t slot) const {

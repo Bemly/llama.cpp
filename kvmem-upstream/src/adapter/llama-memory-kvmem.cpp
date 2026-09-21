@@ -719,11 +719,7 @@ llama_memory_kvmem::~llama_memory_kvmem() {
 }
 
 void llama_memory_kvmem::reset_slots() {
-    free_slots_.clear();
-    free_slots_.reserve(n_slots_);
-    for (int32_t i = static_cast<int32_t>(n_slots_) - 1; i >= 0; --i) {
-        free_slots_.push_back(i);
-    }
+    page_table_.reset(n_slots_);
 }
 
 void llama_memory_kvmem::reset_policy() {
@@ -739,6 +735,9 @@ void llama_memory_kvmem::reset_policy() {
     }
     if (runtime_) {
         runtime_->truncate_to(0);
+    }
+    if (trace_ && !page_table_.valid()) {
+        fprintf(stderr, "KVMEM_TRACE page table invalid at reset_policy\n");
     }
     reset_slots();
     retrieval_pinned_ = false;
@@ -791,26 +790,35 @@ llama_pos llama_memory_kvmem::recr_pos_max() const {
 }
 
 int32_t llama_memory_kvmem::alloc_slot() {
-    if (free_slots_.empty()) {
-        return -1;
-    }
-    const int32_t slot = free_slots_.back();
-    free_slots_.pop_back();
-    return slot;
+    return alloc_slot_for(-1, -1);
+}
+
+int32_t llama_memory_kvmem::alloc_slot_for(int32_t owner, int32_t logical) {
+    return page_table_.alloc(owner, logical).slot;
 }
 
 void llama_memory_kvmem::free_slot(int32_t slot) {
-    if (slot < 0) {
-        return;
+    page_table_.free(slot, -2, 0); // legacy path: clear entry, no ownership check
+}
+
+bool llama_memory_kvmem::free_slot_checked(int32_t slot, int32_t owner, uint32_t gen) {
+    const bool ok = page_table_.free(slot, owner, gen);
+    if (!ok) {
+        fprintf(stderr, "KVMEM_PAGE release rejected slot=%d owner=%d gen=%u\n", slot, owner, gen);
     }
-    free_slots_.push_back(slot);
+    return ok;
+}
+
+uint32_t llama_memory_kvmem::page_gen(int32_t slot) const {
+    return page_table_.generation(slot);
+}
+
+uint32_t llama_memory_kvmem::release_session(llama_seq_id seq_id) {
+    return page_table_.release_session(seq_id);
 }
 
 int32_t llama_memory_kvmem::peek_free_slot() const {
-    if (free_slots_.empty()) {
-        return -1;
-    }
-    return free_slots_.back();
+    return page_table_.peek();
 }
 
 bool llama_memory_kvmem::slot_for_orig_pos(llama_pos pos, int32_t * slot, uint32_t * off) const {
@@ -872,14 +880,14 @@ void llama_memory_kvmem::trace_plan(const char * tag, const kvmem::KvMemPlan & p
         }
     }
     fprintf(stderr,
-            "KVMEM_TRACE %s stage_in=%zu stage_out=%zu skip=%u gpu_reused=%u window=%u free_slots=%zu\n",
+            "KVMEM_TRACE %s stage_in=%zu stage_out=%zu skip=%u gpu_reused=%u window=%u free_slots=%u\n",
             tag,
             plan.stage_in.size(),
             plan.stage_out.size(),
             skip,
             plan.gpu_reused_blocks,
             plan.total_window_tokens,
-            free_slots_.size());
+            (unsigned) page_table_.n_free());
 }
 
 void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
@@ -926,6 +934,20 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
         runtime_->admit_incoming();
         if (retr_.enabled) {
             retr_.admit_us += ggml_time_us() - t0;
+        }
+    }
+    // P1: refresh logical block identity on live pages after every plan.
+    for (uint32_t id = 0; id < store.block_count(); ++id) {
+        const kvmem::KvMemBlock & b = store.blocks()[id];
+        if (b.gpu_slot >= 0) {
+            page_table_.note_resident(b.gpu_slot, static_cast<int32_t>(id), -1);
+        }
+    }
+    if (trace_) {
+        const int v = page_table_.valid_detail();
+        if (v != 0) {
+            fprintf(stderr, "KVMEM_TRACE page table invalid at apply_plan_to_kv reason=%d self=%p n_slots=%u kv_size=%u block_tok=%u %s\n",
+                    v, (const void *) this, n_slots_, kv_size_, block_tokens_, page_table_.dump().c_str());
         }
     }
 }
@@ -1515,10 +1537,10 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     if (trace_) {
         fprintf(stderr,
                 "KVMEM_TRACE append n=%u total=%u resident=%u incoming_blocks=%zu "
-                "over_budget=%d need_offload=%d free_slots=%zu\n",
+                "over_budget=%d need_offload=%d free_slots=%u\n",
                 n_new_tokens, t1, resident_tokens(), incoming.size(),
                 (int) (store.block_count() > budget_blocks), (int) need_offload,
-                free_slots_.size());
+                (unsigned) page_table_.n_free());
     }
 
     if (need_offload) {
@@ -1671,6 +1693,9 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
         seq_id <= 0 && p0 <= 0 &&
         (p1 < 0 || p1 >= static_cast<llama_pos>(runtime_->store().total_tokens()))) {
         runtime_->truncate_to(0);
+        if (trace_ && !page_table_.valid()) {
+            fprintf(stderr, "KVMEM_TRACE page table invalid at seq_rm wipe\n");
+        }
         reset_slots();
         retrieval_pinned_ = false;
     }
@@ -3318,7 +3343,7 @@ bool llama_memory_kvmem::can_append(uint32_t end, uint32_t generation_rows, bool
     for (uint64_t id = view.rows / block_tokens_; id < final_blocks; ++id) {
         if (id >= s.block_count() || s.blocks()[id].gpu_slot < 0) ++needed;
     }
-    if (needed > free_slots_.size()) return fail("insufficient_slots");
+    if (needed > page_table_.n_free()) return fail("insufficient_slots");
     reason = all_history ? "all_resident" : "same_query";
     return true;
 }

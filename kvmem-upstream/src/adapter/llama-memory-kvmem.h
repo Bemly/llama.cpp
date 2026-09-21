@@ -5,6 +5,7 @@
 #include "llama-kvmem-hooks.h"
 
 #include "kvmem/kvmem_runtime.hpp"
+#include "kvmem/kvmem_page_table.hpp"
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/rope.hpp"
 
@@ -85,6 +86,25 @@ public:
     int32_t alloc_slot();
     void free_slot(int32_t slot);
     int32_t peek_free_slot() const;
+    // P1 paged-KV page table (kvmem::KvmemPageTable): physical GPU slots are
+    // leased as logical pages with per-handout generations and per-session
+    // owners (a llama_seq_id, -1 = shared/legacy path), so sessions share the
+    // pool without freeing each other's pages and stale (slot, gen) handles
+    // are detectable. One logical page == one store block (block_tokens,
+    // server default 128): NInfer's P=64 is not adopted because the
+    // retrieval/store/FA paths are validated at the current granularity and
+    // the size is already runtime-tunable via --kvmem-block-tokens. Revisit in
+    // P2 if GPU-F16 and host-quant pages want different sizes.
+    int32_t alloc_slot_for(int32_t owner, int32_t logical);
+    // Release with ownership+generation check. Wildcards: owner < -1 skips the
+    // owner check, gen == 0 skips the generation check. Returns false (loud) on
+    // mismatch instead of silently corrupting the pool.
+    bool free_slot_checked(int32_t slot, int32_t owner, uint32_t gen);
+    uint32_t page_gen(int32_t slot) const;
+    // Free every page owned by seq (seq < 0 releases the whole pool, legacy
+    // shared pages included). Returns the released count. Page-layer primitive
+    // for multi-session; the server still runs one session (n_seq_max=1).
+    uint32_t release_session(llama_seq_id seq_id);
     // Map original pos to (gpu_slot, offset in block). For a token the target
     // has not appended yet (MTP draft), predict the slot the next alloc would
     // take without popping the free list. Returns false if no mapping exists.
@@ -144,7 +164,7 @@ public:
         retrieval_pinned_ = true;
         keep_selected_ = true;
     }
-    size_t free_slot_count() const { return free_slots_.size(); }
+    size_t free_slot_count() const { return page_table_.n_free(); }
     void truncate_cached(uint32_t n_past);
     void occupy_in(llama_kv_cache * cache, uint32_t block_id);
     llama_pos model_pos(uint32_t logical_pos) const;
@@ -360,7 +380,7 @@ private:
     SlotBackend backend_;
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;
-    std::vector<int32_t> free_slots_;
+    kvmem::KvmemPageTable page_table_; // P1: the slot pool itself (single source of truth)
     struct RowPosition {
         std::array<llama_pos, 4> pos{};
         llama_token token = LLAMA_TOKEN_NULL;
