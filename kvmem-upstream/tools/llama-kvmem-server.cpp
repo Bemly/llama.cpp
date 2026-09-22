@@ -192,6 +192,7 @@ struct ServerState {
     kvmem_spec_session spec;
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
     ggml_type cache_type_v = GGML_TYPE_Q8_0;
+    bool cache_type_given = false; // P3: set when the user passes --kv-dtype/-ctk/-ctv
     ggml_type spec_cache_type = GGML_TYPE_F16;
     bool spec_cache_given = false;
     bool spec_mtp = false;
@@ -1648,11 +1649,14 @@ int main(int argc, char ** argv) {
             }
             if (eq(arg, "-ctv") || eq(arg, "--cache-type-v")) {
                 st.cache_type_v = t;
+                st.cache_type_given = true;
             } else if (eq(arg, "-ctk") || eq(arg, "--cache-type-k")) {
                 st.cache_type_k = t;
+                st.cache_type_given = true;
             } else {
                 st.cache_type_k = t;
                 st.cache_type_v = t;
+                st.cache_type_given = true;
             }
         } else if (eq(arg, "--kv-dtype-host")) {
             bool ok = false;
@@ -1773,6 +1777,43 @@ int main(int argc, char ** argv) {
     if (!st.model) {
         fprintf(stderr, "failed to load model\n");
         return 1;
+    }
+    // P3 Qwen3.8 profile: exact-arch fast path. The fixed KV representation
+    // (GPU f16 + host q8_0) is nailed down here so cparams and the P0 planner
+    // measure the final types. Env LLAMA_QWEN38_PROFILE=0 disables. MTP runs
+    // and explicit user dtypes keep legacy behavior.
+    {
+        const char * pe = getenv("LLAMA_QWEN38_PROFILE");
+        const bool profile_on = !(pe && pe[0] && pe[0] == '0');
+        char desc[256] = {};
+        llama_model_desc(st.model, desc, sizeof(desc));
+        const int nl = llama_model_n_layer(st.model);
+        const bool is_qwen38 = profile_on && !st.spec_mtp &&
+                strncmp(desc, "qwen35", 6) == 0 &&
+                strncmp(desc, "qwen35moe", 9) != 0 &&
+                (nl == 64 || nl == 65);
+        if (is_qwen38) {
+            if (!st.cache_type_given) {
+                st.cache_type_k = GGML_TYPE_F16;
+                st.cache_type_v = GGML_TYPE_F16;
+            }
+            if (st.kparams.host_type_k == 0 && st.kparams.host_type_v == 0 &&
+                st.cache_type_k == GGML_TYPE_F16 && st.cache_type_v == GGML_TYPE_F16) {
+                st.kparams.host_type_k = (int32_t) GGML_TYPE_Q8_0;
+                st.kparams.host_type_v = (int32_t) GGML_TYPE_Q8_0;
+            }
+            const ggml_type hk = st.kparams.host_type_k
+                    ? (ggml_type) st.kparams.host_type_k : st.cache_type_k;
+            const ggml_type hv = st.kparams.host_type_v
+                    ? (ggml_type) st.kparams.host_type_v : st.cache_type_v;
+            fprintf(stderr, "QWEN38_PROFILE: qwen35-%dblk fast path (gpu=%s/%s host=%s/%s)\n",
+                    nl, ggml_type_name(st.cache_type_k), ggml_type_name(st.cache_type_v),
+                    ggml_type_name(hk), ggml_type_name(hv));
+            // The profile rewrote kparams after the pre-load set_params push.
+            if (st.kparams.enabled) {
+                llama_kvmem_set_params(&st.kparams);
+            }
+        }
     }
     st.vocab = llama_model_get_vocab(st.model);
     try {

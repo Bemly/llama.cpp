@@ -386,7 +386,8 @@ struct kvmem_pool_plan {
 // is printed for cross-check only, never used for the fit decision.
 // Policy: explicit --kvmem-budget that does not fit -> fatal; budget=0 (auto)
 // keeps the old ratio-cap shrink but logs it loud with before/after numbers;
-// weights alone over the cap -> fatal either way. Opt out: KVMEM_NO_PLANNER=1.
+// weights alone over the cap -> loud warning only (Metal over-commits; keeps
+// existing big-file workflows booting). Opt out: KVMEM_NO_PLANNER=1.
 static void kvmem_planner_check(
         const llama_model & model,
         const kvmem_pool_plan & p,
@@ -437,9 +438,12 @@ static void kvmem_planner_check(
             fit_toks, ask_tokens, pool_tokens, (unsigned long long) per_tok);
 
     if (per_tok == 0 || kv_fit < p.block_bytes) {
-        LLAMA_LOG_ERROR("%s: refusing startup: weights (%.2fG) leave no KV room under cap %.2fG; free GPU memory or lower -ngl\n",
+        // Weights alone over the cap: loud warning, boot continues (Metal
+        // over-commits and existing big-file workflows keep running). Only an
+        // explicit over-ask is fatal. See P0 validation gates.
+        LLAMA_LOG_WARN("%s: weights (%.2fG) leave no KV room under cap %.2fG; "
+                       "expect residency pressure (slow prefill). Free GPU memory or lower -ngl\n",
                 __func__, (double) weights / GIB, (double) cap / GIB);
-        throw std::runtime_error("KVMem planner: weights exceed GPU cap, startup refused");
     }
     if (explicit_budget && ask_bytes > kv_fit) {
         unsigned long long suggest = fit_toks > p.gen_reserve ? fit_toks - p.gen_reserve : 0ull;
@@ -725,6 +729,42 @@ llama_memory_kvmem::llama_memory_kvmem(
             pool.cap_blocks,
             (unsigned long long) pool.gpu_total,
             (unsigned long long) pool.block_bytes);
+
+    // P3 Qwen3.8 execution profile: qwen35-64/65blk with dk256 locks the
+    // FA-RDNA2 path, the N_CB split, full offload and the P2 KV repr.
+    // Anything else (or LLAMA_QWEN38_PROFILE=0) takes the generic path below
+    // with zero behavior change.
+    {
+        const char * pe = getenv("LLAMA_QWEN38_PROFILE");
+        const bool profile_on = !(pe && pe[0] && pe[0] == '0');
+        const uint32_t nl = model.hparams.n_layer();
+        const bool is_qwen38 = profile_on && model.arch == LLM_ARCH_QWEN35 &&
+                (nl == 64 || nl == 65) && n_embd_head_ == 256;
+        if (is_qwen38) {
+            const uint32_t n_attn = kvmem_n_attn_layers(model);
+            const uint32_t gqa = n_head_kv_ ? n_head_ / n_head_kv_ : 0;
+            const char * fa_off = getenv("GGML_METAL_FA_AMD");
+            if (fa_off && fa_off[0] == '0') {
+                LLAMA_LOG_WARN("%s: QWEN38_PROFILE qwen35-%ublk but GGML_METAL_FA_AMD=0; "
+                               "keeping user override (FA falls back, slower)\n", __func__, nl);
+            }
+            if (!getenv("GGML_METAL_N_CB")) {
+                setenv("GGML_METAL_N_CB", "16", 0);
+            }
+            const uint32_t n_gl = model.n_gpu_layers();
+            if (n_gl < nl + 1) {
+                LLAMA_LOG_WARN("%s: QWEN38_PROFILE qwen35-%ublk partially offloaded "
+                               "(ngl=%u); profile wants full offload\n", __func__, nl, n_gl);
+            }
+            LLAMA_LOG_INFO("%s: QWEN38_PROFILE qwen35-%ublk locked "
+                           "(attn=%u ssm=%u gqa=%u dk=256 fa_amd=%s n_cb=%s offload=%u/%u kv=%s/%s)\n",
+                    __func__, nl, n_attn, nl - n_attn, gqa,
+                    (fa_off && fa_off[0] == '0') ? "off(user)" : "dk256",
+                    getenv("GGML_METAL_N_CB") ? getenv("GGML_METAL_N_CB") : "0",
+                    n_gl, nl + 1,
+                    ggml_type_name(type_k_), ggml_type_name(host_type_k_));
+        }
+    }
 }
 
 llama_memory_kvmem::~llama_memory_kvmem() {
