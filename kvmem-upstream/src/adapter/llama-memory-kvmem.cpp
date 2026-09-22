@@ -1575,7 +1575,8 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     }
     const uint32_t t1 = store.total_tokens();
 
-    std::vector<uint32_t> incoming;
+    std::vector<uint32_t> & incoming = incoming_scratch_;
+    incoming.clear();
     for (const auto & b : store.blocks()) {
         if (b.orig_pos_end() > t0 && b.orig_pos_start < t1) {
             incoming.push_back(b.block_id);
@@ -1675,14 +1676,16 @@ bool llama_memory_kvmem::prepare_ubatches(
             row.token = ub.token ? ub.token[i] : LLAMA_TOKEN_NULL;
         }
     }
-    sinfos.clear();
-    sinfos.reserve(ubatches.size());
-    for (const auto & ubatch : ubatches) {
-        llama_kv_cache::slot_info sinfo;
-        if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatch, sinfo)) {
+    // P4: refill sinfos in place when the shape matches (keeps inner capacity,
+    // no per-token heap churn in steady decode).
+    if (sinfos.size() != ubatches.size()) {
+        sinfos.clear();
+        sinfos.resize(ubatches.size());
+    }
+    for (size_t ui = 0; ui < ubatches.size(); ++ui) {
+        if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatches[ui], sinfos[ui])) {
             return false;
         }
-        sinfos.push_back(std::move(sinfo));
     }
     pos_queue_.clear();
     for (const auto & ubatch : ubatches) {

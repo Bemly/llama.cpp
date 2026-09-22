@@ -424,6 +424,7 @@ private:
 
     std::vector<std::vector<llama_pos>> pos_queue_;
     std::vector<llama_pos> cur_pos_;
+    std::vector<uint32_t> incoming_scratch_; // P4: reused per prepare (no per-token malloc)
     struct CaptureNode {
         ggml_tensor * t = nullptr;
         int il = 0;
