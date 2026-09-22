@@ -337,6 +337,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_l
     return res;
 }
 
+// SILU+MUL fusion (MLP gate): single f32 variant
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_mul(ggml_metal_library_t lib) {
+    const char * base = "kernel_silu_mul_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    return res;
+}
+
+// SOFTPLUS+MUL fusion (SSM dt path): single f32 variant
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_softplus_mul(ggml_metal_library_t lib) {
+    const char * base = "kernel_softplus_mul_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_SUM);
 

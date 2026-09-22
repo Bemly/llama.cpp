@@ -805,6 +805,9 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
+    const bool use_fusion = ctx->use_fusion();
+    const int  debug_fusion = ggml_metal_fusion_info_debug(ctx->finfo);
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
@@ -866,6 +869,58 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     }
 
     auto pipeline = ggml_metal_library_get_pipeline_unary(lib, op);
+
+    // SILU/SOFTPLUS + MUL fusion: emit one fused kernel for both nodes.
+    // The MUL reads the unary output on either side; always bind
+    // (unary_input, partner) so the kernel computes f(src0)*src1.
+    int n_fuse = 1;
+    if (use_fusion && op->op == GGML_OP_UNARY &&
+        (ggml_get_unary_op(op) == GGML_UNARY_OP_SILU ||
+         ggml_get_unary_op(op) == GGML_UNARY_OP_SOFTPLUS)) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        const ggml_metal_fusion_id fid = fusion ? ggml_metal_fusion_get_id(fusion) : GGML_METAL_FUSION_NONE;
+        if (fid == GGML_METAL_FUSION_SILU_MUL || fid == GGML_METAL_FUSION_SOFTPLUS_MUL) {
+            const ggml_tensor * mul = ctx->node(idx + 1);
+            // The silu output may sit on either MUL side; always bind
+            // (silu_input, partner) so the kernel computes silu(src0)*src1.
+            const ggml_tensor * partner =
+                (mul->src[0] == op) ? mul->src[1] : mul->src[0];
+            ggml_metal_kargs_glu args_f = {
+                /*.ne00 =*/ ne00,
+                /*.nb01 =*/ nb01,
+                /*.ne10 =*/ ne00,
+                /*.nb11 =*/ nb01,
+                /*.ne0  =*/ ne0,
+                /*.nb1  =*/ nb1,
+                /*.i00  =*/ 0,
+                /*.i10  =*/ 0,
+                /*.alpha=*/ 0.0f,
+                /*.limit=*/ 0.0f,
+            };
+            auto pipeline_f = fid == GGML_METAL_FUSION_SOFTPLUS_MUL
+                ? ggml_metal_library_get_pipeline_softplus_mul(lib)
+                : ggml_metal_library_get_pipeline_silu_mul(lib);
+            ggml_metal_encoder_set_pipeline(enc, pipeline_f);
+            ggml_metal_encoder_set_bytes   (enc, &args_f, sizeof(args_f), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(partner), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul),     3);
+            const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_f),
+                                                    ne00 / 2));
+            const int64_t nrows = (int64_t) ne01 * ne02 * ne03;
+            ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+            n_fuse = 2;
+            ctx->count_fusions(fusion);
+            if (debug_fusion > 1) {
+                GGML_LOG_DEBUG("%s: fuse: SILU + MUL\n", __func__);
+            }
+            if (!ggml_metal_op_concurrency_check(ctx, mul)) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
+            return n_fuse;
+        }
+    }
 
     if (pipeline.c4) {
         args.ne00 = ne00/4;
