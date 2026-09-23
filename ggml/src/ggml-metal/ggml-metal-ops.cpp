@@ -3078,14 +3078,14 @@ bool ggml_metal_op_flash_attn_ext_amd_supported(const ggml_tensor * op) {
         return false;
     }
 
-    // 仅 F16 KV（dk==dv∈{64,128,256}，256 为 P1-A 朴素版）
+    // 仅 F16 KV（dk==dv∈{64,128,256,512}，256/512 为 P1-A 朴素版，512 tile 用 NBC=32）
     if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
         return false;
     }
 
     const int64_t dk = op->src[1]->ne[0];
     const int64_t dv = op->src[2]->ne[0];
-    if (dk != dv || (dk != 64 && dk != 128 && dk != 256)) {
+    if (dk != dv || (dk != 64 && dk != 128 && dk != 256 && dk != 512)) {
         return false;
     }
 
@@ -3167,8 +3167,8 @@ bool ggml_metal_op_flash_attn_ext_amd_quant_supported(const ggml_tensor * op) {
     if (!k_is_quant && !v_is_quant) return false; // F16/F16 stays on the path above
     const int64_t dk = op->src[1]->ne[0];
     const int64_t dv = op->src[2]->ne[0];
-    // P1-B: dk256 开给量化 KV（首验 q4_0/q4_0，其余组合 P1-C 逐个验）
-    if (dk != dv || (dk != 64 && dk != 128 && dk != 256)) {
+    // P1-B: dk256/512 开给量化 KV（512 tile 用 NBC=32；首验 q8_0，其余组合 P1-C 逐个验）
+    if (dk != dv || (dk != 64 && dk != 128 && dk != 256 && dk != 512)) {
         return false;
     }
     if (op->src[4] != nullptr) {
@@ -3336,8 +3336,8 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
 
     if (ne01 == 1) {
         // decode vec path: split-k partials + reduce merge (same binds as tile)
-        // P1-A: dk256 只有 nbc64 实例，先钳住（调优见 P4）
-        const int nbc   = (dk == 256) ? 64 : ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
+        // P1-A: dk256/512 只有 nbc64 实例，先钳住（调优见 P4）
+        const int nbc   = (dk == 256 || dk == 512) ? 64 : ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
         const int split = ggml_metal_op_flash_attn_ext_amd_split_count(op);
         const int chunk = (int) GGML_PAD(((uint64_t) ne11 + split - 1)/split, (uint64_t) nbc);
 
@@ -3448,10 +3448,12 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
         /*.nbb_d   =*/ nbd3,
         };
 
-    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, has_mask);
+    // dk512 tile 用 NBC=32（75KB LDS 超 64KB 上限，32 则 40KB），其余 64
+    const int nbc_tile = (dk == 512) ? 32 : 64;
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, nbc_tile, has_mask);
 
-    const size_t smem = (dk/4)*(64 + 1)*8
-        + 32*64*sizeof(float)
+    const size_t smem = (dk/4)*(nbc_tile + 1)*8
+        + 32*nbc_tile*sizeof(float)
         + 32*8*sizeof(float)*2
         + 32*sizeof(float)*3;
 
@@ -3546,8 +3548,8 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
 
     if (ne01 == 1) {
         // ── decode vec 路径：split-k 部分结果 + reduce 合并 ──
-        // P1-A: dk256 只有 nbc64 实例，先钳住（调优见 P4）
-        const int nbc   = (dk == 256) ? 64 : ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
+        // P1-A: dk256/512 只有 nbc64 实例，先钳住（调优见 P4）
+        const int nbc   = (dk == 256 || dk == 512) ? 64 : ggml_metal_fa_amd_knob(op, "NBC", 128, 64, 128);
         const int split = ggml_metal_op_flash_attn_ext_amd_split_count(op);
         const int chunk = (int) GGML_PAD(((uint64_t) ne11 + split - 1)/split, (uint64_t) nbc);
 
@@ -3651,11 +3653,13 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
         /*.nbb_d   =*/ nb3,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, has_mask);
+    // dk512 tile 用 NBC=32（75KB LDS 超 64KB 上限，32 则 40KB），其余 64
+    const int nbc_tile = (dk == 512) ? 32 : 64;
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, nbc_tile, has_mask);
 
     // 与 fa_amd.metal 的 LDS 布局严格一致：kt + sw + mps + lps + mst + cst + lst
-    const size_t smem = (dk/4)*(64 + 1)*8        // kt half4 × (NBC+1) 行距
-        + 32*64*sizeof(float)                    // sw [NQ][NBC]
+    const size_t smem = (dk/4)*(nbc_tile + 1)*8  // kt half4 × (NBC+1) 行距
+        + 32*nbc_tile*sizeof(float)              // sw [NQ][NBC]
         + 32*8*sizeof(float)*2                   // mps + lps
         + 32*sizeof(float)*3;                    // mst + cst + lst
 

@@ -243,6 +243,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(
         ggml_metal_library_t lib,
         int32_t dk,
+        int32_t nbc,
         bool    has_mask);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_amd_reduce(

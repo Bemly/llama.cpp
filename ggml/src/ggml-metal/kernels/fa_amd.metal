@@ -7,7 +7,7 @@
 //   - KV 免 LDS 直读（IC 命中 ~1.5TB/s 吸收 GQA 重读），decode 每块仅 3 个 barrier；
 //   - decode（nq==1）：split-k 部分结果 + reduce 合并，保小模型占用率；
 //   - prefill（nq>1）：Q tile 32 行/tg，K 块过 LDS，Q/O 全寄存器化。
-// 仅支持：F16 KV、dk==dv∈{64,128,256}（256 为 P1-A 朴素版，nbc=64）、无 sinks/bias/softcap；其余形状由 host 门控回退。
+// 仅支持：F16 KV、dk==dv∈{64,128,256,512}（256/512 为 P1-A 朴素版，nbc=64）、无 sinks/bias/softcap；其余形状由 host 门控回退。
 
 constant bool HAS_MASK_FA_AMD [[function_constant(FC_FLASH_ATTN_EXT_AMD + 0)]];
 
@@ -209,6 +209,8 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
         ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr int DK4 = DK/4;
     constexpr int KTP = NBC + 1;          // half4 行距 pad，破 64-bank 周期
+    constexpr int KPT = NBC/8;            // 每个 sub-lane 负责的 K 位置数
+    constexpr int TPB = 256/NBC;          // K 装载时覆盖同 t 的 lane 组大小
 
     const int itile  = tgpig[0];
     const int ih     = tgpig[1];
@@ -268,23 +270,23 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int t0 = 0; t0 < args.ne11; t0 += NBC) {
-        // ── 协作装载 K 块 → LDS 转置 half4（lane: t = lane/4, i4 = (lane%4)*(DK4/4) + k）──
+        // ── 协作装载 K 块 → LDS 转置 half4（lane: t = lane/TPB, i4 = (lane%TPB)*(DK4/TPB) + k）──
         {
-            const int tld = lane/4;
-            const int i0  = (lane%4)*(DK4/4);
+            const int tld = lane/TPB;
+            const int i0  = (lane%TPB)*(DK4/TPB);
             const int t   = t0 + tld;
             device const half4 * kh4 = (device const half4 *)(kp + (size_t) t*args.nb11);
-            FOR_UNROLL (int kk = 0; kk < DK4/4; ++kk) {
+            FOR_UNROLL (int kk = 0; kk < DK4/TPB; ++kk) {
                 kt[(i0 + kk)*KTP + tld] = (t < args.ne11) ? kh4[i0 + kk] : half4(0.0h);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ── S：每 lane 8 个 token 的点积（f32 累加，存寄存器）──
-        float s_reg[8];
+        // ── S：每 lane KPT 个 token 的点积（f32 累加，存寄存器）──
+        float s_reg[KPT];
         {
-            const int tsub = sub*8;
-            FOR_UNROLL (int kk = 0; kk < 8; ++kk) {
+            const int tsub = sub*KPT;
+            FOR_UNROLL (int kk = 0; kk < KPT; ++kk) {
                 const int t = t0 + tsub + kk;
                 float s = -INFINITY;
                 if (r_valid && t < args.ne11) {
@@ -306,7 +308,7 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
         // ── 局部 max → 行合并 ──
         {
             float m_loc = -INFINITY;
-            FOR_UNROLL (int kk = 0; kk < 8; ++kk) {
+            FOR_UNROLL (int kk = 0; kk < KPT; ++kk) {
                 m_loc = MAX(m_loc, s_reg[kk]);
             }
             mps[r_loc*8 + sub] = m_loc;
@@ -329,8 +331,8 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
         // ── 权重 + 局部 l → sw 覆写；O 重缩放 ──
         {
             float l_loc = 0.0f;
-            const int tsub = sub*8;
-            FOR_UNROLL (int kk = 0; kk < 8; ++kk) {
+            const int tsub = sub*KPT;
+            FOR_UNROLL (int kk = 0; kk < KPT; ++kk) {
                 const float w = exp2(fmax(s_reg[kk] - mst[r_loc], -128.0f));
                 l_loc += w;
                 sw[r_loc*NBC + tsub + kk] = w;
@@ -377,7 +379,7 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
 }
 
 // ─────────────────────────── 模板实例化 ───────────────────────────
-// vec：dk∈{64,128} × nbc∈{64,128}，dk256 仅 nbc64（P1-A 朴素版）；tile：dk∈{64,128,256}，nbc=64，NQ=32；reduce：dv∈{64,128,256}
+// vec：dk∈{64,128} × nbc∈{64,128}，dk256/512 仅 nbc64（P1-A 朴素版）；tile：dk∈{64,128,256,512}，nbc=64，NQ=32；reduce：dv∈{64,128,256,512}
 
 typedef decltype(kernel_flash_attn_ext_amd_vec_dk<64, 64, 64>)   flash_attn_ext_amd_vec_t;
 typedef decltype(kernel_flash_attn_ext_amd_reduce_dk<64>)        flash_attn_ext_amd_reduce_t;
@@ -388,11 +390,14 @@ template [[host_name("kernel_flash_attn_ext_amd_vec_dk64_nbc128" )]] kernel flas
 template [[host_name("kernel_flash_attn_ext_amd_vec_dk128_nbc64" )]] kernel flash_attn_ext_amd_vec_t kernel_flash_attn_ext_amd_vec_dk<128, 128,  64>;
 template [[host_name("kernel_flash_attn_ext_amd_vec_dk128_nbc128")]] kernel flash_attn_ext_amd_vec_t kernel_flash_attn_ext_amd_vec_dk<128, 128, 128>;
 template [[host_name("kernel_flash_attn_ext_amd_vec_dk256_nbc64"  )]] kernel flash_attn_ext_amd_vec_t kernel_flash_attn_ext_amd_vec_dk<256, 256,  64>;
+template [[host_name("kernel_flash_attn_ext_amd_vec_dk512_nbc64"  )]] kernel flash_attn_ext_amd_vec_t kernel_flash_attn_ext_amd_vec_dk<512, 512,  64>;
 
 template [[host_name("kernel_flash_attn_ext_amd_reduce_dk64" )]] kernel flash_attn_ext_amd_reduce_t kernel_flash_attn_ext_amd_reduce_dk< 64>;
 template [[host_name("kernel_flash_attn_ext_amd_reduce_dk128")]] kernel flash_attn_ext_amd_reduce_t kernel_flash_attn_ext_amd_reduce_dk<128>;
 template [[host_name("kernel_flash_attn_ext_amd_reduce_dk256")]] kernel flash_attn_ext_amd_reduce_t kernel_flash_attn_ext_amd_reduce_dk<256>;
+template [[host_name("kernel_flash_attn_ext_amd_reduce_dk512")]] kernel flash_attn_ext_amd_reduce_t kernel_flash_attn_ext_amd_reduce_dk<512>;
 
 template [[host_name("kernel_flash_attn_ext_amd_tile_dk64_nbc64" )]] kernel flash_attn_ext_amd_tile_t kernel_flash_attn_ext_amd_tile_dk< 64,  64, 64, 32>;
 template [[host_name("kernel_flash_attn_ext_amd_tile_dk128_nbc64")]] kernel flash_attn_ext_amd_tile_t kernel_flash_attn_ext_amd_tile_dk<128, 128, 64, 32>;
 template [[host_name("kernel_flash_attn_ext_amd_tile_dk256_nbc64")]] kernel flash_attn_ext_amd_tile_t kernel_flash_attn_ext_amd_tile_dk<256, 256, 64, 32>;
+template [[host_name("kernel_flash_attn_ext_amd_tile_dk512_nbc32")]] kernel flash_attn_ext_amd_tile_t kernel_flash_attn_ext_amd_tile_dk<512, 512, 32, 32>;

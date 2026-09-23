@@ -1658,7 +1658,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const bool holes = sp_min >= 0 && sp_max >= sp_min &&
                 cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
 
-            if (!alibi && !holes) {
+            // Copy-and-patch within one build call: occupancy is frozen while
+            // building, row 0 of each seq always fully scans, and only edge
+            // cells need per-row patching. Holes do not invalidate this:
+            // a non-empty hole far below keeps the same mask in every row.
+            if (!alibi) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 

@@ -13,6 +13,7 @@
 #include "llama-arch.h"
 #include "llama-cparams.h"
 #include "llama-impl.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
 #include "llama-model.h"
@@ -368,6 +369,30 @@ static uint32_t kvmem_n_attn_layers(const llama_model & model) {
     return c == 0 ? n : c;
 }
 
+// SWA mode: the slot pool covers full-attention layers only. SWA layers keep
+// a small sliding ring in a separate cache, so pool math must use full-layer
+// dims and counts. Without SWA these match the attn helpers above.
+static uint32_t kvmem_first_full_layer(const llama_model & model) {
+    const uint32_t n = model.hparams.n_layer();
+    for (uint32_t il = 0; il < n; ++il) {
+        if (!model.hparams.is_recr(il) && !model.hparams.is_swa(il)) {
+            return il;
+        }
+    }
+    return kvmem_first_attn_layer(model);
+}
+
+static uint32_t kvmem_n_full_layers(const llama_model & model) {
+    const uint32_t n = model.hparams.n_layer();
+    uint32_t c = 0;
+    for (uint32_t il = 0; il < n; ++il) {
+        if (!model.hparams.is_recr(il) && !model.hparams.is_swa(il)) {
+            ++c;
+        }
+    }
+    return c == 0 ? kvmem_n_attn_layers(model) : c;
+}
+
 struct kvmem_pool_plan {
     uint32_t block_tokens = 32;
     uint32_t budget = 0;
@@ -397,8 +422,8 @@ static kvmem_pool_plan kvmem_compute_pool(
     uint32_t gen_reserve = g_kvmem_params.gen_reserve ? g_kvmem_params.gen_reserve : 256u;
     gen_reserve = kvmem_align_tokens(gen_reserve, p.block_tokens);
 
-    const uint32_t il0 = kvmem_first_attn_layer(model);
-    const uint32_t n_attn = kvmem_n_attn_layers(model);
+    const uint32_t il0 = kvmem_first_full_layer(model);
+    const uint32_t n_attn = kvmem_n_full_layers(model);
     const uint32_t n_embd_k = model.hparams.n_embd_k_gqa(il0);
     const uint32_t n_embd_v = model.hparams.n_embd_v_gqa(il0);
     const uint64_t k_row = ggml_row_size(params.type_k, n_embd_k);
@@ -471,6 +496,10 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         if (!tgt) {
             return nullptr;
         }
+        if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+            LLAMA_LOG_WARN("%s: KVMem MTP unverified on SWA models\n", __func__);
+            return nullptr;
+        }
         return new llama_memory_kvmem_mtp(model, params, cparams, tgt);
     }
     if (llm_arch_is_recurrent(model.arch)) {
@@ -484,8 +513,18 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         return nullptr;
     }
     if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        LLAMA_LOG_WARN("%s: KVMem skips SWA models\n", __func__);
-        return nullptr;
+        // SWA + recurrent hybrids stay out: the hybrid wrapper builds a
+        // plain attn/recr split with no SWA partition.
+        if (llm_arch_is_hybrid(model.arch)) {
+            LLAMA_LOG_WARN("%s: KVMem skips SWA hybrid arch %s\n",
+                    __func__, llm_arch_name(model.arch));
+            return nullptr;
+        }
+        // Pure-attention SWA models (e.g. Gemma interleaved SWA): full layers
+        // go to the slot pool, SWA layers keep a sliding ring. See swa_mode_.
+        LLAMA_LOG_INFO("%s: KVMem SWA mode (%u full layers, window %u)\n",
+                __func__, kvmem_n_full_layers(model), model.hparams.n_swa);
+        return new llama_memory_kvmem(model, params, cparams);
     }
     if (llm_arch_is_hybrid(model.arch)) {
         return new llama_memory_kvmem_hybrid(model, params, cparams);
@@ -528,30 +567,58 @@ llama_memory_kvmem::llama_memory_kvmem(
             }
         }
     } else {
-        kv_owned_ = std::make_unique<llama_kv_cache>(
-                model,
-                model.hparams,
-                params.type_k,
-                params.type_v,
-                !cparams.flash_attn,
-                cparams.offload_kqv,
-                /* unified */ true,
-                kv_size_,
-                /* n_seq_max */ 1,
-                /* n_pad */ 1,
-                model.hparams.n_swa,
-                model.hparams.swa_type,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                "kvmem");
-        kv_ = kv_owned_.get();
+        // SWA mode owns an iswa split: base (full layers) is the slot pool,
+        // swa half is a small sliding ring that stays GPU resident.
+        swa_mode_ = model.hparams.swa_type != LLAMA_SWA_TYPE_NONE;
+        if (swa_mode_) {
+            const llama_memory_i::layer_filter_cb filter_full = [&](int32_t il) {
+                return il < (int32_t) model.hparams.n_layer() && !model.hparams.is_recr(il);
+            };
+            iswa_owned_ = std::make_unique<llama_kv_cache_iswa>(
+                    model,
+                    params.type_k,
+                    params.type_v,
+                    !cparams.flash_attn,
+                    cparams.offload_kqv,
+                    /* swa_full */ false,
+                    /* unified */ true,
+                    kv_size_,
+                    /* n_seq_max */ 1,
+                    cparams.n_ubatch,
+                    /* n_pad */ 1,
+                    nullptr,
+                    filter_full,
+                    nullptr,
+                    nullptr);
+            kv_ = iswa_owned_->get_base();
+            LLAMA_LOG_INFO("%s: SWA split: base %u cells (%u full layers), swa window %u\n",
+                    __func__, kv_->get_size(), kvmem_n_full_layers(model), model.hparams.n_swa);
+        } else {
+            kv_owned_ = std::make_unique<llama_kv_cache>(
+                    model,
+                    model.hparams,
+                    params.type_k,
+                    params.type_v,
+                    !cparams.flash_attn,
+                    cparams.offload_kqv,
+                    /* unified */ true,
+                    kv_size_,
+                    /* n_seq_max */ 1,
+                    /* n_pad */ 1,
+                    model.hparams.n_swa,
+                    model.hparams.swa_type,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    "kvmem");
+            kv_ = kv_owned_.get();
+        }
     }
 
     reset_slots();
 
-    const uint32_t il0 = kvmem_first_attn_layer(model);
+    const uint32_t il0 = kvmem_first_full_layer(model);
     n_layer_ = model.hparams.n_layer();
     n_embd_head_ = model.hparams.n_embd_head_k(il0);
     n_head_kv_ = model.hparams.n_head_kv(il0);
@@ -597,20 +664,25 @@ llama_memory_kvmem::llama_memory_kvmem(
     kvmem_capture_bind(this);
 
     size_t kv_bytes = 0;
-    if (kv_) {
+    if (swa_mode_) {
+        for (const auto & kv : iswa_owned_->memory_breakdown()) {
+            kv_bytes += kv.second;
+        }
+    } else if (kv_) {
         for (const auto & kv : kv_->memory_breakdown()) {
             kv_bytes += kv.second;
         }
     }
     LLAMA_LOG_INFO(
-            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s\n",
+            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s%s\n",
             __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
             rt_cfg.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
             (int) g_kvmem_params.harvest_v,
             ggml_type_name(type_k_), ggml_type_name(type_v_),
-            n_embd_k_, kvmem_n_attn_layers(model),
-            ext_kv ? " hybrid_attn" : "");
+            n_embd_k_, kvmem_n_full_layers(model),
+            ext_kv ? " hybrid_attn" : "",
+            swa_mode_ ? " swa_split" : "");
     fprintf(stderr,
             "KVMEM_KV_BYTES bytes=%zu cells=%u slots=%u budget=%u pool=%u "
             "ratio=%.2f high=%.2f low=%.2f cap_blocks=%u gpu_total=%llu block_bytes=%llu\n",
@@ -947,7 +1019,8 @@ bool llama_memory_kvmem::remove_logical(llama_context * ctx, llama_pos begin, ll
             if (!recr_->seq_rm(0, p, -1)) return false;
         }
     }
-    return kv_->seq_rm_logical(0, begin, end);
+    return kv_->seq_rm_logical(0, begin, end) &&
+        (!swa_mode_ || iswa_owned_->get_swa()->seq_rm(0, begin, end));
 }
 
 #if defined(LLAMA_KVMEM_METAL)
@@ -1556,6 +1629,15 @@ llama_memory_context_ptr llama_memory_kvmem::init_batch(
             break;
         }
 
+        if (swa_mode_) {
+            auto sinfos_swa = iswa_owned_->get_swa()->prepare(ubatches);
+            if (sinfos_swa.empty()) {
+                break;
+            }
+            return std::make_unique<llama_kv_cache_iswa_context>(
+                    iswa_owned_.get(), std::move(sinfos), std::move(sinfos_swa), std::move(ubatches));
+        }
+
         return std::make_unique<llama_kv_cache_context>(
                 kv_, std::move(sinfos), std::move(ubatches));
     } while (false);
@@ -1564,17 +1646,25 @@ llama_memory_context_ptr llama_memory_kvmem::init_batch(
 }
 
 llama_memory_context_ptr llama_memory_kvmem::init_full() {
+    if (swa_mode_) {
+        return iswa_owned_->init_full();
+    }
     return kv_->init_full();
 }
 
 llama_memory_context_ptr llama_memory_kvmem::init_update(llama_context * lctx, bool optimize) {
+    if (swa_mode_) {
+        return iswa_owned_->init_update(lctx, optimize);
+    }
     return kv_->init_update(lctx, optimize);
 }
 
 void llama_memory_kvmem::clear(bool data) {
     harvest_flush();
     harvest_gpu_v_commit();
-    if (kv_) {
+    if (swa_mode_) {
+        iswa_owned_->clear(data);
+    } else if (kv_) {
         kv_->clear(data);
     }
     reset_policy();
@@ -1582,7 +1672,7 @@ void llama_memory_kvmem::clear(bool data) {
 
 bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     ++attention_epoch_;
-    const bool ok = kv_->seq_rm(seq_id, p0, p1);
+    const bool ok = swa_mode_ ? iswa_owned_->seq_rm(seq_id, p0, p1) : kv_->seq_rm(seq_id, p0, p1);
     if (!ok) {
         return false;
     }
@@ -1600,43 +1690,76 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
 
 void llama_memory_kvmem::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     ++attention_epoch_;
-    kv_->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    if (swa_mode_) {
+        iswa_owned_->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    } else {
+        kv_->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
 }
 
 void llama_memory_kvmem::seq_keep(llama_seq_id seq_id) {
     ++attention_epoch_;
-    kv_->seq_keep(seq_id);
+    if (swa_mode_) {
+        iswa_owned_->seq_keep(seq_id);
+    } else {
+        kv_->seq_keep(seq_id);
+    }
 }
 
 void llama_memory_kvmem::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     ++attention_epoch_;
-    kv_->seq_add(seq_id, p0, p1, shift);
+    if (swa_mode_) {
+        iswa_owned_->seq_add(seq_id, p0, p1, shift);
+    } else {
+        kv_->seq_add(seq_id, p0, p1, shift);
+    }
 }
 
 void llama_memory_kvmem::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     ++attention_epoch_;
-    kv_->seq_div(seq_id, p0, p1, d);
+    if (swa_mode_) {
+        iswa_owned_->seq_div(seq_id, p0, p1, d);
+    } else {
+        kv_->seq_div(seq_id, p0, p1, d);
+    }
 }
 
 llama_pos llama_memory_kvmem::seq_pos_min(llama_seq_id seq_id) const {
+    if (swa_mode_) {
+        return iswa_owned_->seq_pos_min(seq_id);
+    }
     return kv_->seq_pos_min(seq_id);
 }
 
 llama_pos llama_memory_kvmem::seq_pos_max(llama_seq_id seq_id) const {
+    if (swa_mode_) {
+        return iswa_owned_->seq_pos_max(seq_id);
+    }
     return kv_->seq_pos_max(seq_id);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem::memory_breakdown() const {
+    if (swa_mode_) {
+        return iswa_owned_->memory_breakdown();
+    }
     return kv_->memory_breakdown();
 }
 
 void llama_memory_kvmem::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    kv_->state_write(io, seq_id, flags);
+    if (swa_mode_) {
+        iswa_owned_->state_write(io, seq_id, flags);
+    } else {
+        kv_->state_write(io, seq_id, flags);
+    }
 }
 
 void llama_memory_kvmem::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ++attention_epoch_;
-    kv_->state_read(io, seq_id, flags);
+    if (swa_mode_) {
+        iswa_owned_->state_read(io, seq_id, flags);
+    } else {
+        kv_->state_read(io, seq_id, flags);
+    }
 }
 
 void llama_memory_kvmem::note_ubatch_pos(const std::vector<llama_pos> & pos) {
@@ -1645,6 +1768,11 @@ void llama_memory_kvmem::note_ubatch_pos(const std::vector<llama_pos> & pos) {
 
 void llama_memory_kvmem::register_capture(ggml_tensor * t, int il, char which) {
     if (!t) {
+        return;
+    }
+    // SWA layers keep a resident sliding ring: no retrieval, no raw store.
+    // Full-layer dims size every capture buffer, so SWA K/Q must stay out.
+    if (swa_mode_ && model_.hparams.is_swa((uint32_t) il)) {
         return;
     }
     pending_capture_.push_back({t, il, which});

@@ -22,6 +22,7 @@ struct llama_memory_params;
 struct ggml_tensor;
 class llama_memory_recurrent;
 class llama_memory_kvmem_mtp;
+class llama_kv_cache_iswa;
 
 // Bounded block-slot pool over a llama_kv_cache.
 //
@@ -67,6 +68,8 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     llama_kv_cache * get_kv() { return kv_; }
+    bool swa_mode() const { return swa_mode_; }
+    llama_kv_cache_iswa * get_iswa() { return iswa_owned_.get(); }
     kvmem::KvMemRuntime & runtime() { return *runtime_; }
     const kvmem::KvMemRuntime & runtime() const { return *runtime_; }
 
@@ -353,6 +356,10 @@ private:
 
     std::unique_ptr<llama_kv_cache> kv_owned_;
     llama_kv_cache * kv_ = nullptr;
+    // SWA mode: iswa owns a full-attn base cache (the slot pool, == kv_)
+    // plus a small sliding SWA cache. Null when swa_mode_ is false.
+    std::unique_ptr<llama_kv_cache_iswa> iswa_owned_;
+    bool swa_mode_ = false;
     llama_memory_recurrent * recr_ = nullptr;
     struct GdnReplay;
     std::unique_ptr<GdnReplay> gdn_replay_;
