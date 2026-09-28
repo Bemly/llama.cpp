@@ -221,7 +221,9 @@ static bool ggml_metal_fusion_check_silu_mul(
         un->src[0]->type != GGML_TYPE_F32 || partner->type != GGML_TYPE_F32) {
         return false;
     }
-    if (!ggml_is_contiguous(un) || !ggml_is_contiguous(mu) || !ggml_is_contiguous(partner)) {
+    // the kernel reads src0 and partner with one row stride (nb01), so src0 must
+    // be contiguous too; a strided view (e.g. split gate/up) would misread partner
+    if (!ggml_is_contiguous(un->src[0]) || !ggml_is_contiguous(un) || !ggml_is_contiguous(mu) || !ggml_is_contiguous(partner)) {
         return false;
     }
     return true;
