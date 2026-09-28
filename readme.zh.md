@@ -35,9 +35,11 @@
   1）、`DECODE_SCHED` 单 CB 折叠（默认关，实测 -4% tg，负优化留档）。
 - `ggml-metal-impl.h`（+48）：kargs 加 `nbq_d/nbh_d/nbb_d`（dst 按 role 的真
   strides），reduce 复用 Q strides 处加注释＋双 encode 位点硬 assert。
-- `kernels/dequantize.h`：`q4_0` / `q4_1` 4x4 按 CPU 逐字节重写（旧 `d/16`＋mask
-  写法高半区少一次右移，直接错 16 倍）。
-- `kernels/fa.metal`（+1 行）：补 `iq4_nl` 的 `kv_*_f16` 预实例化。
+- `kernels/dequantize.h`：`q4_0` / `q4_1` 4x4 改为逐字节取 nibble，与上游数值
+  等价。上游 `d/16`＋mask 写法本身是对的（`(n<<4)*d/16 == n*d`）；此前这里写
+  "上游高半区错 16 倍"是误记。真正错 16 倍的是本 fork 的中间提交 `0187918`，
+  已由 `02726fa` 修正。
+- `kernels/fa_aux.metal`（+1 行）：补 `iq4_nl` 的 `kv_*_f16` 预实例化（上游已把 `fa.metal` 按 dtype 拆分，prepass 在 `fa_aux.metal`）。
 - `kernels/mul_mv.metal`（+86）：`q4_K/q6_K(_nr0_4/_nr0_8)`、
   `q8_0/q4_0/q5_0(_nr0_4)` 变体 kernel（`mul_mv_id` 的重复实例化被 metalc 拒掉，
   已砍；稠密模型不走 id 路径，无影响）。
@@ -86,8 +88,22 @@ decode-like 判据：第一个 MUL_MAT 的 `ne11==1`（FA 旋钮另要求 `ne12*
 - 正确性：`test-backend-ops -o FLASH_ATTN_EXT` mask=0 全绿（F16/全量化类型，
   vec＋tile）；mask=1 随机块 mask 残留 ERR≈0.026——half 精度的 adversarial
   fixture，全零/因果 mask 全过，定为 harness artifact，不是 kernel bug。
-- **注水位声明**：上面的端到端数字测于 tile dst 槽位修复（`ba42cb1`）之前，
-  修后必须重跑 PPL＋bench 重建，旧数在此之前引用即误导。
+- **过期声明**：上面 14B 两组端到端数字测于 tile dst 槽位修复（`ba42cb1`，
+  2026-09-16）之前，至今未重跑，引用前必须按下面的命令复测。
+- `ba42cb1` 之后的实测：唯一的 FA 开/关 A/B 是 Bonsai-2-27B PQ2_0（dk256），
+  tg 17.37→31.29（+80%），见第九节；Serenity-27B pp512 44.5 / tg64 22.3、
+  Hauhau-27B tg64 21.05（第十三节）也在修复之后，但当时未记录 FA 设置。
+
+14B 复测命令（同一二进制，FA 开/关对照；`-d 8192` 即 8k 深度下的 tg）：
+
+```sh
+M=<14B-Q4_K_M>.gguf
+./build/bin/llama-bench -m $M -ngl 99 -fa 0,1 -p 512,8192 -n 128 -r 3 -o md
+./build/bin/llama-bench -m $M -ngl 99 -fa 0,1 -p 0 -n 128 -d 8192 -r 3 -o md
+./build/bin/llama-bench -m $M -ngl 99 -fa 1 -p 32768 -n 0 -r 1 -o md
+./build/bin/llama-perplexity -m $M -ngl 99 -fa on -f wiki.test.raw -c 2048 --chunks 32
+./build/bin/test-backend-ops -o FLASH_ATTN_EXT -b MTL0
+```
 
 ## 六、已知限制（都与 FA 无关，另起炉灶）
 
@@ -100,14 +116,19 @@ decode-like 判据：第一个 MUL_MAT 的 `ne11==1`（FA 旋钮另要求 `ne12*
 
 ## 七、分支图
 
-- `master`：上游基线（本地 718f7b4 一代）。
+- `master`：上游快照（718f7b4，2026-09-12），不随 fork-sync 更新。
+- **`metal-exact-alloc`：默认分支**，fork-sync 每日合并上游到这里；含第十
+  至第十三节全部内容。
+- `ninfer-plan`：KVMem 资源规划 P0-P5 ＋ SILU/SOFTPLUS＋MUL 融合，待并入默认
+  分支。
+- `kvmem-eval`：第十、十二节的 KVMem eval 与 MMQ 开发分支（已并入默认分支）。
 - `rx6800-tile`：RC2 二层 tile 调优（NR0/NSG）。
 - `rx6800-fa`：FA-RDNA2 主线（dk128 时代）。
 - `rx6800-fa-dk128`：dk128 验证分支。
 - **`rx6800-fa-q8`**：Q8/Q4/Q5/iq4 全门＋DK256＋vec 双 fix＋dst-stride 修复
- （`ba42cb1`），上一代默认分支。
-- **`rx6800-fa-q8-pq2`：默认分支**，= fa-q8 ＋第九节的 PQ2_0 ternary 移植
-  （1 个提交，30 文件）。
+ （`ba42cb1`），更早的默认分支。
+- `rx6800-fa-q8-pq2`：fa-q8 ＋第九节的 PQ2_0 ternary 移植（1 个提交，30
+  文件），上上代默认分支。
 - `rx6800-fa-q8-bak-20250915`：tile 根因定位前的快照备份。
 - `rx6800-spec`：投机解码判定（ngram 无增益，draft 双墙判死，留档）。
 
