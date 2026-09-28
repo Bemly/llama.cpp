@@ -19,3 +19,7 @@ kvmem_add_test(pinned_kv_tier_test)
 kvmem_add_test(nvme_kv_tier_test)
 kvmem_add_test(kvmem_runtime_test)
 kvmem_add_test(raw_kv_store_test)
+
+# P2 row-conversion round trip needs the adapter quant helpers (ggml-linked).
+target_include_directories(kvmem_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/adapter)
+target_link_libraries(kvmem_runtime_test PRIVATE ggml)

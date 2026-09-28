@@ -404,6 +404,86 @@ struct kvmem_pool_plan {
     uint64_t gpu_total = 0;
 };
 
+// P0 startup resource planner (NInfer-absorb): loud ledger, no silent fallback.
+// Runs once per process, after weights are resident and before KV is allocated.
+// Weights come from the model object (file bytes scaled by offload fraction):
+// Metal currentAllocatedSize double-counts residency sets (~2x, measured), so it
+// is printed for cross-check only, never used for the fit decision.
+// Policy: explicit --kvmem-budget that does not fit -> fatal; budget=0 (auto)
+// keeps the old ratio-cap shrink but logs it loud with before/after numbers;
+// weights alone over the cap -> loud warning only (Metal over-commits; keeps
+// existing big-file workflows booting). Opt out: KVMEM_NO_PLANNER=1.
+static void kvmem_planner_check(
+        const llama_model & model,
+        const kvmem_pool_plan & p,
+        uint32_t ask_tokens,
+        uint32_t pre_cap_tokens,
+        uint32_t pool_tokens,
+        bool explicit_budget) {
+    static bool done = false;
+    if (done || getenv("KVMEM_NO_PLANNER") != nullptr) {
+        return;
+    }
+    done = true;
+
+    const uint64_t GIB = 1024ull * 1024ull * 1024ull;
+    const uint64_t HARD_CAP = 15ull * GIB; // RX6800 is also the display GPU: weights + KV + compute < 15G
+    const uint64_t SAFETY = 1536ull * 1024ull * 1024ull; // 1.5 GiB for WindowServer + sizing headroom
+    const uint64_t SCRATCH = 512ull * 1024ull * 1024ull; // v1 estimate: FA workspace + CB + ubatch scratch
+
+    size_t free_m = 0, total_m = 0;
+    const size_t ndev = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ggml_backend_dev_memory(dev, &free_m, &total_m);
+            break;
+        }
+    }
+    if (total_m == 0) {
+        return; // no GPU backend visible (CPU runs, host tests): nothing to plan
+    }
+    const uint64_t total = (uint64_t) total_m; // Metal: recommendedMaxWorkingSetSize
+    const uint64_t metal_cur = total > free_m ? total - (uint64_t) free_m : total;
+    const uint32_t n_gl = model.n_gpu_layers();
+    const uint32_t n_all = model.hparams.n_layer() + 1; // +1 for the output layer
+    const double frac = n_all ? std::min(1.0, (double) n_gl / (double) n_all) : 1.0;
+    const uint64_t weights = (uint64_t) ((double) model.size() * frac);
+    const uint64_t cap = total < HARD_CAP ? total : HARD_CAP;
+    const uint64_t reserve = SAFETY + SCRATCH;
+    const uint64_t kv_fit = cap > weights + reserve ? cap - weights - reserve : 0;
+    const uint64_t per_tok = p.block_tokens ? p.block_bytes / p.block_tokens : 0;
+    const uint64_t ask_bytes = per_tok ? (uint64_t) ask_tokens * per_tok : 0;
+    const unsigned long long fit_toks = per_tok ? (unsigned long long) (kv_fit / per_tok) : 0ull;
+
+    LLAMA_LOG_INFO("%s: ledger total=%.2fG metal_cur=%.2fG weights=%.2fG(frac=%.2f) cap=%.2fG safety=%.2fG scratch=%.2fG kv_fit=%.2fG(%llu toks) ask=%u toks pool=%u toks per_tok=%lluB\n",
+            __func__, (double) total / GIB, (double) metal_cur / GIB, (double) weights / GIB, frac,
+            (double) cap / GIB,
+            (double) SAFETY / GIB, (double) SCRATCH / GIB, (double) kv_fit / GIB,
+            fit_toks, ask_tokens, pool_tokens, (unsigned long long) per_tok);
+
+    if (per_tok == 0 || kv_fit < p.block_bytes) {
+        // Weights alone over the cap: loud warning, boot continues (Metal
+        // over-commits and existing big-file workflows keep running). Only an
+        // explicit over-ask is fatal. See P0 validation gates.
+        LLAMA_LOG_WARN("%s: weights (%.2fG) leave no KV room under cap %.2fG; "
+                       "expect residency pressure (slow prefill). Free GPU memory or lower -ngl\n",
+                __func__, (double) weights / GIB, (double) cap / GIB);
+    }
+    if (explicit_budget && ask_bytes > kv_fit) {
+        unsigned long long suggest = fit_toks > p.gen_reserve ? fit_toks - p.gen_reserve : 0ull;
+        suggest = suggest / p.block_tokens * p.block_tokens; // floor to whole blocks
+        LLAMA_LOG_ERROR("%s: refusing startup: explicit ask %u toks (%.2fG) exceeds kv_fit %llu toks (%.2fG); retry with --kvmem-budget %llu\n",
+                __func__, ask_tokens, (double) ask_bytes / GIB, fit_toks,
+                (double) kv_fit / GIB, suggest);
+        throw std::runtime_error("KVMem planner: explicit budget exceeds GPU cap, startup refused");
+    }
+    if (pool_tokens < pre_cap_tokens) {
+        LLAMA_LOG_WARN("%s: auto shrink (was silent): pool %u -> %u toks under ratio cap %.2fG; set --kvmem-budget explicitly to fail instead\n",
+                __func__, pre_cap_tokens, pool_tokens, (double) p.cap_blocks * p.block_bytes / GIB);
+    }
+}
+
 static kvmem_pool_plan kvmem_compute_pool(
         const llama_model & model,
         const llama_memory_params & params,
@@ -438,9 +518,11 @@ static kvmem_pool_plan kvmem_compute_pool(
     }
 
     uint32_t pool = budget + gen_reserve;
+    const uint32_t ask_tokens = pool;
     if (pool > cparams.n_ctx_seq && g_kvmem_params.budget == 0) {
         pool = cparams.n_ctx_seq;
     }
+    const uint32_t pre_cap_tokens = pool;
     if (p.cap_blocks > 0) {
         const uint32_t cap_tokens = p.cap_blocks * p.block_tokens;
         if (pool > cap_tokens) {
@@ -466,6 +548,7 @@ static kvmem_pool_plan kvmem_compute_pool(
     if (p.n_slots * p.block_tokens < p.kv_size) {
         p.n_slots += 1;
     }
+    kvmem_planner_check(model, p, ask_tokens, pre_cap_tokens, pool, g_kvmem_params.budget != 0);
     return p;
 }
 
@@ -549,10 +632,34 @@ llama_memory_kvmem::llama_memory_kvmem(
     kv_size_ = pool.kv_size;
     n_slots_ = pool.n_slots;
 
+    // P2 host/GPU dtype split: cold pages live quantized on host, the GPU hot
+    // set stays F16 so FA runs its native path (no per-op dequant prepass).
+    // Resolved here (before rt_cfg) so tier arenas size by host rows.
+    {
+        const uint32_t il0e = kvmem_first_attn_layer(model);
+        const uint32_t neke = model.hparams.n_embd_k_gqa(il0e);
+        const uint32_t neve = model.hparams.n_embd_v_gqa(il0e);
+        host_type_k_ = g_kvmem_params.host_type_k ? (ggml_type) g_kvmem_params.host_type_k : params.type_k;
+        host_type_v_ = g_kvmem_params.host_type_v ? (ggml_type) g_kvmem_params.host_type_v : params.type_v;
+        host_split_ = (host_type_k_ != params.type_k) || (host_type_v_ != params.type_v);
+        if (host_split_ && (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16)) {
+            throw std::runtime_error(
+                    "KVMem P2 split needs an F16 GPU cache (use --kv-dtype f16 with --kv-dtype-host q8_0)");
+        }
+        host_krow_ = ggml_row_size(host_type_k_, neke);
+        host_vrow_ = ggml_row_size(host_type_v_, neve);
+        host_block_bytes_ = static_cast<uint64_t>(kvmem_n_full_layers(model)) *
+                (host_krow_ + host_vrow_) * block_tokens_;
+    }
+
     auto rt_cfg = make_runtime_cfg(
             block_tokens_, pool.budget, g_kvmem_params.sink_tokens, g_kvmem_params.recent_tokens,
             pool.block_bytes);
     rt_cfg.store.estimated_gpu_block_capacity = pool.cap_blocks;
+    if (host_split_) {
+        // Tiers/NVMe store host-dtype rows; GPU-resident accounting keeps GPU bytes.
+        rt_cfg.store.estimated_block_bytes = host_block_bytes_;
+    }
     runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg, &backend_);
 
     if (ext_kv) {
@@ -674,12 +781,13 @@ llama_memory_kvmem::llama_memory_kvmem(
         }
     }
     LLAMA_LOG_INFO(
-            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s%s\n",
+            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s host_k=%s host_v=%s n_embd_k=%u attn_layers=%u%s%s\n",
             __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
             rt_cfg.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
             (int) g_kvmem_params.harvest_v,
             ggml_type_name(type_k_), ggml_type_name(type_v_),
+            ggml_type_name(host_type_k_), ggml_type_name(host_type_v_),
             n_embd_k_, kvmem_n_full_layers(model),
             ext_kv ? " hybrid_attn" : "",
             swa_mode_ ? " swa_split" : "");
@@ -693,6 +801,42 @@ llama_memory_kvmem::llama_memory_kvmem(
             pool.cap_blocks,
             (unsigned long long) pool.gpu_total,
             (unsigned long long) pool.block_bytes);
+
+    // P3 Qwen3.8 execution profile: qwen35-64/65blk with dk256 locks the
+    // FA-RDNA2 path, the N_CB split, full offload and the P2 KV repr.
+    // Anything else (or LLAMA_QWEN38_PROFILE=0) takes the generic path below
+    // with zero behavior change.
+    {
+        const char * pe = getenv("LLAMA_QWEN38_PROFILE");
+        const bool profile_on = !(pe && pe[0] && pe[0] == '0');
+        const uint32_t nl = model.hparams.n_layer();
+        const bool is_qwen38 = profile_on && model.arch == LLM_ARCH_QWEN35 &&
+                (nl == 64 || nl == 65) && n_embd_head_ == 256;
+        if (is_qwen38) {
+            const uint32_t n_attn = kvmem_n_attn_layers(model);
+            const uint32_t gqa = n_head_kv_ ? n_head_ / n_head_kv_ : 0;
+            const char * fa_off = getenv("GGML_METAL_FA_AMD");
+            if (fa_off && fa_off[0] == '0') {
+                LLAMA_LOG_WARN("%s: QWEN38_PROFILE qwen35-%ublk but GGML_METAL_FA_AMD=0; "
+                               "keeping user override (FA falls back, slower)\n", __func__, nl);
+            }
+            if (!getenv("GGML_METAL_N_CB")) {
+                setenv("GGML_METAL_N_CB", "16", 0);
+            }
+            const uint32_t n_gl = model.n_gpu_layers();
+            if (n_gl < nl + 1) {
+                LLAMA_LOG_WARN("%s: QWEN38_PROFILE qwen35-%ublk partially offloaded "
+                               "(ngl=%u); profile wants full offload\n", __func__, nl, n_gl);
+            }
+            LLAMA_LOG_INFO("%s: QWEN38_PROFILE qwen35-%ublk locked "
+                           "(attn=%u ssm=%u gqa=%u dk=256 fa_amd=%s n_cb=%s offload=%u/%u kv=%s/%s)\n",
+                    __func__, nl, n_attn, nl - n_attn, gqa,
+                    (fa_off && fa_off[0] == '0') ? "off(user)" : "dk256",
+                    getenv("GGML_METAL_N_CB") ? getenv("GGML_METAL_N_CB") : "0",
+                    n_gl, nl + 1,
+                    ggml_type_name(type_k_), ggml_type_name(host_type_k_));
+        }
+    }
 }
 
 llama_memory_kvmem::~llama_memory_kvmem() {
@@ -712,11 +856,7 @@ llama_memory_kvmem::~llama_memory_kvmem() {
 }
 
 void llama_memory_kvmem::reset_slots() {
-    free_slots_.clear();
-    free_slots_.reserve(n_slots_);
-    for (int32_t i = static_cast<int32_t>(n_slots_) - 1; i >= 0; --i) {
-        free_slots_.push_back(i);
-    }
+    page_table_.reset(n_slots_);
 }
 
 void llama_memory_kvmem::reset_policy() {
@@ -732,6 +872,9 @@ void llama_memory_kvmem::reset_policy() {
     }
     if (runtime_) {
         runtime_->truncate_to(0);
+    }
+    if (trace_ && !page_table_.valid()) {
+        fprintf(stderr, "KVMEM_TRACE page table invalid at reset_policy\n");
     }
     reset_slots();
     retrieval_pinned_ = false;
@@ -784,26 +927,35 @@ llama_pos llama_memory_kvmem::recr_pos_max() const {
 }
 
 int32_t llama_memory_kvmem::alloc_slot() {
-    if (free_slots_.empty()) {
-        return -1;
-    }
-    const int32_t slot = free_slots_.back();
-    free_slots_.pop_back();
-    return slot;
+    return alloc_slot_for(-1, -1);
+}
+
+int32_t llama_memory_kvmem::alloc_slot_for(int32_t owner, int32_t logical) {
+    return page_table_.alloc(owner, logical).slot;
 }
 
 void llama_memory_kvmem::free_slot(int32_t slot) {
-    if (slot < 0) {
-        return;
+    page_table_.free(slot, -2, 0); // legacy path: clear entry, no ownership check
+}
+
+bool llama_memory_kvmem::free_slot_checked(int32_t slot, int32_t owner, uint32_t gen) {
+    const bool ok = page_table_.free(slot, owner, gen);
+    if (!ok) {
+        fprintf(stderr, "KVMEM_PAGE release rejected slot=%d owner=%d gen=%u\n", slot, owner, gen);
     }
-    free_slots_.push_back(slot);
+    return ok;
+}
+
+uint32_t llama_memory_kvmem::page_gen(int32_t slot) const {
+    return page_table_.generation(slot);
+}
+
+uint32_t llama_memory_kvmem::release_session(llama_seq_id seq_id) {
+    return page_table_.release_session(seq_id);
 }
 
 int32_t llama_memory_kvmem::peek_free_slot() const {
-    if (free_slots_.empty()) {
-        return -1;
-    }
-    return free_slots_.back();
+    return page_table_.peek();
 }
 
 bool llama_memory_kvmem::slot_for_orig_pos(llama_pos pos, int32_t * slot, uint32_t * off) const {
@@ -865,14 +1017,14 @@ void llama_memory_kvmem::trace_plan(const char * tag, const kvmem::KvMemPlan & p
         }
     }
     fprintf(stderr,
-            "KVMEM_TRACE %s stage_in=%zu stage_out=%zu skip=%u gpu_reused=%u window=%u free_slots=%zu\n",
+            "KVMEM_TRACE %s stage_in=%zu stage_out=%zu skip=%u gpu_reused=%u window=%u free_slots=%u\n",
             tag,
             plan.stage_in.size(),
             plan.stage_out.size(),
             skip,
             plan.gpu_reused_blocks,
             plan.total_window_tokens,
-            free_slots_.size());
+            (unsigned) page_table_.n_free());
 }
 
 void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
@@ -919,6 +1071,20 @@ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
         runtime_->admit_incoming();
         if (retr_.enabled) {
             retr_.admit_us += ggml_time_us() - t0;
+        }
+    }
+    // P1: refresh logical block identity on live pages after every plan.
+    for (uint32_t id = 0; id < store.block_count(); ++id) {
+        const kvmem::KvMemBlock & b = store.blocks()[id];
+        if (b.gpu_slot >= 0) {
+            page_table_.note_resident(b.gpu_slot, static_cast<int32_t>(id), -1);
+        }
+    }
+    if (trace_) {
+        const int v = page_table_.valid_detail();
+        if (v != 0) {
+            fprintf(stderr, "KVMEM_TRACE page table invalid at apply_plan_to_kv reason=%d self=%p n_slots=%u kv_size=%u block_tok=%u %s\n",
+                    v, (const void *) this, n_slots_, kv_size_, block_tokens_, page_table_.dump().c_str());
         }
     }
 }
@@ -1482,7 +1648,8 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     }
     const uint32_t t1 = store.total_tokens();
 
-    std::vector<uint32_t> incoming;
+    std::vector<uint32_t> & incoming = incoming_scratch_;
+    incoming.clear();
     for (const auto & b : store.blocks()) {
         if (b.orig_pos_end() > t0 && b.orig_pos_start < t1) {
             incoming.push_back(b.block_id);
@@ -1509,10 +1676,10 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     if (trace_) {
         fprintf(stderr,
                 "KVMEM_TRACE append n=%u total=%u resident=%u incoming_blocks=%zu "
-                "over_budget=%d need_offload=%d free_slots=%zu\n",
+                "over_budget=%d need_offload=%d free_slots=%u\n",
                 n_new_tokens, t1, resident_tokens(), incoming.size(),
                 (int) (store.block_count() > budget_blocks), (int) need_offload,
-                free_slots_.size());
+                (unsigned) page_table_.n_free());
     }
 
     if (need_offload) {
@@ -1582,14 +1749,16 @@ bool llama_memory_kvmem::prepare_ubatches(
             row.token = ub.token ? ub.token[i] : LLAMA_TOKEN_NULL;
         }
     }
-    sinfos.clear();
-    sinfos.reserve(ubatches.size());
-    for (const auto & ubatch : ubatches) {
-        llama_kv_cache::slot_info sinfo;
-        if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatch, sinfo)) {
+    // P4: refill sinfos in place when the shape matches (keeps inner capacity,
+    // no per-token heap churn in steady decode).
+    if (sinfos.size() != ubatches.size()) {
+        sinfos.clear();
+        sinfos.resize(ubatches.size());
+    }
+    for (size_t ui = 0; ui < ubatches.size(); ++ui) {
+        if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatches[ui], sinfos[ui])) {
             return false;
         }
-        sinfos.push_back(std::move(sinfo));
     }
     pos_queue_.clear();
     for (const auto & ubatch : ubatches) {
@@ -1682,6 +1851,9 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
         seq_id <= 0 && p0 <= 0 &&
         (p1 < 0 || p1 >= static_cast<llama_pos>(runtime_->store().total_tokens()))) {
         runtime_->truncate_to(0);
+        if (trace_ && !page_table_.valid()) {
+            fprintf(stderr, "KVMEM_TRACE page table invalid at seq_rm wipe\n");
+        }
         reset_slots();
         retrieval_pinned_ = false;
     }
@@ -3148,11 +3320,37 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
     uint64_t off = 0;
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    // P2: host spans use host-dtype rows (equal to GPU rows unless split).
+    const size_t hkrow = host_split_ ? host_krow_ : krow;
+    const size_t hvrow = host_split_ ? host_vrow_ : vrow;
     const uint32_t cell0 = static_cast<uint32_t>(gpu_slot) * block_tokens_;
     const uint32_t nget = (cell0 < kv_size_)
             ? std::min(block_tokens_, kv_size_ - cell0) : 0;
-    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
-    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
+    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * hkrow;
+    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * hvrow;
+    std::vector<uint8_t> grow;
+    if (host_split_) {
+        grow.reserve(static_cast<size_t>(block_tokens_) * std::max(krow, vrow));
+    }
+    // Split needs an F16 GPU cache (enforced in ctor): convert F16 rows once
+    // per spill; FA keeps eating native F16 with no per-op prepass.
+    auto spill_side = [&](ggml_tensor * t, uint8_t * d, size_t grow_bytes, size_t hrow,
+                          ggml_type host_ty, uint32_t dim, const char * what) -> bool {
+        if (!t || nget == 0) {
+            return true;
+        }
+        if (!host_split_ || hrow == grow_bytes) {
+            kvmem_tensor_get(t, d, cell0 * grow_bytes, nget * grow_bytes);
+            return true;
+        }
+        grow.assign(grow_bytes * nget, 0);
+        kvmem_tensor_get(t, grow.data(), cell0 * grow_bytes, nget * grow_bytes);
+        if (!kvmem_rows_f16_to_host(host_ty, grow.data(), d, nget, dim)) {
+            fprintf(stderr, "KVMEM_P2 spill %s convert failed (dim=%u)\n", what, dim);
+            return false;
+        }
+        return true;
+    };
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
@@ -3162,15 +3360,17 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
         if (off + kspan > bytes) {
             return;
         }
-        if (kt && nget > 0) {
-            kvmem_tensor_get(kt, dst + off, cell0 * krow, nget * krow);
+        if (!spill_side(kt, dst + off, krow, hkrow, host_type_k_, n_embd_k_, "K")) {
+            return;
         }
         off += kspan;
         if (off + vspan > bytes) {
             return;
         }
-        if (vt && !v_trans_ && nget > 0) {
-            kvmem_tensor_get(vt, dst + off, cell0 * vrow, nget * vrow);
+        if (vt && !v_trans_) {
+            if (!spill_side(vt, dst + off, vrow, hvrow, host_type_v_, n_embd_v_, "V")) {
+                return;
+            }
         }
         off += vspan;
     }
@@ -3186,11 +3386,37 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     uint64_t off = 0;
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    // P2: host spans use host-dtype rows (equal to GPU rows unless split).
+    const size_t hkrow = host_split_ ? host_krow_ : krow;
+    const size_t hvrow = host_split_ ? host_vrow_ : vrow;
     const uint32_t cell0 = static_cast<uint32_t>(gpu_slot) * block_tokens_;
     const uint32_t nset = (cell0 < kv_size_)
             ? std::min(block_tokens_, kv_size_ - cell0) : 0;
-    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
-    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
+    const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * hkrow;
+    const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * hvrow;
+    std::vector<uint8_t> grow;
+    if (host_split_) {
+        grow.reserve(static_cast<size_t>(block_tokens_) * std::max(krow, vrow));
+    }
+    // Recall converts quantized host rows back to F16 once per block; the GPU
+    // hot set (and FA) never sees quantized rows.
+    auto recall_side = [&](ggml_tensor * t, const uint8_t * s, size_t grow_bytes, size_t hrow,
+                           ggml_type host_ty, uint32_t dim, const char * what) -> bool {
+        if (!t || nset == 0) {
+            return true;
+        }
+        if (!host_split_ || hrow == grow_bytes) {
+            kvmem_tensor_set(t, s, cell0 * grow_bytes, nset * grow_bytes);
+            return true;
+        }
+        grow.assign(grow_bytes * nset, 0);
+        if (!kvmem_rows_host_to_f16(host_ty, s, grow.data(), nset, dim)) {
+            fprintf(stderr, "KVMEM_P2 recall %s convert failed (dim=%u)\n", what, dim);
+            return false;
+        }
+        kvmem_tensor_set(t, grow.data(), cell0 * grow_bytes, nset * grow_bytes);
+        return true;
+    };
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
             continue;
@@ -3200,15 +3426,17 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
         if (off + kspan > bytes) {
             return;
         }
-        if (kt && nset > 0) {
-            kvmem_tensor_set(kt, src + off, cell0 * krow, nset * krow);
+        if (!recall_side(kt, src + off, krow, hkrow, host_type_k_, n_embd_k_, "K")) {
+            return;
         }
         off += kspan;
         if (off + vspan > bytes) {
             return;
         }
-        if (vt && !v_trans_ && nset > 0) {
-            kvmem_tensor_set(vt, src + off, cell0 * vrow, nset * vrow);
+        if (vt && !v_trans_) {
+            if (!recall_side(vt, src + off, vrow, hvrow, host_type_v_, n_embd_v_, "V")) {
+                return;
+            }
         }
         off += vspan;
     }
@@ -3367,7 +3595,7 @@ bool llama_memory_kvmem::can_append(uint32_t end, uint32_t generation_rows, bool
     for (uint64_t id = view.rows / block_tokens_; id < final_blocks; ++id) {
         if (id >= s.block_count() || s.blocks()[id].gpu_slot < 0) ++needed;
     }
-    if (needed > free_slots_.size()) return fail("insufficient_slots");
+    if (needed > page_table_.n_free()) return fail("insufficient_slots");
     reason = all_history ? "all_resident" : "same_query";
     return true;
 }

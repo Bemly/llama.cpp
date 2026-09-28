@@ -32,6 +32,7 @@ using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_h
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_prec_policy;
 
 struct llama_memory_context_i;
 
@@ -802,6 +803,8 @@ struct llm_graph_params {
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
+    const llama_prec_policy * prec_policy = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1046,6 +1049,8 @@ struct llm_graph_context {
     const llama_hadamard_rotations * hadamard_inverses;
 
     mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
+
+    const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

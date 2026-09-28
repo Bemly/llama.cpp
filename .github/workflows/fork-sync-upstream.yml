@@ -8,12 +8,17 @@ name: fork-sync-upstream
 # What this does, daily + on demand:
 #   1. merge upstream/master into the current default branch (resolved
 #      dynamically, so renaming the default branch needs no edits here)
-#   2. compile-check the result (Metal + kvmem)
+#   2. compile-check the result (Metal + kvmem + test-backend-ops + bench)
 #   3. push, but only if the build passes
-#   4. publish the binaries to a single rolling release (old release
-#      and any stray releases are deleted first, so there is exactly one)
+#   4. publish the binaries to a single rolling release: the new release
+#      is created and its asset uploaded first; only then are the older
+#      releases and tags deleted, so a failed publish keeps the old one
 # Any failure fails the job, which is the notification. Nothing is
 # ever pushed or published half-done.
+#
+# Upstream adds new workflow files from time to time (e.g. the
+# ci-self-hosted-*.yml set). Delete them when resolving the merge;
+# they need runners this fork does not have.
 
 on:
   schedule:
@@ -64,7 +69,7 @@ jobs:
         run: |
           set -e
           cmake -S . -B build-fork-sync -DGGML_METAL=ON -DLLAMA_KVMEM=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-fork-sync --target llama-kvmem-cli llama-kvmem-server -j "$(sysctl -n hw.ncpu)"
+          cmake --build build-fork-sync --target llama-kvmem-cli llama-kvmem-server test-backend-ops llama-bench -j "$(sysctl -n hw.ncpu)"
 
       - name: Push
         if: env.UP_TO_DATE != '1'
@@ -115,19 +120,17 @@ jobs:
               except urllib.error.HTTPError as e:
                   return e.code, None
 
-          # delete every existing release so exactly one remains
-          _, rels = api("GET", "/releases?per_page=100")
-          for r in rels or []:
-              api("DELETE", "/releases/%d" % r["id"])
-              api("DELETE", "/git/refs/tags/%s" % r["tag_name"])
-
-          # create the rolling release
-          _, rel = api("POST", "/releases", {
-              "tag_name": "rolling",
+          # create the new release as a draft under a unique tag, so the old
+          # one survives if anything below fails
+          tag = "rolling-%s-%s" % (date, sha)
+          code, rel = api("POST", "/releases", {
+              "tag_name": tag,
               "target_commitish": branch,
               "name": "Rolling %s (%s)" % (date, sha),
               "body": "Auto build of `%s` @ `%s` (upstream `%s`)." % (branch, sha, upstream_sha),
+              "draft": True,
           })
+          assert code == 201 and rel, "create release failed: %s" % code
           rid = rel["id"]
 
           # upload the binary tarball
@@ -141,5 +144,18 @@ jobs:
               data=open("kvmem-metal-macos.tar.gz", "rb").read())
           with urllib.request.urlopen(up) as r:
               assert r.status == 201, r.status
-          print("rolling release published")
+
+          # asset is in place: publish the draft
+          code, _ = api("PATCH", "/releases/%d" % rid, {"draft": False, "make_latest": "true"})
+          assert code == 200, "publish release failed: %s" % code
+
+          # new release is complete; now drop every other release and its tag
+          code, rels = api("GET", "/releases?per_page=100")
+          assert code == 200, "list releases failed: %s" % code
+          for r in rels or []:
+              if r["id"] == rid:
+                  continue
+              api("DELETE", "/releases/%d" % r["id"])
+              api("DELETE", "/git/refs/tags/%s" % r["tag_name"])
+          print("rolling release published: " + tag)
           EOF
