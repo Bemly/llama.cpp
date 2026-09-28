@@ -1209,12 +1209,13 @@ void oaicompat_chat_process_media(json & body, const server_chat_params & opt,
                 p["text"] = get_media_marker();
                 p.erase("input_audio");
 
-            } else if (type == "input_video") {
+            } else if (type == "input_video" || type == "video_url") {
                 if (!opt.allow_video) {
                     throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                 }
 
-                json input_video = json_value(p, "input_video", json::object());
+                // accept the OpenAI-style "video_url" key as an alias of "input_video"
+                json input_video = json_value(p, type, json::object());
                 std::string url  = json_value(input_video, "data",
                                         json_value(input_video, "url", std::string()));
                 handle_media(out_files, url, opt.media_path);
@@ -1222,6 +1223,7 @@ void oaicompat_chat_process_media(json & body, const server_chat_params & opt,
                 p["type"] = "media_marker";
                 p["text"] = get_media_marker();
                 p.erase("input_video");
+                p.erase("video_url");
 
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");

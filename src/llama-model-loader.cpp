@@ -418,6 +418,10 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
+    // string-key reads of prism.hadamard.* in llama-model.cpp; do not rely on unity-build batching
+    template bool llama_model_loader::get_arr<int32_t>    (const std::string & key, std::vector<int32_t> & result,     bool required);
+    template bool llama_model_loader::get_arr<std::string>(const std::string & key, std::vector<std::string> & result, bool required);
+
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
         auto it = kv_overrides.find(key);
@@ -443,6 +447,10 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
+
+    template bool llama_model_loader::get_key<bool>       (const std::string & key, bool & result,        bool required);
+    template bool llama_model_loader::get_key<uint32_t>   (const std::string & key, uint32_t & result,    bool required);
+    template bool llama_model_loader::get_key<std::string>(const std::string & key, std::string & result, bool required);
 
     template<>
     bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
