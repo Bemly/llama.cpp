@@ -455,29 +455,25 @@ static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, 
     // Explicit pos: T5 query sits in the middle of the prompt (last user, then
     // assistant tool XML + role=tool). llama_batch_get_one would append at
     // seq_pos_max+1 and miss the hole after seq_rm(q0,q1).
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
     int n_pos = pos0;
     while (n_pos < pos1) {
         if (!stream_heartbeat(io)) {
             fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill pos=%d what=%s\n",
                     n_pos, what ? what : "");
-            llama_batch_free(batch);
             return KVMEM_DECODE_ABORT;
         }
         const int n = std::min(n_batch, pos1 - n_pos);
-        common_batch_clear(batch);
+        common_batch cb(ctx);
         for (int i = 0; i < n; ++i) {
-            common_batch_add(batch, toks[n_pos + i], n_pos + i, { 0 }, i == n - 1);
+            cb.add(toks[n_pos + i], n_pos + i, 0, i == n - 1);
         }
-        const int rc = llama_decode(ctx, batch);
+        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, cb.get());
         if (rc != 0) {
-            fprintf(stderr, "llama_decode(%s) failed rc=%d at pos=%d n=%d\n", what, rc, n_pos, n);
-            llama_batch_free(batch);
+            fprintf(stderr, "llama_process(%s) failed rc=%d at pos=%d n=%d\n", what, rc, n_pos, n);
             return rc;
         }
         n_pos += n;
     }
-    llama_batch_free(batch);
     return 0;
 }
 
@@ -1186,11 +1182,12 @@ static common_chat_msg parse_assistant_output(
         bool parse_tools) {
     try {
         common_chat_parser_params pp(chat);
-        pp.parse_tool_calls = parse_tools;
-        if (!chat.parser.empty()) {
-            pp.parser.load(chat.parser);
+        if (!parse_tools) {
+            pp.parser = {};
+        } else if (!chat.parser.empty()) {
+            pp.parser = chat.parser;
         }
-        common_chat_msg msg = common_chat_parse(content, false, pp);
+        common_chat_msg msg = common_chat_parse(common_chat_input(content), false, pp);
         if (msg.role.empty()) {
             msg.role = "assistant";
         }
@@ -1249,9 +1246,10 @@ struct StreamChatOut {
 
     StreamChatOut(const common_chat_params & chat, bool parse_tools, const std::string & id) : request_id(id) {
         pp = common_chat_parser_params(chat);
-        pp.parse_tool_calls = parse_tools;
-        if (!chat.parser.empty()) {
-            pp.parser.load(chat.parser);
+        if (!parse_tools) {
+            pp.parser = {};
+        } else if (!chat.parser.empty()) {
+            pp.parser = chat.parser;
         }
     }
 
@@ -1259,7 +1257,7 @@ struct StreamChatOut {
         acc = text;
         std::vector<json> chunks;
         try {
-            common_chat_msg msg = common_chat_parse(acc, partial, pp);
+            common_chat_msg msg = common_chat_parse(common_chat_input(acc), partial, pp);
             if (msg.empty() && partial) {
                 return chunks;
             }

@@ -152,7 +152,22 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
             st.mm_perf.target_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
         const auto draft_start = std::chrono::steady_clock::now();
-        if (rc == 0 && st.spec.ok && !common_speculative_process(st.spec.spec, batch)) rc = -1;
+        if (rc == 0 && st.spec.ok) {
+            // feed the classic multimodal batch to the new speculative API
+            common_batch cb(st.ctx);
+            const int32_t w = batch.embd ? llama_model_n_embd_inp(llama_get_model(st.ctx)) : 0;
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                const llama_seq_id sid = (batch.n_seq_id && batch.seq_id && batch.seq_id[i]) ? batch.seq_id[i][0] : 0;
+                const llama_pos p = batch.pos ? batch.pos[i] : 0;
+                if (batch.token) {
+                    cb.add(batch.token[i], p, sid, false);
+                } else if (batch.embd) {
+                    const llama_embd e = { batch.embd + (size_t) i * w, 1, (size_t) w };
+                    cb.add_embd(e, &p, sid, false);
+                }
+            }
+            if (!common_speculative_process(st.spec.spec, cb)) rc = -1;
+        }
         if (diagnostic && st.spec.ok) {
             llama_synchronize(st.spec.ctx_dft);
             st.mm_perf.draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - draft_start).count();

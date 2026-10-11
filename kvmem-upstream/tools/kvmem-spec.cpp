@@ -170,37 +170,60 @@ int kvmem_spec_decode_span(llama_context * ctx,
     if (n_batch <= 0) {
         n_batch = 512;
     }
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
     int n_pos = pos0;
     while (n_pos < pos1) {
         if (abort && abort()) {
             fprintf(stderr, "KVMEM_TRACE stream_abort phase=prefill pos=%d what=%s\n",
                     n_pos, what ? what : "");
-            llama_batch_free(batch);
             return KVMEM_DECODE_ABORT;
         }
         const int n = std::min(n_batch, pos1 - n_pos);
-        common_batch_clear(batch);
+        common_batch cb(ctx);
         for (int i = 0; i < n; ++i) {
-            common_batch_add(batch, toks[n_pos + i], n_pos + i, { 0 }, false);
+            cb.add(toks[n_pos + i], n_pos + i, 0, false);
         }
-        const int rc = llama_decode(ctx, batch);
+        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, cb.get());
         if (rc != 0) {
-            fprintf(stderr, "llama_decode(%s) failed rc=%d at pos=%d n=%d\n",
+            fprintf(stderr, "llama_process(%s) failed rc=%d at pos=%d n=%d\n",
                     what, rc, n_pos, n);
-            llama_batch_free(batch);
             return rc;
         }
-        if (spec && !common_speculative_process(spec, batch)) {
+        if (spec && !common_speculative_process(spec, cb)) {
             fprintf(stderr, "common_speculative_process(%s) failed at pos=%d n=%d\n",
                     what, n_pos, n);
-            llama_batch_free(batch);
             return 1;
         }
         n_pos += n;
     }
-    llama_batch_free(batch);
     return 0;
+}
+
+// append one token row to a classic batch (replaces removed common_batch_add;
+// single seq, capacity managed by the caller as before)
+static void kvmem_spec_batch_add(llama_batch & b, llama_token tok, llama_pos pos, llama_seq_id sid, bool output) {
+    const int32_t i = b.n_tokens++;
+    b.token[i] = tok;
+    b.pos[i] = pos;
+    b.n_seq_id[i] = 1;
+    b.seq_id[i][0] = sid;
+    b.logits[i] = output ? 1 : 0;
+}
+
+// feed a classic kvmem batch to the new speculative API (token path carries// ids, embd path carries rows; output flags are not consumed by process)
+static bool kvmem_spec_process(common_speculative * spec, llama_context * ctx, const llama_batch & b) {
+    common_batch cb(ctx);
+    const int32_t w = b.embd ? llama_model_n_embd_inp(llama_get_model(ctx)) : 0;
+    for (int32_t i = 0; i < b.n_tokens; ++i) {
+        const llama_seq_id sid = (b.n_seq_id && b.seq_id && b.seq_id[i]) ? b.seq_id[i][0] : 0;
+        const llama_pos p = b.pos ? b.pos[i] : 0;
+        if (b.token) {
+            cb.add(b.token[i], p, sid, false);
+        } else if (b.embd) {
+            const llama_embd e = { b.embd + (size_t) i * w, 1, (size_t) w };
+            cb.add_embd(e, &p, sid, false);
+        }
+    }
+    return common_speculative_process(spec, cb);
 }
 
 kvmem_spec_gen_stats kvmem_spec_generate(
@@ -327,12 +350,12 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             }
         }
 
-        common_batch_clear(batch_tgt);
+        batch_tgt.n_tokens = 0;
         logical_positions[0] = n_past;
-        common_batch_add(batch_tgt, id_last, n_past++ + position_offset, { seq_id }, true);
+        kvmem_spec_batch_add(batch_tgt, id_last, n_past++ + position_offset, seq_id, true);
         for (size_t i = 0; i < draft.size(); ++i) {
             logical_positions[batch_tgt.n_tokens] = n_past + (llama_pos) i;
-            common_batch_add(batch_tgt, draft[i], n_past + position_offset + (llama_pos) i, { seq_id }, true);
+            kvmem_spec_batch_add(batch_tgt, draft[i], n_past + position_offset + (llama_pos) i, seq_id, true);
         }
 
         gdn_replay_transaction transaction{ctx_tgt};
@@ -352,7 +375,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             st.failed = true;
             break;
         }
-        if (!common_speculative_process(spec, batch_tgt)) {
+        if (!kvmem_spec_process(spec, ctx_tgt, batch_tgt)) {
             fprintf(stderr, "common_speculative_process(verify) failed\n");
             st.failed = true;
             break;
