@@ -2327,6 +2327,8 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 #undef DV
 }
 
+constant short FC_lightning_indexer_nh [[function_constant(FC_LIGHTNING_INDEXER + 0)]];
+
 template<
     typename kd4x4_t,
     short nl_k,
@@ -2343,7 +2345,7 @@ kernel void kernel_lightning_indexer(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     constexpr short DK    = OP_LIGHTNING_INDEXER_DK;
-    constexpr short NH    = OP_LIGHTNING_INDEXER_NH;
+    const     short NH    = FC_lightning_indexer_nh;
     constexpr short NHPTG = OP_LIGHTNING_INDEXER_NHPTG;
     constexpr short NKPSG = OP_LIGHTNING_INDEXER_NKPSG;
     constexpr short NSG   = OP_LIGHTNING_INDEXER_NSG;
