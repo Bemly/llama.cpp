@@ -44,9 +44,12 @@ to CPU on this card. This branch replaces that path with VALU kernels.
   degrades (34 graph splits, PPL 4507 vs 3.9), so the gate stays on.
 - Phase knobs: `GGML_METAL_{DECODE_FA,PP_FA,FA}_{SPLIT,NBC}`. `SPLIT=0`
   targets ~96 threadgroups automatically; `NBC` defaults to 128.
-- Dequant fixes: `dequantize_q4_0` / `dequantize_q4_1` 4x4 rewritten
-  byte-explicit to match the CPU rows (old `d/16` + mask form was wrong
-  for the high half).
+- Dequant rewrite: `dequantize_q4_0` / `dequantize_q4_1` 4x4 use a
+  byte-explicit nibble select. This is numerically the same as upstream:
+  the upstream `d/16` + mask form is correct (`(n << 4) * d/16 == n * d`).
+  An earlier note here called it an upstream bug; that was wrong. The
+  only 16x error was in this fork's own intermediate commit `0187918`,
+  fixed in `02726fa`.
 - RX 6800 tile tuning: phase-aware `NR0`/`NSG` env knobs with extra
   `mul_mv` variants (`Q8_0` `nr0=4` gains ~28% pp; default stays `nr0=2`).
 - Discrete-GPU hardening: private VRAM mirror with budget
@@ -66,13 +69,29 @@ to CPU on this card. This branch replaces that path with VALU kernels.
 - 14B Qwen3 `Q4_K_M`: `pp8192` 43.3 -> 70.1 (+62%), short-ctx tg +3~5%;
   32k prefill unlocked at 61.1 t/s (non-FA path OOMs). Second 14B
   (`Q6_K`): `pp8192` +42%. Small/hybrid models: neutral (attention share
-  too small to matter). Note: end-to-end re-verification after the tile
-  store-index fix (`ba42cb1`) is still pending; treat these as pre-fix
-  numbers.
+  too small to matter). **Stale:** these were measured before the tile
+  store-index fix `ba42cb1` (2026-09-16) and have not been re-run. Do not
+  quote them without re-measuring (commands below).
+- Measured after `ba42cb1`: the only FA on/off A/B is Bonsai-2-27B PQ2_0
+  (dk256), tg 17.37 -> 31.29 (+80%), see PQ2_0 below. Serenity-27B
+  pp512 44.5 / tg64 22.3 and Hauhau-27B tg64 21.05 (see exact allocation
+  below) are also post-fix, but their FA setting was not recorded.
 - Correctness: `test-backend-ops -o FLASH_ATTN_EXT` mask=0 fully green on
   F16 and all quantized KV types; random-block-mask cases carry a known
   ~0.026 fixture artifact (half-dot adversarial input, also fails on the
   vec path; neutral/causal masks pass).
+
+Re-measure the 14B numbers (same binary, FA on vs off; `-d 8192` gives tg
+at 8k depth):
+
+```sh
+M=<14B-Q4_K_M>.gguf
+./build/bin/llama-bench -m $M -ngl 99 -fa 0,1 -p 512,8192 -n 128 -r 3 -o md
+./build/bin/llama-bench -m $M -ngl 99 -fa 0,1 -p 0 -n 128 -d 8192 -r 3 -o md
+./build/bin/llama-bench -m $M -ngl 99 -fa 1 -p 32768 -n 0 -r 1 -o md
+./build/bin/llama-perplexity -m $M -ngl 99 -fa on -f wiki.test.raw -c 2048 --chunks 32
+./build/bin/test-backend-ops -o FLASH_ATTN_EXT -b MTL0
+```
 
 ### Metal exact allocation (segmented mmap, this branch)
 
@@ -163,16 +182,20 @@ Decode (`mul_mv`) is a separate story: stock Metal tg 3.65 vs Vulkan 9.15,
  and our port (`kernel_mul_mv_iq3_s_f32_mmq`, opt-in via
  `GGML_METAL_MMQ_MV=1`) is correct (suite green) but performance-neutral,
  so it stays opt-in. Knob sweeps (`GGML_METAL_{DECODE,PP}_IQ3S_{NR0,NSG}`,
- `nr0_2`/`nr0_8` variants) move tg <5%: the gap needs deeper surgery,
- not tuning. Small-model sanity: 0.8B tg Metal 176 vs Vulkan 157 (no
- fixed-overhead gap).
+ `nr0_2`/`nr0_8` variants) move tg <5%. Small-model sanity: 0.8B tg
+ Metal 176 vs Vulkan 157 (no fixed-overhead gap).
+
+Correction (2026-09-20): the tg gap above was not a kernel problem. The
+loader's single-range mmap pushed one 3.5 GiB chunk into shared memory,
+so every decode token re-read it over PCIe. With segmented mmap (below)
+Metal tg is 21.05, ahead of Vulkan (9.2).
 
 ### KVMem eval (`kvmem-eval`: this branch)
 
 KVMem (KV-context virtualization, https://github.com/kvmem/kvmem-llama.cpp)
-wired for Metal, evaluated with Bonsai-2-27B. Adapter sources are compiled
-from `LLAMA_KVMEM_ROOT` (a local `kvmem-llama.cpp` checkout, CUDA upstream);
-this branch holds the llama.cpp-side Metal pieces:
+wired for Metal, evaluated with Bonsai-2-27B. Adapter sources are vendored
+under `kvmem-upstream/` (default `LLAMA_KVMEM_ROOT`); this branch holds the
+llama.cpp-side Metal pieces:
 
 - `ggml-metal-device.{h,m}`: synchronous batched D2D blit
   (`ggml_metal_blit_batched`), private scratch alloc, shared staging alloc

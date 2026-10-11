@@ -648,7 +648,7 @@ llama_memory_kvmem::llama_memory_kvmem(
         }
         host_krow_ = ggml_row_size(host_type_k_, neke);
         host_vrow_ = ggml_row_size(host_type_v_, neve);
-        host_block_bytes_ = static_cast<uint64_t>(kvmem_n_attn_layers(model)) *
+        host_block_bytes_ = static_cast<uint64_t>(kvmem_n_full_layers(model)) *
                 (host_krow_ + host_vrow_) * block_tokens_;
     }
 

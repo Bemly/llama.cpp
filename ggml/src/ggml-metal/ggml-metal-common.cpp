@@ -7,16 +7,16 @@
 
 #include <vector>
 
-// must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
-// 512 run on the simdgroup kernel and need no threadgroup memory. The wider ones allocate
-// float[N] per threadgroup, so they are only available where that fits.
-// (this fork: tg wide-block kernels cover 64..8192; on RX 6800 max_tg_mem is 64KB so all pass)
+// must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths below
+// GGML_METAL_FWHT_TG_MIN_N (512 in this fork) run on the simdgroup kernel and need no
+// threadgroup memory. The wider ones allocate float[N] per threadgroup, so they are only
+// available where that fits.
 static bool ggml_metal_fwht_supported_size(int64_t n, size_t max_tg_mem) {
-    if (n == 64 || n == 128 || n == 256 || n == 512) {
+    if (n == 64 || n == 128 || n == 256) {
         return true;
     }
 
-    if (n == 1024 || n == 2048 || n == 4096 || n == 8192) {
+    if (n == 512 || n == 1024 || n == 2048 || n == 4096 || n == 8192) {
         return (size_t) n * sizeof(float) <= max_tg_mem;
     }
 

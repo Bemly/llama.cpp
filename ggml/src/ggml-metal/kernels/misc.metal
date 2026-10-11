@@ -567,7 +567,6 @@ template [[host_name("kernel_fwht_f16_1024")]] kernel kernel_fwht_f16_t kernel_f
 template [[host_name("kernel_fwht_f16_2048")]] kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, half>;
 template [[host_name("kernel_fwht_f16_4096")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
 template [[host_name("kernel_fwht_f16_8192")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
-
 constant int FC_dsv4_hc_n_hc [[function_constant(FC_DSV4_HC + 0)]];
 
 kernel void kernel_dsv4_hc_comb_f32(
