@@ -398,3 +398,60 @@ typedef decltype(kernel_geglu_quick<float>) kernel_geglu_quick_t;
 
 template [[host_name("kernel_geglu_quick_f32")]] kernel kernel_geglu_quick_t kernel_geglu_quick<float>;
 template [[host_name("kernel_geglu_quick_f16")]] kernel kernel_geglu_quick_t kernel_geglu_quick<half>;
+
+// SILU+MUL fusion (MLP gate): same row mapping as geglu_quick, silu instead
+// of gelu_quick. Bit-identical to separate SILU then MUL (same order).
+template<typename T>
+kernel void kernel_silu_mul(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+
+    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        const float silu = x0*(1.0f/(1.0f+exp(-x0)));
+
+        dst_row[i0] = (T)(silu*x1);
+    }
+}
+
+typedef decltype(kernel_silu_mul<float>) kernel_silu_mul_t;
+
+template [[host_name("kernel_silu_mul_f32")]] kernel kernel_silu_mul_t kernel_silu_mul<float>;
+
+// SOFTPLUS+MUL fusion (SSM dt path): same row mapping, softplus instead.
+template<typename T>
+kernel void kernel_softplus_mul(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+
+    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        const float sp = select(log(1.0f + exp(x0)), x0, x0 > 20.0f);
+
+        dst_row[i0] = (T)(sp*x1);
+    }
+}
+
+typedef decltype(kernel_softplus_mul<float>) kernel_softplus_mul_t;
+
+template [[host_name("kernel_softplus_mul_f32")]] kernel kernel_softplus_mul_t kernel_softplus_mul<float>;

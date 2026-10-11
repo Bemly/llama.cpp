@@ -138,6 +138,63 @@ static bool ggml_metal_fusion_check_ssm_conv_silu(
     return true;
 }
 
+// UNARY (silu/softplus) + MUL: the MUL reads the unary output on either side.
+// Same shape, F32, contiguous rows; the fused kernel indexes src1 with the
+// same row math, so no broadcast and no strided second input.
+static bool ggml_metal_fusion_check_silu_mul(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * un = nodes[0];
+    const ggml_tensor * mu = nodes[1];
+
+    if (un->op != GGML_OP_UNARY || mu->op != GGML_OP_MUL) {
+        return false;
+    }
+    const int uop = ggml_get_unary_op(un);
+    // The table carries one entry per unary op (same raw pattern); each entry
+    // only accepts its own op so the encoder picks the matching kernel.
+    if (fusion->id == GGML_METAL_FUSION_SILU_MUL && uop != GGML_UNARY_OP_SILU) {
+        return false;
+    }
+    if (fusion->id == GGML_METAL_FUSION_SOFTPLUS_MUL && uop != GGML_UNARY_OP_SOFTPLUS) {
+        return false;
+    }
+    // MUL is commutative: the silu output may sit on either side (SSM z-gate
+    // puts it on src1). The encoder always binds (silu_input, partner).
+    const ggml_tensor * partner = nullptr;
+    if (mu->src[0] == un) {
+        partner = mu->src[1];
+    } else if (mu->src[1] == un) {
+        partner = mu->src[0];
+    } else {
+        return false;
+    }
+    if (!partner) {
+        return false;
+    }
+    if (!ggml_are_same_shape(un, mu) || !ggml_are_same_shape(partner, mu)) {
+        return false;
+    }
+    if (un->type != GGML_TYPE_F32 || mu->type != GGML_TYPE_F32 ||
+        un->src[0]->type != GGML_TYPE_F32 || partner->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(un) || !ggml_is_contiguous(mu) || !ggml_is_contiguous(partner)) {
+        return false;
+    }
+    return true;
+}
+
 // ADD x N: each ADD reads the previous ADD as src0, and all addends must share layout
 // (and, in FULL mode, live in the same Metal buffer)
 static bool ggml_metal_fusion_check_add_chain(
@@ -624,6 +681,8 @@ static const std::vector<ggml_op> ops_topk_moe_norm_scale = {
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
+static const std::vector<ggml_op> ops_silu_mul = { GGML_OP_UNARY, GGML_OP_MUL };
+
 static const std::vector<ggml_op> ops_moe_reduce_2 = { GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_moe_reduce_3 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_moe_reduce_4 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
@@ -687,6 +746,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           ops_moe_reduce_all_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           ops_moe_reduce_all_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          ops_ssm_conv_silu,              {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+    { GGML_METAL_FUSION_SILU_MUL,       ops_silu_mul,               ops_silu_mul,                   {},     false, ggml_metal_fusion_check_silu_mul },
+    { GGML_METAL_FUSION_SOFTPLUS_MUL,   ops_silu_mul,               ops_silu_mul,                   {},     false, ggml_metal_fusion_check_silu_mul },
 };
 
 // ---- alloc deps -----------------------------------------------------------

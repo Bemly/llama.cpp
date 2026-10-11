@@ -59,6 +59,8 @@ public:
         uint32_t pool_tokens,
         const std::vector<uint32_t> &mandatory = {});
 
+    friend struct kvmem_runtime_test_access; // host tests: extent checks
+
     // Copy outgoing GPU blocks to CPU/NVMe. Does not free GPU slots yet so
     // the adapter can seq_rm the cells afterwards.
     void spill_outgoing();

@@ -1,6 +1,9 @@
 #include "kvmem/kvmem_runtime.hpp"
+#include "kvmem/kvmem_page_table.hpp"
+#include "llama-kvmem-quant.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -244,6 +247,86 @@ static void test_selection_preview_and_resident_commit() {
     CHECK(rt.commit_resident_selection(selected));
 }
 
+// P1: host arena extent geometry. make_cfg gives 16 slots of 1024B.
+namespace kvmem {
+struct kvmem_runtime_test_access {
+    static const uint8_t *cpu_ptr(const KvMemRuntime & rt, int32_t slot) {
+        return rt.cpu_ptr(slot);
+    }
+};
+} // namespace kvmem
+static void test_cpu_ptr_extent_checks() {
+    RecordingBackend be;
+    KvMemRuntime rt(make_cfg(), &be);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, -1) == nullptr);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 0) != nullptr);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 15) != nullptr);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 16) == nullptr); // upper bound (was OOB before P1)
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 1000000) == nullptr);
+    CHECK(kvmem_runtime_test_access::cpu_ptr(rt, 2147483647) == nullptr); // multiply-overflow shape
+}
+
+// P1: page table generations, ownership, session release.
+static void test_page_table_sessions() {
+    KvmemPageTable t;
+    t.reset(4);
+    CHECK(t.valid());
+    CHECK(t.n_free() == 4);
+    const KvmemPageAlloc a0 = t.alloc(0, 10);
+    const KvmemPageAlloc a1 = t.alloc(1, 20);
+    CHECK(a0.slot >= 0 && a1.slot >= 0 && a0.slot != a1.slot);
+    CHECK(a0.gen >= 1 && a1.gen >= 1);
+    CHECK(t.valid());
+    CHECK(!t.free(a0.slot, 1, a0.gen)); // wrong owner rejected
+    CHECK(!t.free(a0.slot, 0, a0.gen + 1)); // stale generation rejected
+    CHECK(t.valid());
+    CHECK(t.free(a0.slot, 0, a0.gen));
+    CHECK(t.double_free_drops() == 0);
+    CHECK(!t.free(a0.slot, -2, 0)); // double free rejected, not re-pushed
+    CHECK(t.double_free_drops() == 1);
+    CHECK(t.n_free() == 3);
+    const KvmemPageAlloc a2 = t.alloc(1, 30);
+    CHECK(a2.slot == a0.slot); // LIFO reuse
+    CHECK(a2.gen != a0.gen); // generation bumped: old handles are stale
+    CHECK(t.note_resident(a1.slot, 21, 1)); // live page: logical refresh ok
+    CHECK(t.release_session(0) == 0); // session 0 holds nothing now
+    CHECK(t.release_session(1) == 2); // both live pages belong to session 1
+    CHECK(t.valid());
+    CHECK(t.n_free() == 4);
+    const KvmemPageAlloc b0 = t.alloc(-1, 5);
+    CHECK(t.release_session(-1) == 1); // negative releases the whole pool
+    CHECK(t.valid());
+    CHECK(b0.slot >= 0);
+}
+
+// P2: F16 <-> Q8 host-row round trip stays within quant noise; identity and
+// bad-dims behave.
+static void test_p2_host_row_roundtrip() {
+    const uint32_t nrows = 5, dim = 1024;
+    std::vector<float> orig(nrows * dim);
+    for (uint32_t i = 0; i < nrows * dim; ++i) {
+        orig[i] = 0.02f * std::sin(i * 0.11f) * std::cos(i * 0.031f);
+    }
+    std::vector<uint8_t> f16(nrows * dim * 2), q8(nrows * 1088), back(nrows * dim * 2);
+    ggml_fp32_to_fp16_row(orig.data(), reinterpret_cast<ggml_fp16_t *>(f16.data()),
+                          (int64_t) nrows * dim);
+    CHECK(kvmem_rows_f16_to_host(GGML_TYPE_Q8_0, f16.data(), q8.data(), nrows, dim));
+    CHECK(kvmem_rows_host_to_f16(GGML_TYPE_Q8_0, q8.data(), back.data(), nrows, dim));
+    std::vector<float> rt(nrows * dim);
+    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(back.data()), rt.data(),
+                          (int64_t) nrows * dim);
+    double se = 0.0;
+    for (uint32_t i = 0; i < nrows * dim; ++i) {
+        const double d = (double) rt[i] - orig[i];
+        se += d * d;
+    }
+    CHECK(std::sqrt(se / (nrows * dim)) < 0.05);
+    CHECK(kvmem_rows_f16_to_host(GGML_TYPE_F16, f16.data(), back.data(), nrows, dim));
+    CHECK(std::memcmp(f16.data(), back.data(), f16.size()) == 0);
+    CHECK(!kvmem_rows_f16_to_host(GGML_TYPE_Q8_0, f16.data(), q8.data(), nrows, 1000));
+    CHECK(!kvmem_rows_host_to_f16(GGML_TYPE_Q8_0, q8.data(), back.data(), 0, dim));
+}
+
 int main() {
     test_selection_preview_and_resident_commit();
     test_stage_out_before_stage_in();
@@ -251,6 +334,9 @@ int main() {
     test_pressure_keeps_sink_and_tail();
     test_maybe_offload_evicts_before_stage_in();
     test_cpu_full_spills_to_nvme_and_roundtrips();
+    test_cpu_ptr_extent_checks();
+    test_page_table_sessions();
+    test_p2_host_row_roundtrip();
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);
         return 1;
