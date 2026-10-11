@@ -144,6 +144,50 @@ const char * get_media_marker() {
 }
 
 //
+// model output modalities
+//
+
+std::vector<std::string> server_model_output_modalities(common_decision_type decision_type) {
+    switch (decision_type) {
+        case COMMON_DECISION_TYPE_OPENJEV:
+        case COMMON_DECISION_TYPE_LEV:
+        case COMMON_DECISION_TYPE_KEV:
+        case COMMON_DECISION_TYPE_NIMBLE:
+        case COMMON_DECISION_TYPE_LAYA:
+        case COMMON_DECISION_TYPE_CLEF:
+        case COMMON_DECISION_TYPE_PPLX_DECIDER:
+        case COMMON_DECISION_TYPE_LFM2_D1:
+        case COMMON_DECISION_TYPE_LFM2_D1_OMNI:
+            return {"decisions"};
+        default:
+            // fallback when there is no decision type or the metadata is bad
+            return {"text"};
+    }
+}
+
+json server_model_architecture_json(
+        bool inp_image,
+        bool inp_audio,
+        bool inp_video,
+        const std::vector<std::string> & output_modalities) {
+    std::vector<std::string> input_modalities = {"text"};
+    if (inp_image) {
+        input_modalities.push_back("image");
+    }
+    if (inp_audio) {
+        input_modalities.push_back("audio");
+    }
+    if (inp_video) {
+        input_modalities.push_back("video");
+    }
+
+    return {
+        {"input_modalities",  input_modalities},
+        {"output_modalities", output_modalities},
+    };
+}
+
+//
 // lora utils
 //
 
@@ -667,7 +711,7 @@ void server_tokens::keep_first(size_t n) {
             // note that the case where we keep a full image at the end is allowed:
             //   tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] != LLAMA_TOKEN_NULL
             if (tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] == LLAMA_TOKEN_NULL) {
-                find_chunk(n - 1); // will throw an error if the token is not begin-of-chunk
+                find_chunk(n); // will throw an error if the cut is not at a chunk boundary
             }
         }
         // remove all image chunks that are not used anymore
@@ -970,7 +1014,7 @@ server_tokens process_mtmd_prompt(
 }
 
 /**
- * break the input "prompt" object into multiple prompt if needed, then tokenize them
+ * tokenize a single input "prompt" object
  * use tokenize_input_prompts() if the input could be an array.
  * this supports these cases:
  * - "prompt": "string"
@@ -978,7 +1022,7 @@ server_tokens process_mtmd_prompt(
  * - "prompt": [12, 34, "string", 56, 78]
  * - "prompt": { "prompt_string": "string", "multimodal_data": [ "base64" ] }
  */
-static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special, const mtmd_helper_init_opt & init_opt) {
+server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special, const mtmd_helper_init_opt & init_opt) {
     constexpr char JSON_STRING_PROMPT_KEY[] = "prompt_string";
     constexpr char JSON_MTMD_DATA_KEY[] = "multimodal_data";
     const bool has_mtmd = mctx != nullptr;
@@ -1008,7 +1052,7 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
             return server_tokens(tmp, false);
         }
    } else {
-       throw std::runtime_error("\"prompt\" elements must be a string, a list of tokens, a JSON object containing a prompt string, or a list of mixed strings & tokens.");
+       throw std::invalid_argument("\"prompt\" elements must be a string, a list of tokens, a JSON object containing a prompt string, or a list of mixed strings & tokens.");
    }
 }
 
@@ -1023,7 +1067,7 @@ std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtm
         result.push_back(tokenize_input_subprompt(vocab, mctx, json_prompt, add_special, parse_special, init_opt));
     }
     if (result.empty()) {
-        throw std::runtime_error("\"prompt\" must not be empty");
+        throw std::invalid_argument("\"prompt\" must not be empty");
     }
     return result;
 }
@@ -1076,7 +1120,7 @@ json oaicompat_completion_params_parse(const json & body) {
 // - file:// for local files (only allowed if media_path is set)
 // - data: for base64 encoded data with uri scheme (e.g. data:image/png;base64,...)
 // - raw base64 encoded data
-static void handle_media(
+void handle_media(
         std::vector<raw_buffer> & out_files,
         const std::string & url,
         const std::string & media_path) {
@@ -1147,95 +1191,86 @@ static void handle_media(
     }
 }
 
-void oaicompat_chat_process_media(json & body, const server_chat_params & opt,
-                                 std::vector<raw_buffer> & out_files) {
-    // get input files
-    if (!body.contains("messages")) {
-        throw std::invalid_argument("'messages' is required");
-    }
-    json & messages = body.at("messages");
-    if (!messages.is_array()) {
-        throw std::invalid_argument("Expected 'messages' to be an array");
-    }
-    for (auto & msg : messages) {
-        std::string role = json_value(msg, "role", std::string());
-        if (role != "assistant" && !msg.contains("content")) {
-            throw std::invalid_argument("All non-assistant messages must contain 'content'");
-        }
-        if (role == "assistant") {
-            if (!msg.contains("content") && !msg.contains("tool_calls")) {
-                throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
+// load media files from an OAI content array, then replace each media part with a media marker text part
+static void oaicompat_content_load_media(json & content, const server_chat_params & opt, std::vector<raw_buffer> & out_files) {
+    for (auto & p : content) {
+        std::string type = json_value(p, "type", std::string());
+        if (type == "image_url") {
+            if (!opt.allow_image) {
+                throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
             }
-            if (!msg.contains("content")) {
-                continue; // avoid errors with no content
+
+            json image_url = json_value(p, "image_url", json::object());
+            std::string url = json_value(image_url, "url", std::string());
+            handle_media(out_files, url, opt.media_path);
+
+            p["type"] = "media_marker";
+            p["text"] = get_media_marker();
+            p.erase("image_url");
+
+        } else if (type == "input_audio") {
+            if (!opt.allow_audio) {
+                throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
             }
-        }
-        json & content = msg.at("content");
-        if (content.is_string() || content.is_null()) {
-            continue;
-        }
 
-        if (!content.is_array()) {
-            throw std::invalid_argument("Expected 'content' to be a string or an array");
-        }
+            // note: don't need to validate "format", it's redundant
+            json input_audio = json_value(p, "input_audio", json::object());
+            std::string url  = json_value(input_audio, "data",
+                                    json_value(input_audio, "url", std::string()));
+            handle_media(out_files, url, opt.media_path);
 
-        for (auto & p : content) {
-            std::string type = json_value(p, "type", std::string());
-            if (type == "image_url") {
-                if (!opt.allow_image) {
-                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
-                }
+            p["type"] = "media_marker";
+            p["text"] = get_media_marker();
+            p.erase("input_audio");
 
-                json image_url = json_value(p, "image_url", json::object());
-                std::string url = json_value(image_url, "url", std::string());
-                handle_media(out_files, url, opt.media_path);
-
-                p["type"] = "media_marker";
-                p["text"] = get_media_marker();
-                p.erase("image_url");
-
-            } else if (type == "input_audio") {
-                if (!opt.allow_audio) {
-                    throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
-                }
-
-                // note: don't need to validate "format", it's redundant
-                json input_audio = json_value(p, "input_audio", json::object());
-                std::string url  = json_value(input_audio, "data",
-                                        json_value(input_audio, "url", std::string()));
-                handle_media(out_files, url, opt.media_path);
-
-                p["type"] = "media_marker";
-                p["text"] = get_media_marker();
-                p.erase("input_audio");
-
-            } else if (type == "input_video") {
-                if (!opt.allow_video) {
-                    throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
-                }
-
-                json input_video = json_value(p, "input_video", json::object());
-                std::string url  = json_value(input_video, "data",
-                                        json_value(input_video, "url", std::string()));
-                handle_media(out_files, url, opt.media_path);
-
-                p["type"] = "media_marker";
-                p["text"] = get_media_marker();
-                p.erase("input_video");
-
-            } else if (type != "text") {
-                throw std::invalid_argument("unsupported content[].type");
+        } else if (type == "input_video" || type == "video_url") {
+            if (!opt.allow_video) {
+                throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
             }
+
+            // accept the OpenAI-style "video_url" key as an alias of "input_video"
+            json input_video = json_value(p, type, json::object());
+            std::string url  = json_value(input_video, "data",
+                                    json_value(input_video, "url", std::string()));
+            handle_media(out_files, url, opt.media_path);
+
+            p["type"] = "media_marker";
+            p["text"] = get_media_marker();
+            p.erase("input_video");
+            p.erase("video_url");
+
+        } else if (type != "text") {
+            throw std::invalid_argument("unsupported content[].type");
         }
     }
+}
 
+server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context * mctx, const server_chat_params & opt, json content, bool add_special, bool parse_special, const mtmd_helper_init_opt & init_opt) {
+    if (!content.is_array()) {
+        throw std::invalid_argument("\"content\" must be an array");
+    }
+
+    std::vector<raw_buffer> files;
+    oaicompat_content_load_media(content, opt, files);
+
+    std::string prompt;
+    for (const auto & p : content) {
+        prompt += json_value(p, "text", std::string());
+    }
+
+    if (files.empty()) {
+        return server_tokens(common_tokenize(vocab, prompt, add_special, parse_special), false);
+    }
+    return process_mtmd_prompt(mctx, prompt, files, init_opt);
 }
 
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
+    const llama_vocab * vocab,
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    common_chat_session & out_session)
 {
     json llama_params;
 
@@ -1287,148 +1322,74 @@ json oaicompat_chat_params_parse(
         json_schema["type"] = "object";
     }
 
-    oaicompat_chat_process_media(body, opt, out_files);
+    // get input files
+    if (!body.contains("messages")) {
+        throw std::invalid_argument("'messages' is required");
+    }
     json & messages = body.at("messages");
-
-    auto caps = common_chat_templates_get_caps(opt.tmpls.get());
-
-    common_chat_templates_inputs inputs;
-    inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
-    inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
-    inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
-    inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
-    inputs.grammar                = grammar;
-    inputs.use_jinja              = opt.use_jinja;
-    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
-    inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
-    inputs.continue_final_message = body.contains("continue_final_message") ?
-        common_chat_continuation_parse(body.at("continue_final_message")) :
-        COMMON_CHAT_CONTINUATION_NONE;
-    if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant
-        && !inputs.messages.empty() && inputs.messages.back().role == "assistant") {
-        if (inputs.messages.size() >= 2 && inputs.messages[inputs.messages.size() - 2].role == "assistant") {
-            throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
+    if (!messages.is_array()) {
+        throw std::invalid_argument("Expected 'messages' to be an array");
+    }
+    for (auto & msg : messages) {
+        std::string role = json_value(msg, "role", std::string());
+        if (role != "assistant" && !msg.contains("content")) {
+            throw std::invalid_argument("All non-assistant messages must contain 'content'");
         }
-        inputs.continue_final_message = COMMON_CHAT_CONTINUATION_AUTO;
-        inputs.add_generation_prompt  = false;
-    }
-    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && inputs.add_generation_prompt) {
-        throw std::invalid_argument("Cannot set both add_generation_prompt and continue_final_message to true.");
-    }
-    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE
-        && !inputs.messages.empty()
-        && inputs.messages.back().role == "assistant"
-        && !inputs.messages.back().tool_calls.empty()) {
-        throw std::invalid_argument("Cannot continue an assistant message that contains tool calls.");
-    }
-    inputs.reasoning_format = opt.reasoning_format;
-    if (body.contains("reasoning_format")) {
-        inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
-    }
-    inputs.enable_thinking = opt.enable_thinking;
-    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-        if (body.contains("grammar")) {
-            throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
+        if (role == "assistant") {
+            if (!msg.contains("content") && !msg.contains("tool_calls")) {
+                throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
+            }
+            if (!msg.contains("content")) {
+                continue; // avoid errors with no content
+            }
         }
-        llama_params["parse_tool_calls"] = true;
-    }
-
-    // merge the template args provided from command line with the args provided in the user request
-    auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());
-    inputs.chat_template_kwargs = opt.chat_template_kwargs;
-    for (const auto & item : chat_template_kwargs_object.items()) {
-        inputs.chat_template_kwargs[item.key()] = item.value().dump();
-    }
-
-    // parse the "enable_thinking" kwarg to override the default value
-    auto enable_thinking_kwarg = json_value(inputs.chat_template_kwargs, "enable_thinking", std::string(""));
-    if (enable_thinking_kwarg == "true") {
-        inputs.enable_thinking = true;
-    } else if (enable_thinking_kwarg == "false") {
-        inputs.enable_thinking = false;
-    } else if (!enable_thinking_kwarg.empty() && enable_thinking_kwarg[0] == '"') {
-        throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
-    }
-
-    // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
-    if (body.contains("reasoning_effort")) {
-        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
-        if (reasoning_effort == "none") {
-            inputs.enable_thinking = false;
-            inputs.chat_template_kwargs.erase("reasoning_effort");
-        } else if (!reasoning_effort.empty()) {
-            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
-        }
-    }
-
-    inputs.force_pure_content = opt.force_pure_content;
-
-    // Apply chat template to the list of messages
-    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
-
-    llama_params["chat_format"] = static_cast<int>(chat_params.format);
-    llama_params["prompt"]      = chat_params.prompt;
-    if (!chat_params.grammar.empty()) {
-        llama_params["grammar"]      = chat_params.grammar;
-        llama_params["grammar_type"] = std::string("tool_calls");
-    }
-    llama_params["grammar_lazy"] = chat_params.grammar_lazy;
-    auto grammar_triggers        = json::array();
-    for (const auto & trigger : chat_params.grammar_triggers) {
-        server_grammar_trigger ct(trigger);
-        grammar_triggers.push_back(ct.to_json());
-    }
-    llama_params["grammar_triggers"]  = grammar_triggers;
-    llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
-    llama_params["generation_prompt"] = chat_params.generation_prompt;
-    for (const auto & stop : chat_params.additional_stops) {
-        llama_params["stop"].push_back(stop);
-    }
-    if (!chat_params.parser.empty()) {
-        llama_params["chat_parser"] = chat_params.parser;
-    }
-
-    llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
-
-    // Reasoning budget: pass parameters through to sampling layer
-    {
-        int reasoning_budget = json_value(body, "reasoning_budget_tokens",
-                               json_value(body, "thinking_budget_tokens", -1));
-        if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
+        json & content = msg.at("content");
+        if (content.is_string() || content.is_null()) {
+            continue;
         }
 
-        if (!chat_params.thinking_end_tags.empty()) {
-            llama_params["reasoning_budget_tokens"] = reasoning_budget;
-            llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
-            llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
-            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
-            llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
+        if (!content.is_array()) {
+            throw std::invalid_argument("Expected 'content' to be a string or an array");
         }
+
+        oaicompat_content_load_media(content, opt, out_files);
     }
 
-    // Handle "logprobs" field
-    // TODO: The response format of this option is not yet OAI-compatible, but seems like no one really using it; We may need to fix it in the future
-    if (json_value(body, "logprobs", false)) {
-        if (has_tools && stream) {
-            throw std::invalid_argument("logprobs is not supported with tools + stream");
-        }
-        llama_params["n_probs"] = json_value(body, "top_logprobs", 20);
-    } else if (body.contains("top_logprobs") && !body.at("top_logprobs").is_null()) {
-        throw std::invalid_argument("top_logprobs requires logprobs to be set to true");
-    }
+}
 
-    // Copy remaining properties to llama_params
-    // This allows user to use llama.cpp-specific params like "mirostat", ... via OAI endpoint.
-    // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
-    for (const auto & item : body.items()) {
-        // Exception: if "n_predict" is present, we overwrite the value specified earlier by "max_tokens"
-        if (!llama_params.contains(item.key()) || item.key() == "n_predict") {
-            llama_params[item.key()] = item.value();
-        }
+// OAI message media via the shared content loader (kvmem vision entry)
+void oaicompat_chat_process_media(json & body, const server_chat_params & opt,
+                                 std::vector<raw_buffer> & out_files) {
+    // get input files
+    if (!body.contains("messages")) {
+        throw std::invalid_argument("'messages' is required");
     }
-
-    return llama_params;
+    json & messages = body.at("messages");
+    if (!messages.is_array()) {
+        throw std::invalid_argument("Expected 'messages' to be an array");
+    }
+    for (auto & msg : messages) {
+        std::string role = json_value(msg, "role", std::string());
+        if (role != "assistant" && !msg.contains("content")) {
+            throw std::invalid_argument("All non-assistant messages must contain 'content'");
+        }
+        if (role == "assistant") {
+            if (!msg.contains("content") && !msg.contains("tool_calls")) {
+                throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
+            }
+            if (!msg.contains("content")) {
+                continue; // avoid errors with no content
+            }
+        }
+        json & content = msg.at("content");
+        if (content.is_string() || content.is_null()) {
+            continue;
+        }
+        if (!content.is_array()) {
+            throw std::invalid_argument("Expected 'content' to be a string or an array");
+        }
+        oaicompat_content_load_media(content, opt, out_files);
+    }
 }
 
 json format_embeddings_response_oaicompat(
@@ -1866,38 +1827,71 @@ server_tokens format_prompt_rerank(
 // server_subproc
 //
 
-bool server_subproc::has_output() {
-    if (out_handle >= 0) {
-        return true;
-    }
-    FILE * f = sproc.stdout_file(); // combined stdout/stderr
-    if (!f) {
-        return false;
-    }
+FILE * server_reserve_stdout() {
+    fflush(stdout);
+    // the reserved stream is not inherited, grandchildren get stdout and stderr of their own
 #ifdef _WIN32
-    HANDLE h = (HANDLE) _get_osfhandle(_fileno(f));
-    if (h != INVALID_HANDLE_VALUE) {
-        out_handle = (intptr_t) h;
-    }
+    int fd = _dup(_fileno(stdout));
+    GGML_ASSERT(fd >= 0);
+    SetHandleInformation((HANDLE) _get_osfhandle(fd), HANDLE_FLAG_INHERIT, 0);
+    _dup2(_fileno(stderr), _fileno(stdout));
+    SetStdHandle(STD_OUTPUT_HANDLE, GetStdHandle(STD_ERROR_HANDLE));
+    FILE * f = _fdopen(fd, "w");
 #else
-    int fd = fileno(f);
-    if (fd >= 0) {
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-        out_handle = fd;
-    }
+    int fd = fcntl(fileno(stdout), F_DUPFD_CLOEXEC, 0);
+    GGML_ASSERT(fd >= 0);
+    dup2(fileno(stderr), fileno(stdout));
+    FILE * f = fdopen(fd, "w");
 #endif
-    return out_handle >= 0;
+    GGML_ASSERT(f);
+    return f;
 }
 
-int server_subproc::read_output(char * buf, size_t len) {
+bool server_subproc::has_output() {
+    FILE * files[SERVER_SUBPROC_STREAMS] = { sproc.stdout_file(), sproc.stderr_file() };
+    for (int i = 0; i < SERVER_SUBPROC_STREAMS; i++) {
+        if (out_handles[i] >= 0) {
+            continue;
+        }
+        if (!files[i]) {
+            return false;
+        }
+#ifdef _WIN32
+        HANDLE h = (HANDLE) _get_osfhandle(_fileno(files[i]));
+        if (h == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        out_handles[i] = (intptr_t) h;
+#else
+        int fd = fileno(files[i]);
+        if (fd < 0) {
+            return false;
+        }
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        out_handles[i] = fd;
+#endif
+    }
+    return true;
+}
+
+bool server_subproc::output_closed() const {
+    return out_closed[SERVER_SUBPROC_STDOUT] && out_closed[SERVER_SUBPROC_STDERR];
+}
+
+int server_subproc::read_output(server_subproc_stream stream, char * buf, size_t len) {
+    if (out_closed[stream]) {
+        return -1;
+    }
     if (!has_output()) {
+        out_closed[stream] = true;
         return -1;
     }
 #ifdef _WIN32
-    HANDLE h     = (HANDLE) out_handle;
+    HANDLE h     = (HANDLE) out_handles[stream];
     DWORD  avail = 0;
     if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
-        return -1; // pipe broken, child gone
+        out_closed[stream] = true; // pipe broken, child gone
+        return -1;
     }
     if (avail == 0) {
         return 0;
@@ -1905,24 +1899,23 @@ int server_subproc::read_output(char * buf, size_t len) {
     DWORD to_read = avail < (DWORD) len ? avail : (DWORD) len;
     DWORD got     = 0;
     if (!ReadFile(h, buf, to_read, &got, NULL) || got == 0) {
+        out_closed[stream] = true;
         return -1;
     }
     return (int) got;
 #else
     while (true) {
-        ssize_t r = read((int) out_handle, buf, len);
+        ssize_t r = read((int) out_handles[stream], buf, len);
         if (r > 0) {
             return (int) r;
         }
-        if (r == 0) {
-            return -1; // EOF
-        }
-        if (errno == EINTR) {
+        if (r < 0 && errno == EINTR) {
             continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return 0;
         }
+        out_closed[stream] = true; // EOF or error
         return -1;
     }
 #endif
@@ -1960,11 +1953,15 @@ void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, s
     // no waitable wait exists for anonymous pipes, so poll them in 50 ms steps
     bool any = false;
     for (size_t i = 0; i < procs.size(); i++) {
-        DWORD avail = 0;
-        if (!procs[i]->has_output() || !PeekNamedPipe((HANDLE) procs[i]->out_handle, NULL, 0, NULL, &avail, NULL) || avail > 0) {
-            ready[i] = true; // data or broken pipe, read_output() tells which
-            any = true;
+        server_subproc * p = procs[i];
+        ready[i] = !p->has_output();
+        for (int s = 0; s < SERVER_SUBPROC_STREAMS && !ready[i]; s++) {
+            DWORD avail = 0;
+            if (!p->out_closed[s] && (!PeekNamedPipe((HANDLE) p->out_handles[s], NULL, 0, NULL, &avail, NULL) || avail > 0)) {
+                ready[i] = true; // data or broken pipe, read_output() tells which
+            }
         }
+        any = any || ready[i];
     }
     if (!any) {
         int64_t step = timeout_ms < 0 ? 50 : std::min<int64_t>(timeout_ms, 50);
@@ -1972,10 +1969,13 @@ void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, s
     }
 #else
     std::vector<pollfd> pfds;
-    pfds.reserve(procs.size() + 1);
+    pfds.reserve(procs.size() * SERVER_SUBPROC_STREAMS + 1);
     pfds.push_back({ (int) wake_fd[0], POLLIN, 0 });
     for (auto * p : procs) {
-        pfds.push_back({ p->has_output() ? (int) p->out_handle : -1, POLLIN, 0 }); // poll() skips negative fds
+        const bool open = p->has_output();
+        for (int s = 0; s < SERVER_SUBPROC_STREAMS; s++) {
+            pfds.push_back({ open && !p->out_closed[s] ? (int) p->out_handles[s] : -1, POLLIN, 0 }); // poll() skips negative fds
+        }
     }
     int timeout = timeout_ms < 0 ? -1 : (int) std::min<int64_t>(timeout_ms, std::numeric_limits<int>::max());
     int r = poll(pfds.data(), pfds.size(), timeout);
@@ -1987,7 +1987,10 @@ void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, s
         while (read((int) wake_fd[0], buf, sizeof(buf)) > 0) {}
     }
     for (size_t i = 0; i < procs.size(); i++) {
-        ready[i] = pfds[i + 1].fd < 0 || pfds[i + 1].revents != 0;
+        ready[i] = !procs[i]->has_output();
+        for (int s = 0; s < SERVER_SUBPROC_STREAMS; s++) {
+            ready[i] = ready[i] || pfds[1 + i * SERVER_SUBPROC_STREAMS + s].revents != 0;
+        }
     }
 #endif
 }
