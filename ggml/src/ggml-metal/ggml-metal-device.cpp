@@ -1222,7 +1222,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                                                                         "GGML_METAL_DECODE_Q8_NR0",
                                                                         "GGML_METAL_PP_Q8_NR0",
                                                                         "GGML_METAL_Q8_NR0");
-                if (env_nr0_q8 && env_nr0_q8[0] && ggml_metal_nr0_variant_(atoi(env_nr0_q8)) == 4) {
+                if (env_nr0_q8 && env_nr0_q8[0]) {
+                    if (ggml_metal_nr0_variant_(atoi(env_nr0_q8)) == 4) {
+                        nr0 = 4;
+                        suffix = "_nr0_4";
+                    }
+                } else if (!is_decode_like) {
+                    // default PP nr0=4 (0.8B Q8_0 pp512 1105 -> 1417, tg unchanged)
                     nr0 = 4;
                     suffix = "_nr0_4";
                 }
@@ -1294,6 +1300,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (env_nr0_q6k && env_nr0_q6k[0]) {
                     nr0 = ggml_metal_nr0_variant_(atoi(env_nr0_q6k));
                     suffix = nr0 == 8 ? "_nr0_8" : (nr0 == 4 ? "_nr0_4" : "");
+                } else if (!is_decode_like) {
+                    // default PP nr0=4, nsg=2 (sakura-14B Q6_K pp512 50.1 -> 53.1, tg unchanged)
+                    nr0 = 4;
+                    suffix = "_nr0_4";
+                    const char * env_nsg_q6k = ggml_metal_getenv_phase_pref_(false,
+                                                                             "GGML_METAL_DECODE_Q6K_NSG",
+                                                                             "GGML_METAL_PP_Q6K_NSG",
+                                                                             "GGML_METAL_Q6K_NSG");
+                    if (!(env_nsg_q6k && env_nsg_q6k[0])) {
+                        nsg = 2;
+                    }
                 }
                 if (nsg < 1) {
                     nsg = 1;
