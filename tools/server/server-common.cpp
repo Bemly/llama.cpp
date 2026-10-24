@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <filesystem>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -32,6 +33,60 @@
 #include <poll.h>
 #include <unistd.h>
 #endif
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#   define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__APPLE__) && defined(__MACH__)
+#include <mach-o/dyld.h>
+#include <limits.h>
+#else
+#include <unistd.h>
+#endif
+
+std::filesystem::path get_server_exec_path() {
+#if defined(_WIN32)
+    wchar_t buf[32768] = { 0 };  // Large buffer to handle long paths
+    DWORD len = GetModuleFileNameW(nullptr, buf, _countof(buf));
+    if (len == 0 || len >= _countof(buf)) {
+        throw std::runtime_error("GetModuleFileNameW failed or path too long");
+    }
+    return std::filesystem::path(buf);
+#elif defined(__APPLE__) && defined(__MACH__)
+    char small_path[PATH_MAX];
+    uint32_t size = sizeof(small_path);
+
+    if (_NSGetExecutablePath(small_path, &size) == 0) {
+        // resolve any symlinks to get absolute path
+        try {
+            return std::filesystem::canonical(std::filesystem::path(small_path));
+        } catch (...) {
+            return std::filesystem::path(small_path);
+        }
+    } else {
+        // buffer was too small, allocate required size and call again
+        std::vector<char> buf(size);
+        if (_NSGetExecutablePath(buf.data(), &size) == 0) {
+            try {
+                return std::filesystem::canonical(std::filesystem::path(buf.data()));
+            } catch (...) {
+                return std::filesystem::path(buf.data());
+            }
+        }
+        throw std::runtime_error("_NSGetExecutablePath failed after buffer resize");
+    }
+#else
+    char path[FILENAME_MAX];
+    ssize_t count = readlink("/proc/self/exe", path, FILENAME_MAX);
+    if (count <= 0) {
+        throw std::runtime_error("failed to resolve /proc/self/exe");
+    }
+    return std::filesystem::path(std::string(path, count));
+#endif
+}
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -147,7 +202,8 @@ const char * get_media_marker() {
 // model output modalities
 //
 
-std::vector<std::string> server_model_output_modalities(common_decision_type decision_type) {
+std::vector<std::string> server_model_output_modalities(common_decision_type decision_type, bool has_cap_chat, bool has_cap_tts) {
+    std::vector<std::string> out;
     switch (decision_type) {
         case COMMON_DECISION_TYPE_OPENJEV:
         case COMMON_DECISION_TYPE_LEV:
@@ -156,13 +212,32 @@ std::vector<std::string> server_model_output_modalities(common_decision_type dec
         case COMMON_DECISION_TYPE_LAYA:
         case COMMON_DECISION_TYPE_CLEF:
         case COMMON_DECISION_TYPE_PPLX_DECIDER:
+        case COMMON_DECISION_TYPE_VLLM_DECISION2:
+        case COMMON_DECISION_TYPE_VLLM_D3:
         case COMMON_DECISION_TYPE_LFM2_D1:
         case COMMON_DECISION_TYPE_LFM2_D1_OMNI:
-            return {"decisions"};
+        case COMMON_DECISION_TYPE_H2O_LIGHTNING:
+            out = {"decisions"};
+            break;
+        case COMMON_DECISION_TYPE_GRANITE_SWITCH:
+            out = {"text", "decisions"};
+            break;
         default:
-            // fallback when there is no decision type or the metadata is bad
-            return {"text"};
+            // a tts-only model cannot generate text
+            if (has_cap_chat || !has_cap_tts) {
+                // fallback when there is no decision type or the metadata is bad
+                out = {"text"};
+            }
+            break;
     }
+    if (has_cap_tts) {
+        out.push_back("audio");
+    }
+    return out;
+}
+
+std::vector<std::string> server_model_output_modalities(const llama_model * model, bool has_cap_chat, bool has_cap_tts) {
+    return server_model_output_modalities(common_get_decision_type(model), has_cap_chat, has_cap_tts);
 }
 
 json server_model_architecture_json(
@@ -1190,7 +1265,6 @@ void handle_media(
         out_files.push_back(decoded_data);
     }
 }
-
 // load media files from an OAI content array, then replace each media part with a media marker text part
 static void oaicompat_content_load_media(json & content, const server_chat_params & opt, std::vector<raw_buffer> & out_files) {
     for (auto & p : content) {
@@ -1261,6 +1335,7 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
     if (files.empty()) {
         return server_tokens(common_tokenize(vocab, prompt, add_special, parse_special), false);
     }
+
     return process_mtmd_prompt(mctx, prompt, files, init_opt);
 }
 
@@ -1355,6 +1430,133 @@ json oaicompat_chat_params_parse(
         oaicompat_content_load_media(content, opt, out_files);
     }
 
+    auto caps = common_chat_templates_get_caps(opt.tmpls.get());
+
+    common_chat_templates_inputs inputs;
+    inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
+    inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
+    inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
+    inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
+    inputs.grammar                = grammar;
+    inputs.use_jinja              = opt.use_jinja;
+    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
+    inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
+    inputs.continue_final_message = body.contains("continue_final_message") ?
+        common_chat_continuation_parse(body.at("continue_final_message")) :
+        COMMON_CHAT_CONTINUATION_NONE;
+    if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant
+        && !inputs.messages.empty() && inputs.messages.back().role == "assistant") {
+        if (inputs.messages.size() >= 2 && inputs.messages[inputs.messages.size() - 2].role == "assistant") {
+            throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
+        }
+        inputs.continue_final_message = COMMON_CHAT_CONTINUATION_AUTO;
+        inputs.add_generation_prompt  = false;
+    }
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && inputs.add_generation_prompt) {
+        throw std::invalid_argument("Cannot set both add_generation_prompt and continue_final_message to true.");
+    }
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE
+        && !inputs.messages.empty()
+        && inputs.messages.back().role == "assistant"
+        && !inputs.messages.back().tool_calls.empty()) {
+        throw std::invalid_argument("Cannot continue an assistant message that contains tool calls.");
+    }
+    inputs.reasoning_format = opt.reasoning_format;
+    if (body.contains("reasoning_format")) {
+        inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
+    }
+    inputs.enable_thinking = opt.enable_thinking;
+    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+        if (body.contains("grammar")) {
+            throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
+        }
+    }
+
+    // merge the template args provided from command line with the args provided in the user request
+    auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());
+    inputs.chat_template_kwargs = opt.chat_template_kwargs;
+    for (const auto & item : chat_template_kwargs_object.items()) {
+        inputs.chat_template_kwargs[item.key()] = item.value().dump();
+    }
+
+    // parse the "enable_thinking" kwarg to override the default value
+    auto enable_thinking_kwarg = json_value(inputs.chat_template_kwargs, "enable_thinking", std::string(""));
+    if (enable_thinking_kwarg == "true") {
+        inputs.enable_thinking = true;
+    } else if (enable_thinking_kwarg == "false") {
+        inputs.enable_thinking = false;
+    } else if (!enable_thinking_kwarg.empty() && enable_thinking_kwarg[0] == '"') {
+        throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
+    }
+
+    // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
+    if (body.contains("reasoning_effort")) {
+        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+        if (reasoning_effort == "none") {
+            inputs.enable_thinking = false;
+            inputs.chat_template_kwargs.erase("reasoning_effort");
+        } else if (!reasoning_effort.empty()) {
+            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+        }
+    }
+
+    inputs.force_pure_content = opt.force_pure_content;
+
+    // Apply chat template to the list of messages
+    common_chat_session_params session_params;
+    session_params.echo = json_value(body, "echo", false);
+    out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+
+    llama_params["prompt"] = out_session.prompt().str();
+
+    // Reasoning budget: pass parameters through to sampling layer
+    {
+        int reasoning_budget = json_value(body, "reasoning_budget_tokens",
+                               json_value(body, "thinking_budget_tokens", -1));
+        if (reasoning_budget == -1) {
+            reasoning_budget = opt.reasoning_budget;
+        }
+
+        if (!out_session.thinking_end_tags().empty()) {
+            llama_params["reasoning_budget_tokens"] = reasoning_budget;
+            llama_params["reasoning_budget_start_tag"] = out_session.thinking_start_tag();
+            llama_params["reasoning_budget_end_tags"] = out_session.thinking_end_tags();
+            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+            llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
+        }
+    }
+
+    // Handle "logprobs" field
+    // TODO: The response format of this option is not yet OAI-compatible, but seems like no one really using it; We may need to fix it in the future
+    if (json_value(body, "logprobs", false)) {
+        if (has_tools && stream) {
+            throw std::invalid_argument("logprobs is not supported with tools + stream");
+        }
+        llama_params["n_probs"] = json_value(body, "top_logprobs", 20);
+    } else if (body.contains("top_logprobs") && !body.at("top_logprobs").is_null()) {
+        throw std::invalid_argument("top_logprobs requires logprobs to be set to true");
+    }
+
+    // Copy remaining properties to llama_params
+    // This allows user to use llama.cpp-specific params like "mirostat", ... via OAI endpoint.
+    // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
+    for (const auto & item : body.items()) {
+        // Exception: if "n_predict" is present, we overwrite the value specified earlier by "max_tokens"
+        if (!llama_params.contains(item.key()) || item.key() == "n_predict") {
+            llama_params[item.key()] = item.value();
+        }
+    }
+
+    // the session owns these, the server applies them with server_task::apply_chat_session()
+    for (const char * key : { "grammar_lazy", "grammar_triggers", "preserved_tokens" }) {
+        llama_params.erase(key);
+    }
+    if (!out_session.grammar().empty()) {
+        llama_params.erase("grammar");
+        llama_params.erase("json_schema");
+    }
+
+    return llama_params;
 }
 
 // OAI message media via the shared content loader (kvmem vision entry)
@@ -1778,24 +1980,73 @@ llama_tokens format_prompt_infill(
     return embd_inp;
 }
 
+std::string format_rerank_template(
+        const std::string & tmpl,
+        const std::string & query,
+        const std::string & doc) {
+    std::string prompt;
+    prompt.reserve(tmpl.size());
+    for (size_t pos = 0; pos < tmpl.size();) {
+        if (tmpl.compare(pos, 7, "{query}") == 0) {
+            prompt += query;
+            pos += 7;
+        } else if (tmpl.compare(pos, 10, "{document}") == 0) {
+            prompt += doc;
+            pos += 10;
+        } else {
+            prompt += tmpl[pos++];
+        }
+    }
+    return prompt;
+}
+
 server_tokens format_prompt_rerank(
         const struct llama_model * model,
         const struct llama_vocab * vocab,
         mtmd_context * mctx,
         const std::string & query,
         const std::string & doc,
+        const std::vector<raw_buffer> & query_files,
+        const std::vector<raw_buffer> & doc_files,
         const mtmd_helper_init_opt & init_opt) {
     server_tokens result = {};
+
+    // media must be spliced through the mtmd pipeline
+    if ((!query_files.empty() || !doc_files.empty()) && mctx == nullptr) {
+        throw std::invalid_argument("multimodal rerank input requires --mmproj");
+    }
 
     const char * rerank_prompt = llama_model_chat_template(model, "rerank");
 
     if (rerank_prompt != nullptr) {
-        std::string prompt = rerank_prompt;
-        string_replace_all(prompt, "{query}"   , query);
-        string_replace_all(prompt, "{document}", doc  );
-        server_tokens tokens = tokenize_input_subprompt(vocab, mctx, prompt, false, true, init_opt);
-        result.push_back(tokens);
+        // multimodal: append one media marker per image (arrays already flattened by caller)
+        std::string q = query;
+        for (size_t i = 0; i < query_files.size(); i++) {
+            q += get_media_marker();
+        }
+        std::string d = doc;
+        for (size_t i = 0; i < doc_files.size(); i++) {
+            d += get_media_marker();
+        }
+
+        std::string prompt = format_rerank_template(rerank_prompt, q, d);
+
+        if (query_files.empty() && doc_files.empty()) {
+            server_tokens tokens = tokenize_input_subprompt(vocab, mctx, prompt, false, true, init_opt);
+            result.push_back(tokens);
+        } else {
+            // process_mtmd_prompt returns a complete mtmd server_tokens; return it directly
+            // (push_back into a non-mtmd result would hit the NULL placeholder tokens)
+            std::vector<raw_buffer> files;
+            files.insert(files.end(), query_files.begin(), query_files.end());
+            files.insert(files.end(), doc_files.begin(),   doc_files.end());
+            return process_mtmd_prompt(mctx, prompt, files, init_opt);
+        }
     } else {
+        if (!query_files.empty() || !doc_files.empty()) {
+            throw std::invalid_argument("multimodal rerank input requires a model with a rerank chat template");
+        }
+
         // Get EOS token - use SEP token as fallback if EOS is not available
         server_tokens query_tokens = tokenize_input_subprompt(vocab, mctx, query, false, false, init_opt);
         server_tokens doc_tokens   = tokenize_input_subprompt(vocab, mctx, doc,   false, false, init_opt);

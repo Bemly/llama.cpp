@@ -54,6 +54,8 @@ bool ggml_metal_op_flash_attn_ext_amd_supported(const struct ggml_tensor * op);
 // Quantized-KV gate: same env, K/V in {F16, Q8_0, Q4_0, Q4_1} (not both F16)
 bool ggml_metal_op_flash_attn_ext_amd_quant_supported(const struct ggml_tensor * op);
 
+size_t ggml_metal_op_argmax_extra(const struct ggml_tensor * op);
+
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_acc               (ggml_metal_op_t ctx, int idx);

@@ -1022,7 +1022,7 @@ static bool derive_native_query_span(const ServerState & st, const std::string &
     prefix_inputs.add_generation_prompt = false;
     std::string prefix;
     try {
-        prefix = common_chat_templates_apply(st.tmpls.get(), prefix_inputs).prompt;
+        prefix = common_chat_templates_apply(st.tmpls.get(), prefix_inputs).prompt.str();
     } catch (const std::exception &) {
         return false; // A template may require the full trailing tool sequence.
     }
@@ -1992,7 +1992,7 @@ int main(int argc, char ** argv) {
             res.set_content(json{{"error", std::string("chat template: ") + e.what()}}.dump(), "application/json");
             return;
         }
-        const std::string & prompt = formatted.prompt;
+        const std::string prompt = formatted.prompt.str();
         std::shared_ptr<kvmem_prompt> parsed_prompt;
         try {
             parsed_prompt = media_files.empty()
