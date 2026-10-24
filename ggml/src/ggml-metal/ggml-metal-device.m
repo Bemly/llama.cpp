@@ -2433,7 +2433,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder fillBuffer:bid_dst.metal
-                          range:NSMakeRange(bid_dst.offs, bid_dst.offs + size)
+                          range:NSMakeRange(bid_dst.offs, size)
                           value:value];
 
             [encoder endEncoding];
@@ -2444,21 +2444,56 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
     }
 }
 
+// synchronous host <-> device transfers stage through one shared buffer per thread, grown on demand:
+// a fresh MTLBuffer per call shows up in decode (several input uploads per token, tg128 20.7 -> 18.8);
+// transfers above GGML_METAL_STAGING_MAX keep a one-off buffer so model loads do not pin a huge one
+#define GGML_METAL_STAGING_MAX (64u*1024u*1024u)
+
+static id<MTLBuffer> ggml_metal_staging_acquire(id<MTLDevice> device, size_t size, bool * one_off) {
+    static _Thread_local id<MTLBuffer> staging     = nil;
+    static _Thread_local id<MTLDevice> staging_dev = nil;
+
+    if (size > GGML_METAL_STAGING_MAX) {
+        *one_off = true;
+        return [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    }
+
+    *one_off = false;
+    if (staging == nil || staging_dev != device || [staging length] < size) {
+        if (staging != nil) {
+            [staging release];
+        }
+        size_t cap = 1u*1024u*1024u;
+        while (cap < size) {
+            cap *= 2;
+        }
+        staging     = [device newBufferWithLength:cap options:MTLResourceStorageModeShared];
+        staging_dev = device;
+    }
+    return staging;
+}
+
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
         memcpy((char *) tensor->data + offset, data, size);
         return;
     }
+    if (size == 0) {
+        return;
+    }
 
     @autoreleasepool {
-        // src
-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // src: temp shared buffer + copy, as in get_tensor: newBufferWithBytesNoCopy returns nil
+        // for a host pointer that is not page aligned (DFlash uploads hit this on discrete GPUs)
+        bool src_one_off = false;
+        id<MTLBuffer> buf_src = ggml_metal_staging_acquire(buf->dev->mtl_device, size, &src_one_off);
 
+        if (buf_src == nil) {
+            GGML_LOG_ERROR("%s: error: failed to create staging upload buffer, size = %8.2f MiB\n", __func__, size / 1024.0 / 1024.0);
+        }
         GGML_ASSERT(buf_src);
+
+        memcpy([buf_src contents], data, size);
 
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
@@ -2496,13 +2531,18 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
         //[cmd_buf waitUntilCompleted];
 
-        [buf_src release];
+        if (src_one_off) {
+            [buf_src release];
+        }
     }
 }
 
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
         memcpy(data, (const char *) tensor->data + offset, size);
+        return;
+    }
+    if (size == 0) {
         return;
     }
 
@@ -2512,8 +2552,8 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         bid_src.offs += offset;
 
         // dst: use a temp shared buffer, host ptr may not be page aligned
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithLength:size
-                                                                  options:MTLResourceStorageModeShared];
+        bool dst_one_off = false;
+        id<MTLBuffer> buf_dst = ggml_metal_staging_acquire(buf->dev->mtl_device, size, &dst_one_off);
 
         GGML_ASSERT(buf_dst);
 
@@ -2536,7 +2576,9 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         // temp shared buffer + copy: host ptr may not be page aligned for NoCopy
         memcpy(data, [buf_dst contents], size);
-        [buf_dst release];
+        if (dst_one_off) {
+            [buf_dst release];
+        }
     }
 }
 

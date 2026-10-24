@@ -1079,6 +1079,17 @@ static inline int ggml_metal_nr0_variant_(int v_req) {
     return 2;
 }
 
+int ggml_metal_iq3s_nc_max(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        // NC chunks beat the blocked mm at every size measured (pp128 44.4->56.3, pp512 49.5->55.8)
+        const char * e = getenv("GGML_METAL_IQ3S_NC_MAX");
+        const int v = (e && e[0]) ? atoi(e) : 512;
+        cached = v < 8 ? 8 : (v > 512 ? 512 : v);
+    }
+    return cached;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -1361,6 +1372,46 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (nb32 < 32 && (32 % nb32) == 0) {
                     nr0 = N_R0_IQ3_S_SPLIT;
                     split = true;
+                }
+                // RX6800: 2..8 columns (spec-decode verify) dequantize once for all columns.
+                // GGML_METAL_IQ3S_NC=0 opts out. Auto rows per simdgroup from the Hauhau IQ3_M
+                // sweep (t/s, per-column -> nc): n=3 nr0=2 26.6->29.6, n=4 nr0=4 27.0->32.1,
+                // n=8 nr0=4 29.1->45.1; n=2 stays per-column (24.0 vs 23.6).
+                {
+                    static int nc_on = -2;
+                    if (nc_on == -2) {
+                        const char * e = getenv("GGML_METAL_IQ3S_NC");
+                        nc_on = (!e || !e[0] || e[0] != '0') ? 1 : 0;
+                    }
+                    // rows per simdgroup (1, 2 or 4) and simdgroups per threadgroup for this variant
+                    static int nc_nr0 = -1;
+                    static int nc_nsg = -1;
+                    if (nc_nr0 < 0) {
+                        const char * e = getenv("GGML_METAL_IQ3S_NC_NR0");
+                        const int v = (e && e[0]) ? atoi(e) : 0;
+                        nc_nr0 = (v == 1 || v == 2 || v == 4) ? v : 0; // 0 = auto by ne11
+                        const char * g = getenv("GGML_METAL_IQ3S_NC_NSG");
+                        const int n = (g && g[0]) ? atoi(g) : N_SG_IQ3_S;
+                        nc_nsg = (n >= 1 && n <= 8) ? n : N_SG_IQ3_S;
+                    }
+                    static char nc_suffix[3][9][16];
+                    // up to ggml_metal_iq3s_nc_max() columns run as 8-column chunks: the blocked mm
+                    // (kernel_mul_mm_iq3_s_f32_amd) costs about the same for any ne11 <= 64
+                    // (pp16 9.9, pp32 19.5, pp64 38.5 t/s) while the chunks give 32.1, 45.1, 56.0
+                    const int nc_n = (int) std::min<int64_t>(ne11, 8);
+                    const int nc_r = nc_nr0 > 0 ? nc_nr0 : (nc_n >= 4 ? 4 : (nc_n == 3 ? 2 : 0));
+                    if (nc_on == 1 && nc_r > 0 && !split && ne11 >= 2 && ne11 <= ggml_metal_iq3s_nc_max() &&
+                        tsrc1 == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+                        const int ri = nc_r == 1 ? 0 : (nc_r == 2 ? 1 : 2);
+                        char * sfx = nc_suffix[ri][nc_n];
+                        if (!sfx[0]) {
+                            snprintf(sfx, sizeof(nc_suffix[0][0]), "_r%d_nc%d", nc_r, nc_n);
+                        }
+                        suffix = sfx;
+                        nr0 = nc_r;
+                        nr1 = nc_n;
+                        nsg = nc_nsg;
+                    }
                 }
                 // MMQ-style port (Vulkan matvec translation): one TG per
                 // output row, 256 threads. Decode only (ne11==1), opt-in via

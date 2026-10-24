@@ -2649,6 +2649,48 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// RX6800: IQ types on mul_mv_ext for 2..8 columns (spec-decode verify batches).
+// Opt-in (GGML_METAL_EXT_IQ=1): measured slower than the per-column mat-vec on RDNA2
+// (Hauhau IQ3_M pp2 20.75 vs 24.23 t/s), the generic dequant reads the grid from constant memory.
+// GGML_METAL_EXT_IQ_MIN sets the smallest ne11 (default 2).
+static bool ggml_metal_op_mul_mat_ext_iq(ggml_type type) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * val = getenv("GGML_METAL_EXT_IQ");
+        cached = (val && val[0] && val[0] != '0') ? 1 : 0;
+    }
+    if (cached == 0) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int ggml_metal_op_mul_mat_ext_iq_min(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * val = getenv("GGML_METAL_EXT_IQ_MIN");
+        const int n = (val && val[0]) ? atoi(val) : 2;
+        cached = n < 2 ? 2 : (n > 9 ? 9 : n);
+    }
+    return cached;
+}
+
+// ne11 the IQ3_S multi-column mat-vec keeps away from the blocked mm (0 when it is switched off)
+static int ggml_metal_iq3s_nc_max_eff(void) {
+    const char * e = getenv("GGML_METAL_IQ3S_NC");
+    return (e && e[0] == '0') ? 0 : ggml_metal_iq3s_nc_max();
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2691,7 +2733,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         }
         const bool mmq_gate =
             mmq_cached == 1 &&
-            (op->src[0]->type == GGML_TYPE_IQ3_S ||
+            ((op->src[0]->type == GGML_TYPE_IQ3_S && ne11 > ggml_metal_iq3s_nc_max_eff()) ||
              op->src[0]->type == GGML_TYPE_Q4_K) &&
             op->src[1]->type == GGML_TYPE_F32 &&
             op->type == GGML_TYPE_F32 &&
@@ -2776,7 +2818,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
            false) && (ne11 >= 4 && ne11 <= 8)
-         )
+         ) ||
+         (ggml_metal_op_mul_mat_ext_iq(op->src[0]->type) && ne11 >= ggml_metal_op_mul_mat_ext_iq_min() && ne11 <= 8)
         )
        ) {
         // TODO: determine the optimal parameters based on grid utilization

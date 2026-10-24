@@ -2690,8 +2690,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    result.cache_type_k  = params_spec.cache_type_k;
-    result.cache_type_v  = params_spec.cache_type_v;
+    // an unset (default F16) draft KV type follows the target: on RX6800 Metal an F16 MTP draft cache
+    // drafts garbage (Hauhau IQ3_M, q8 target KV: 1/756 accepted with F16, 86/120 with q8_0)
+    result.cache_type_k  = params_spec.cache_type_k == GGML_TYPE_F16 ? params.cache_type_k : params_spec.cache_type_k;
+    result.cache_type_v  = params_spec.cache_type_v == GGML_TYPE_F16 ? params.cache_type_v : params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

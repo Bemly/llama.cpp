@@ -59,9 +59,15 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
     const int kv0 = isplit*args.chunk;
     const int kv1 = MIN((int) args.ne11, kv0 + args.chunk);
 
+    // 128 lane 每轮覆盖 256 个 dv 元素；DV=512 需要 2 轮（否则后半 dv 不写，reduce 读到垃圾）
+    constexpr int NPV = (DV/2 + 127)/128;
+
     float  m_run = -INFINITY;
     float  l_run = 0.0f;
-    float2 o_run = 0.0f;   // lane 拥有 dv 元素 {2*lane, 2*lane+1}（lane < DV/2）
+    float2 o_run[NPV];   // lane 拥有 dv 元素对 p = lane + 128*i：{2*p, 2*p+1}（p < DV/2）
+    FOR_UNROLL (int i = 0; i < NPV; ++i) {
+        o_run[i] = 0.0f;
+    }
 
     threadgroup float * ss = shm;             // [NBC]
     threadgroup float * sm = shm + NBC;       // [4]
@@ -80,7 +86,7 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
                     float4 p = float4(q4 * kh4[i]);
                     acc += p.x + p.y + p.z + p.w;
                 }
-                s = HAS_MASK_FA_AMD ? acc + (float) mp[t] : acc;
+                s = HAS_MASK_FA_AMD ? acc + (float) mp[t]*1.44269504088896f : acc;   // mask 在 ln 域，S 在 log2 域
             }
             if (lane < NBC) {
                 ss[lane] = s;
@@ -117,7 +123,9 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
             const float corr = (m_new == -INFINITY) ? 1.0f
                              : ((m_run == -INFINITY) ? 0.0f : exp2(m_run - m_new));
             l_run = l_run*corr + (sl[0] + sl[1] + sl[2] + sl[3]);
-            o_run *= corr;
+            FOR_UNROLL (int i = 0; i < NPV; ++i) {
+                o_run[i] *= corr;
+            }
             m_run = m_new;
         }
 
@@ -126,8 +134,14 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
             device const half2 * vh2 = (device const half2 *) vp;
             for (int j = 0; j < NBC; ++j) {
                 if (t0 + j >= kv1) break;
-                const float2 vv = float2(vh2[(size_t) (t0 + j)*(args.nb21/4) + lane]);
-                o_run += ss[j]*vv;
+                device const half2 * vrow = vh2 + (size_t) (t0 + j)*(args.nb21/4);
+                const float w = ss[j];
+                FOR_UNROLL (int i = 0; i < NPV; ++i) {
+                    const int p = lane + 128*i;
+                    if (p < DV/2) {
+                        o_run[i] += w*float2(vrow[p]);
+                    }
+                }
             }
         }
         // ss holds this block's weights; the next block overwrites it after this barrier
@@ -138,9 +152,12 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
     device float * pb = (device float *)(part +
             ((size_t) ib*args.ne02 + ih)*args.split*(DV + 2)*sizeof(float) +
             (size_t) isplit*(DV + 2)*sizeof(float));
-    if (lane < DV/2) {
-        pb[2*lane + 0] = o_run.x;
-        pb[2*lane + 1] = o_run.y;
+    FOR_UNROLL (int i = 0; i < NPV; ++i) {
+        const int p = lane + 128*i;
+        if (p < DV/2) {
+            pb[2*p + 0] = o_run[i].x;
+            pb[2*p + 1] = o_run[i].y;
+        }
     }
     if (lane == 0) {
         pb[DV + 0] = m_run;
@@ -298,7 +315,7 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
                     }
                     s = acc;
                     if (HAS_MASK_FA_AMD) {
-                        s += (float) ((device const half *) mp)[t];
+                        s += (float) ((device const half *) mp)[t]*1.44269504088896f;   // ln 域 mask → log2 域
                     }
                 }
                 s_reg[kk] = s;

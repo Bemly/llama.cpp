@@ -1083,6 +1083,33 @@ template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_3")]] kernel mul_mv_ext_q4x4
 template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_q6_K, 256, dequantize_q6_K>;
 template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_q6_K, 256, dequantize_q6_K>;
 
+// RX6800: IQ types on the multi-column path too. Without it a 2..8-token batch (spec-decode verify)
+// runs one mat-vec per column, re-dequantizing the weights each time; decode here is dequant-bound.
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_iq2_xxs, 256, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_iq2_xxs, 256, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_iq2_xxs, 256, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_iq2_xxs, 256, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_iq2_xs, 256, dequantize_iq2_xs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_iq2_xs, 256, dequantize_iq2_xs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_iq2_xs, 256, dequantize_iq2_xs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_iq2_xs, 256, dequantize_iq2_xs>;
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_iq2_s, 256, dequantize_iq2_s>;
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_iq2_s, 256, dequantize_iq2_s>;
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_iq2_s, 256, dequantize_iq2_s>;
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_iq2_s, 256, dequantize_iq2_s>;
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_iq3_xxs, 256, dequantize_iq3_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_iq3_xxs, 256, dequantize_iq3_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_iq3_xxs, 256, dequantize_iq3_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_iq3_xxs, 256, dequantize_iq3_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_iq3_s, 256, dequantize_iq3_s>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_iq3_s, 256, dequantize_iq3_s>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_iq3_s, 256, dequantize_iq3_s>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_iq3_s, 256, dequantize_iq3_s>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_iq4_xs, 256, dequantize_iq4_xs>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_iq4_xs, 256, dequantize_iq4_xs>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_iq4_xs, 256, dequantize_iq4_xs>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_iq4_xs, 256, dequantize_iq4_xs>;
+
 template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_q2_K, 256, dequantize_q2_K>;
 template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_q2_K, 256, dequantize_q2_K>;
 template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_q2_K, 256, dequantize_q2_K>;
@@ -2609,6 +2636,159 @@ kernel void kernel_mul_mv_iq3_s_f32_nr0_8(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_iq3_s_f32_impl<8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
+
+// RX6800: IQ3_S mat-vec over NC columns per threadgroup (spec-decode verify batches, ne11 = 2..8).
+// The per-column kernel re-dequantizes the weights for every column, and decode on RDNA2 is
+// dequant-bound, so each extra verify token costs ~0.7 of a decode step. Here each 32-weight
+// chunk is dequantized once into registers and dotted against all NC columns.
+// Same layout as kernel_mul_mv_iq3_s_f32_impl (non-split): grid table staged in threadgroup memory.
+template<int nr0, short NC>
+void kernel_mul_mv_iq3_s_f32_nc_impl(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb   = args.ne00/QK_K;
+    const int nb32 = nb * (QK_K / 32);
+
+    const int r0 = tgpig.x;
+    const int c0 = tgpig.y*NC;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const short nc = MIN((int) NC, args.ne11 - c0);
+
+    device const block_iq3_s * x = (device const block_iq3_s *) (src0 + first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03);
+    device const char        * y = src1 + (uint64_t) c0*args.nb11 + i12*args.nb12 + i13*args.nb13;
+
+    threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
+    {
+        const int nval = 8;
+        const int pos  = (32*sgitg + tiisg)*nval;
+        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3s_grid[pos + i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float sumf[nr0][NC];
+    for (short row = 0; row < nr0; ++row) {
+        for (short c = 0; c < NC; ++c) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    for (int ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+
+        device const block_iq3_s * xr = x + ibl;
+        device const uint8_t * qs    = xr->qs + 8 * ib;
+        device const uint8_t * qh    = xr->qh + ib;
+        device const uint8_t * sc    = xr->scales + (ib/2);
+        device const uint8_t * signs = xr->signs + 4 * ib;
+        device const half    * dh    = &xr->d;
+
+        // dequantize the 32 weights of this chunk once per row (d folded in)
+        float4 w[nr0][8];
+        for (short row = 0; row < nr0; ++row) {
+            const float d = (float) dh[0] * (1 + 2*((sc[0] >> 4*(ib%2)) & 0xf));
+            for (short l = 0; l < 4; ++l) {
+                const threadgroup uint32_t * table1 = qh[0] & kmask_iq2xs[2*l+0] ? svalues + 256 : svalues;
+                const threadgroup uint32_t * table2 = qh[0] & kmask_iq2xs[2*l+1] ? svalues + 256 : svalues;
+                const float4 g1 = float4(as_type<uchar4>(table1[qs[2*l+0]]));
+                const float4 g2 = float4(as_type<uchar4>(table2[qs[2*l+1]]));
+                const uint8_t sg = signs[l];
+                w[row][2*l+0] = d * g1 * float4(select(1.f, -1.f, (bool)(sg & 0x01)), select(1.f, -1.f, (bool)(sg & 0x02)),
+                                                select(1.f, -1.f, (bool)(sg & 0x04)), select(1.f, -1.f, (bool)(sg & 0x08)));
+                w[row][2*l+1] = d * g2 * float4(select(1.f, -1.f, (bool)(sg & 0x10)), select(1.f, -1.f, (bool)(sg & 0x20)),
+                                                select(1.f, -1.f, (bool)(sg & 0x40)), select(1.f, -1.f, (bool)(sg & 0x80)));
+            }
+            dh    += args.nb01/2;
+            qs    += args.nb01;
+            qh    += args.nb01;
+            sc    += args.nb01;
+            signs += args.nb01;
+        }
+
+        // each column's 32 activations are loaded once and reused for every row
+        for (short c = 0; c < NC; ++c) {
+            if (c >= nc) {
+                break;
+            }
+            device const float4 * y4 = (device const float4 *) (y + (uint64_t) c*args.nb11) + 8*ib32;
+            float4 yv[8];
+            for (short k = 0; k < 8; ++k) {
+                yv[k] = y4[k];
+            }
+            for (short row = 0; row < nr0; ++row) {
+                float acc = 0.f;
+                for (short k = 0; k < 8; ++k) {
+                    acc += dot(w[row][k], yv[k]);
+                }
+                sumf[row][c] += acc;
+            }
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1;
+
+    for (short row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        for (short c = 0; c < NC; ++c) {
+            if (c >= nc) {
+                break;
+            }
+            const float sum_all = simd_sum(sumf[row][c]);
+            if (tiisg == 0) {
+                dst_f32[(uint64_t)(c0 + c)*args.ne0 + first_row + row] = sum_all;
+            }
+        }
+    }
+}
+
+#define KERNEL_MUL_MV_IQ3_S_NC(NR0_, NC_) \
+[[host_name("kernel_mul_mv_iq3_s_f32_r" #NR0_ "_nc" #NC_)]] \
+kernel void kernel_mul_mv_iq3_s_f32_r##NR0_##_nc##NC_( \
+        constant ggml_metal_kargs_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_iq3_s_f32_nc_impl<NR0_, NC_>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+
+KERNEL_MUL_MV_IQ3_S_NC(1, 2)
+KERNEL_MUL_MV_IQ3_S_NC(1, 3)
+KERNEL_MUL_MV_IQ3_S_NC(1, 4)
+KERNEL_MUL_MV_IQ3_S_NC(1, 5)
+KERNEL_MUL_MV_IQ3_S_NC(1, 6)
+KERNEL_MUL_MV_IQ3_S_NC(1, 7)
+KERNEL_MUL_MV_IQ3_S_NC(1, 8)
+KERNEL_MUL_MV_IQ3_S_NC(2, 2)
+KERNEL_MUL_MV_IQ3_S_NC(2, 3)
+KERNEL_MUL_MV_IQ3_S_NC(2, 4)
+KERNEL_MUL_MV_IQ3_S_NC(2, 5)
+KERNEL_MUL_MV_IQ3_S_NC(2, 6)
+KERNEL_MUL_MV_IQ3_S_NC(2, 7)
+KERNEL_MUL_MV_IQ3_S_NC(2, 8)
+KERNEL_MUL_MV_IQ3_S_NC(4, 2)
+KERNEL_MUL_MV_IQ3_S_NC(4, 3)
+KERNEL_MUL_MV_IQ3_S_NC(4, 4)
+KERNEL_MUL_MV_IQ3_S_NC(4, 5)
+KERNEL_MUL_MV_IQ3_S_NC(4, 6)
+KERNEL_MUL_MV_IQ3_S_NC(4, 7)
+KERNEL_MUL_MV_IQ3_S_NC(4, 8)
 
 template<int nr0, typename args_t>
 void kernel_mul_mv_iq2_s_f32_impl(
