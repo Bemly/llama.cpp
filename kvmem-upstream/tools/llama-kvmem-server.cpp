@@ -1981,8 +1981,8 @@ int main(int argc, char ** argv) {
             inputs.parallel_tool_calls = cr.parallel_tool_calls;
         } else {
             const auto caps = common_chat_templates_get_caps(st.tmpls.get());
-            const auto it = caps.find("supports_parallel_tool_calls");
-            inputs.parallel_tool_calls = it != caps.end() && it->second;
+            inputs.parallel_tool_calls = caps.contains("supports_parallel_tool_calls")
+                    && caps.at("supports_parallel_tool_calls").get<bool>();
         }
         common_chat_params formatted;
         try {

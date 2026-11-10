@@ -683,6 +683,7 @@ llama_memory_kvmem::llama_memory_kvmem(
             };
             iswa_owned_ = std::make_unique<llama_kv_cache_iswa>(
                     model,
+                    params.no_alloc,
                     params.type_k,
                     params.type_v,
                     !cparams.flash_attn,
@@ -692,7 +693,6 @@ llama_memory_kvmem::llama_memory_kvmem(
                     kv_size_,
                     /* n_seq_max */ 1,
                     cparams.n_ubatch,
-                    /* n_pad */ 1,
                     nullptr,
                     filter_full,
                     nullptr,
@@ -703,6 +703,7 @@ llama_memory_kvmem::llama_memory_kvmem(
         } else {
             kv_owned_ = std::make_unique<llama_kv_cache>(
                     model,
+                    params.no_alloc,
                     model.hparams,
                     params.type_k,
                     params.type_v,
@@ -711,7 +712,6 @@ llama_memory_kvmem::llama_memory_kvmem(
                     /* unified */ true,
                     kv_size_,
                     /* n_seq_max */ 1,
-                    /* n_pad */ 1,
                     model.hparams.n_swa,
                     model.hparams.swa_type,
                     nullptr,

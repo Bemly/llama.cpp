@@ -160,6 +160,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY  = 142, // pre-rename value for the same format
+        LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -402,7 +403,8 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
-        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1569,6 +1571,10 @@ extern "C" {
                                float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
                                float   penalty_freq,     // must be finite, 0.0 = disabled
                                float   penalty_present); // must be finite, 0.0 = disabled
+
+    /// maximum number of distinct DRY sequence breakers, duplicates not counted
+    /// processing each breaker scans the entire vocabulary, so the init cost is O(num_breakers x n_vocab)
+    #define LLAMA_DRY_MAX_SEQ_BREAKERS 64
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(

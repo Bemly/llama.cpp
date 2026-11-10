@@ -36,7 +36,6 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 
 // id map [n_tokens, n_expert]
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
-size_t ggml_metal_op_mul_mat_id_extra_amax(const struct ggml_tensor * op);
 
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
@@ -53,6 +52,7 @@ bool ggml_metal_op_flash_attn_ext_amd_supported(const struct ggml_tensor * op);
 
 // Quantized-KV gate: same env, K/V in {F16, Q8_0, Q4_0, Q4_1} (not both F16)
 bool ggml_metal_op_flash_attn_ext_amd_quant_supported(const struct ggml_tensor * op);
+size_t ggml_metal_op_flash_attn_ext_extra_rows(const struct ggml_tensor * op);
 
 size_t ggml_metal_op_argmax_extra(const struct ggml_tensor * op);
 
@@ -68,6 +68,7 @@ int ggml_metal_op_get_rows          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_set_rows          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_diag              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_top_k_mask        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);

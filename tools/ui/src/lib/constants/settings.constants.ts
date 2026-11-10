@@ -1,5 +1,6 @@
 import { DEFAULT_AGENTIC_CONFIG } from './agentic.constants';
 import { CLI_FLAGS } from './cli-flags.constants';
+import { COMPACTION } from './compaction.constants';
 import { DEFAULT_MCP_CONFIG } from './mcp.constants';
 import { SETTINGS_KEYS } from './settings-keys.constants';
 import { TITLE_GENERATION } from './title-generation.constants';
@@ -113,6 +114,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: true,
+				help: 'Render the markdown in the message input as you write it: every line but the one you are on shows as it will look in the conversation. When disabled, the input shows the plain markdown text.',
+				key: SETTINGS_KEYS.LIVE_MARKDOWN_PREVIEW,
+				label: 'Live markdown preview in the message input',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: true,
 				help: 'Automatically show microphone button instead of send button when textarea is empty for models with audio modality support.',
 				key: SETTINGS_KEYS.AUTO_MIC_ON_EMPTY,
 				label: 'Show microphone on empty input',
@@ -175,6 +183,21 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				label: 'Generate title with LLM',
 				standaloneField: false,
 				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: COMPACTION.DEFAULT_PROMPT,
+				help: 'Optional override for the instruction sent to the model when compacting a conversation.',
+				key: SETTINGS_KEYS.COMPACTION_PROMPT,
+				label: 'Compaction prompt',
+				type: SettingsFieldType.TEXTAREA
+			},
+			{
+				defaultValue: COMPACTION.DEFAULT_PRESERVED_STEPS,
+				help: 'Last steps a compaction keeps as written after the summary: a user message, or an assistant message with its tool results.',
+				isPositiveInteger: true,
+				key: SETTINGS_KEYS.COMPACTION_PRESERVED_STEPS,
+				label: 'Compaction preserved steps',
+				type: SettingsFieldType.INPUT
 			},
 			{
 				defaultValue: false,
@@ -264,7 +287,7 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: false,
-				help: 'Disable automatic scrolling while messages stream so you can control the viewport position manually.',
+				help: 'Stop the view from following new content while messages stream, so you control the viewport position yourself.',
 				key: SETTINGS_KEYS.DISABLE_AUTO_SCROLL,
 				label: 'Disable automatic scroll',
 				type: SettingsFieldType.CHECKBOX
@@ -316,6 +339,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				help: 'Display the organization name alongside model names in the model selector, in the trigger and in the model rows.',
 				key: SETTINGS_KEYS.SHOW_MODEL_ORG_NAME,
 				label: 'Show organization name in model selector',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: false,
+				help: 'Keep the organization name on a phone too, where the model selector is narrow. Applies only while the organization name is shown.',
+				key: SETTINGS_KEYS.SHOW_MODEL_ORG_NAME_ON_MOBILE,
+				label: 'Show organization name on mobile',
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
