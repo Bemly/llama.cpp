@@ -3,7 +3,7 @@
 > This fork targets AMD RX 6800 (RDNA2) on Metal. Default branch is `metal-exact-alloc`.
 > Upstream README continues below. Full notes in Chinese: [readme.zh.md](readme.zh.md).
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
 

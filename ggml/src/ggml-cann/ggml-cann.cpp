@@ -1793,7 +1793,6 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_dup(ctx, dst);
             break;
         case GGML_OP_ADD:
-        case GGML_OP_ADD1:
             ggml_cann_binary_op<aclnn_add>(ctx, dst);
             break;
         case GGML_OP_SUB:
@@ -1957,9 +1956,6 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-            break;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_cann_diag_mask(ctx, dst, -INFINITY);
             break;
         case GGML_OP_SOFT_MAX:
             ggml_cann_softmax(ctx, dst);
@@ -2447,6 +2443,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             break;
         case GGML_OP_MUL_MAT:
             {
+                if (ggml_prec_get_src(op, 1) == GGML_PREC_BF16 || ggml_prec_get_src(op, 1) == GGML_PREC_F32) {
+                    return false;
+                }
                 switch (op->src[0]->type) {
 #ifndef ASCEND_310P
                     case GGML_TYPE_BF16:
@@ -2615,7 +2614,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_TRANSPOSE:
         case GGML_OP_NORM:
         case GGML_OP_ADD:
-        case GGML_OP_ADD1:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -2623,7 +2621,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_CLAMP:
-        case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_ARGSORT:
         case GGML_OP_ACC:

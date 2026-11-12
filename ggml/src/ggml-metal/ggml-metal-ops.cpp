@@ -3792,8 +3792,8 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
         ggml_metal_kargs_flash_attn_ext_amd_reduce args_r = {
             /*.ne02  =*/ ne02,
             /*.ne03  =*/ ne03,
-            /*.nb02  =*/ nb02,
-            /*.nb03  =*/ nb03,
+            /*.nb02  =*/ nbd1,
+            /*.nb03  =*/ nbd3,
             /*.split =*/ split,
         };
 
@@ -4000,8 +4000,8 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
         ggml_metal_kargs_flash_attn_ext_amd_reduce args_r = {
             /*.ne02  =*/ ne02,
             /*.ne03  =*/ ne03,
-            /*.nb02  =*/ nb02,
-            /*.nb03  =*/ nb03,
+            /*.nb02  =*/ nb1,
+            /*.nb03  =*/ nb3,
             /*.split =*/ split,
         };
 
