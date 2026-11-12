@@ -2858,14 +2858,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    // RDNA2 VALU blocked mm (kernels/mmq_amd.metal): dense prefill would
-    // otherwise run as per-row mul_mv dispatches re-reading weights.
-    // Default on, GGML_METAL_MMQ_AMD=0 opts out.
+    // RDNA2 VALU blocked mm (kernels/mmq_amd.metal) for Q4_K/IQ3_S prefill. The register-tiled
+    // manual kernel_mul_mm is 1.4-3x faster on the same types, so this only runs when that path
+    // is disabled; GGML_METAL_MMQ_AMD=1 forces it, =0 turns it off.
     {
         static int mmq_cached = -1;
         if (mmq_cached < 0) {
             const char * val = getenv("GGML_METAL_MMQ_AMD");
-            mmq_cached = (!val || !val[0] || val[0] != '0') ? 1 : 0;
+            mmq_cached = (val && val[0]) ? (val[0] != '0' ? 1 : 0) : (props_dev->use_mm_manual ? 0 : 1);
         }
         const bool mmq_gate =
             mmq_cached == 1 &&
@@ -2900,6 +2900,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                     /*.ne1  =*/ ne1,
                     /*.r2   =*/ r2,
                     /*.r3   =*/ r3,
+                    /*.band =*/ 0,
                 },
                 ne12, ne13, r2, r3,
             };
@@ -3029,7 +3030,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
-    } else if (ggml_metal_op_mul_mat_use_mm(op, props_dev->has_simdgroup_mm)) {
+    } else if (ggml_metal_op_mul_mat_use_mm(op, props_dev->has_simdgroup_mm || props_dev->use_mm_manual)) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers
@@ -3058,7 +3059,25 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ ne1,
             /*.r2   =*/ r2,
             /*.r3   =*/ r3,
+            /*.band =*/ 0,
         };
+
+        const int nr0 = pipeline.nr0;
+        const int nr1 = pipeline.nr1;
+        const int nsg = pipeline.nsg;
+
+        // bands only pay with a last-level cache that holds them; TOSH_MM_BAND_MB sets another
+        // size, 0 the plain order
+        if (!props_dev->has_simdgroup_mm && !props_dev->has_unified_memory &&
+            (strstr(props_dev->desc, "RX 6") || strstr(props_dev->desc, "W6"))) {
+            static const int64_t band_bytes = (int64_t) (getenv("TOSH_MM_BAND_MB") ? atoi(getenv("TOSH_MM_BAND_MB")) : 16) << 20;
+            const int64_t tile_bytes = (int64_t) nr1*nb11;
+            const int64_t ntx = (ne11 + nr1 - 1)/nr1;
+            if (band_bytes > 0 && tile_bytes > 0) {
+                const int64_t band = std::max<int64_t>(1, band_bytes/tile_bytes);
+                args.band = band < ntx ? (int32_t) band : 0;
+            }
+        }
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -3069,10 +3088,6 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const size_t smem = pipeline.smem;
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-
-        const int nr0 = pipeline.nr0;
-        const int nr1 = pipeline.nr1;
-        const int nsg = pipeline.nsg;
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
     } else {
