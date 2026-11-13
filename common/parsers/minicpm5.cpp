@@ -105,7 +105,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
             auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
             auto tool_calls = p.trigger_rule("tool-call", p.repeat(tool_choice + p.space(), 1, max_calls));
 
-            auto content = p.content(p.until("<function"));
+            auto content = p.required_preamble(p.content(p.until("<function")), "<function", inputs, "<think>", "</think>");
 
             return generation_prompt + reasoning + content + tool_calls + p.end();
         }

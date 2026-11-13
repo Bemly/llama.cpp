@@ -485,6 +485,11 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
+    // the router runs the MCP servers and the Tosh agent; a worker only answers raw inference
+    preset.unset_option("LLAMA_ARG_MCP_SERVERS_CONFIG");
+    preset.unset_option("LLAMA_ARG_MCP_SERVERS_JSON");
+    preset.unset_option("LLAMA_ARG_MCP_AGENT");
+    preset.unset_option("LLAMA_ARG_MCP_AGENT_EXPLICIT");
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");
@@ -2513,9 +2518,12 @@ server_http_proxy::server_http_proxy(
     cli->set_write_timeout(timeout_read, 0); // reversed for cli (client) vs srv (server)
     cli->set_read_timeout(timeout_write, 0);
     this->status = 500; // to be overwritten upon response
-    this->cleanup_pipes = [pipe]() {
+    this->cleanup_pipes = [pipe, cli]() {
         pipe->close_read();
         pipe->close_write();
+        // a request without streaming sends nothing until it is done, so its thread would not notice the
+        // client left: closing the socket lets the worker see it and stop generating
+        cli->stop();
     };
 
     // wire up the receive end of the pipe

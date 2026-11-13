@@ -52,8 +52,18 @@ void ggml_graph_optimize(struct ggml_cgraph * gf);
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);
-bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
-bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
+
+// inline: these run once per matmul node during encode, and a cross-TU call there is not free
+static inline bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
+    static const int ne11_mm_min = 8;
+    return !ggml_is_transposed(op->src[0]) &&
+           !ggml_is_transposed(op->src[1]) &&
+           has_simdgroup_mm && op->src[0]->ne[0] >= 64 && op->src[1]->ne[1] > ne11_mm_min;
+}
+
+static inline bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
+    return has_simdgroup_mm && op->src[0]->ne[0] >= 64 && op->src[2]->ne[1] >= 32;
+}
 
 bool ggml_metal_op_mul_mat_use_mma    (const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op); // graph structure only

@@ -92,6 +92,7 @@ std::map<std::string, bool> caps::to_map() const {
         {"supports_tool_calls", supports_tool_calls},
         {"supports_parallel_tool_calls", supports_parallel_tool_calls},
         {"supports_system_role", supports_system_role},
+        {"supports_late_system", supports_late_system},
         {"supports_preserve_reasoning", supports_preserve_reasoning},
         {"supports_reasoning_effort", supports_reasoning_effort},
         {"supports_object_arguments", supports_object_arguments},
@@ -211,6 +212,32 @@ caps caps_get(jinja::program & prog) {
             }
         }
     );
+
+    JJ_DEBUG("%s\n", ">>> Running capability check: late system message");
+
+    // case: a system message in the middle of the conversation, as agent hooks send
+    if (result.supports_system_role) {
+        static const std::string late_marker = "LATE_SYSTEM_MARKER";
+        caps_try_execute(
+            prog,
+            [&]() {
+                return json::array({
+                    {{"role", "system"},    {"content", "System message"}},
+                    {{"role", "user"},      {"content", "User message"}},
+                    {{"role", "assistant"}, {"content", "Assistant message"}},
+                    {{"role", "system"},    {"content", late_marker}},
+                    {{"role", "user"},      {"content", "User message"}},
+                });
+            },
+            nullptr, // ctx_fn
+            nullptr, // tools_fn
+            [&](context &, bool success, value &, value &, const std::string & rendered) {
+                if (!success || rendered.find(late_marker) == std::string::npos) {
+                    result.supports_late_system = false;
+                }
+            }
+        );
+    }
 
     JJ_DEBUG("%s\n", ">>> Running capability check: single tool with object arguments support");
 

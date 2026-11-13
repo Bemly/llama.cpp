@@ -9,14 +9,14 @@ kernel void kernel_op_sum_f32(
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgptg[[threads_per_simdgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
 
     if (args.np == 0) {
         return;
     }
 
-    // TODO: become function constant
-    const uint nsg = (ntg.x + 31) / 32;
+    const uint nsg = (ntg.x + sgptg - 1) / sgptg;
 
     float sumf = 0;
 
@@ -127,6 +127,7 @@ kernel void kernel_cumsum_blk(
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgptg[[threads_per_simdgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
     const int ib = tgpig[0]/args.ne01;
 
@@ -142,6 +143,14 @@ kernel void kernel_cumsum_blk(
 
     threadgroup float * shmem_f32 = (threadgroup float *) shmem;
 
+    // zero the real simd width so the exclusive prefix below reads neutral
+    // values past the live simdgroups (keeps wave64 in bounds too)
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     float v = 0.0f;
 
     if (i00 + tpitg.x < args.ne00) {
@@ -150,7 +159,8 @@ kernel void kernel_cumsum_blk(
 
     float s = simd_prefix_inclusive_sum(v);
 
-    if (tiisg == N_SIMDWIDTH - 1) {
+    // the simdgroup total lives in the last lane of the real width (63 on wave64)
+    if (tiisg == sgptg - 1) {
         shmem_f32[sgitg] = s;
     }
 

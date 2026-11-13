@@ -157,6 +157,9 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors (Prism ML)
+        LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY  = 142, // same format, ftype written by older Prism ML packers
+        LLAMA_FTYPE_MOSTLY_PTQ1_0        = 143, // except 1d tensors (Prism ML)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -927,6 +930,9 @@ extern "C" {
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
+
+// a cached copy that may be stored in a smaller type; never for a state that must come back exact
+#define LLAMA_STATE_SEQ_FLAGS_COMPACT 4
 
     typedef uint32_t llama_state_seq_flags;
 
@@ -1719,7 +1725,21 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        // Optional checkpoint loading
+        const char * checkpoint_path;        // path to checkpoint file to load optimizer state from (nullptr = don't load)
+        bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
+
+        bool assistant_loss_only;
+
+        // keep flash attention during training; backends without FLASH_ATTN_EXT_BACK run it on the CPU
+        bool flash_attn;
+
+        // the global norm of the LoRA gradients is clipped to this before each step (0 = off)
+        float grad_clip;
     };
+
+    LLAMA_API struct llama_opt_params llama_opt_default_params(void);
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
@@ -1731,6 +1751,84 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    LLAMA_API void llama_opt_epoch_resume(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_split,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval,
+            int64_t                   resume_from_batch);
+
+    // Optimizer state persistence
+    LLAMA_API bool llama_opt_save_state(struct llama_context * lctx, const char * filename);
+    LLAMA_API bool llama_opt_load_state(struct llama_context * lctx, const char * filename);
+
+    // Clean up optimizer context to free memory and allow reinitialization
+    // Call this before calling llama_opt_init() again on the same context
+    LLAMA_API void llama_opt_cleanup(struct llama_context * lctx);
+
+    // Request early exit from training epoch (thread-safe)
+    // Call this from a callback or another thread to stop training after the current batch
+    LLAMA_API void llama_opt_request_stop(struct llama_context * lctx);
+
+    // Reset the stop flag to allow training to continue
+    // Call this before resuming training after a pause
+    LLAMA_API void llama_opt_reset_stop(struct llama_context * lctx);
+
+    // LoRA training parameters
+    enum llama_lora_target_module {
+        LLAMA_LORA_TARGET_ATTN_Q            = 1 << 0,
+        LLAMA_LORA_TARGET_ATTN_K            = 1 << 1,
+        LLAMA_LORA_TARGET_ATTN_V            = 1 << 2,
+        LLAMA_LORA_TARGET_ATTN_O            = 1 << 3,
+        LLAMA_LORA_TARGET_FFN_GATE          = 1 << 4,
+        LLAMA_LORA_TARGET_FFN_UP            = 1 << 5,
+        LLAMA_LORA_TARGET_FFN_DOWN          = 1 << 6,
+        LLAMA_LORA_TARGET_OUTPUT            = 1 << 7,
+        LLAMA_LORA_TARGET_FFN_GATE_EXPS     = 1 << 8,
+        LLAMA_LORA_TARGET_FFN_UP_EXPS       = 1 << 9,
+        LLAMA_LORA_TARGET_FFN_DOWN_EXPS     = 1 << 10,
+        LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS  = 1 << 11,
+        LLAMA_LORA_TARGET_ALL               = -1
+    };
+
+    struct llama_lora_training_params {
+        uint32_t target_modules;
+        int32_t  rank;
+        float    alpha;
+        float    dropout;    // reserved, not yet implemented
+        float    init_std;
+        uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
+    };
+
+    // Initialize LoRA training with the given parameters
+    // Creates LoRA tensors and adds them to the model context
+    LLAMA_API struct llama_adapter_lora * llama_lora_training_init(
+            struct llama_context * ctx,
+            struct llama_model * model,
+            const struct llama_lora_training_params * params
+    );
+
+    // LoRA parameter filter (returns true for LoRA tensors only)
+    LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
+
+    LLAMA_API int64_t llama_opt_get_iter(struct llama_context * ctx);
+
+    LLAMA_API bool llama_lora_save_adapter(
+        const struct llama_adapter_lora * adapter,
+        const char * filename,
+        const struct llama_model * model
+    );
+
+    LLAMA_API bool llama_lora_save_checkpoint(
+        const struct llama_adapter_lora * adapter,
+        const char * filename,
+        const struct llama_model * model,
+        struct llama_context * ctx
+    );
 
 #ifdef __cplusplus
 }

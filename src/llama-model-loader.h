@@ -48,6 +48,13 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // for tensors that are not in the file but read a slice of one that is
+        llama_tensor_weight(const llama_file * file, uint16_t idx, size_t offs, ggml_tensor * tensor) : idx(idx), offs(offs), tensor(tensor) {
+            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+                throw std::runtime_error(format("tensor '%s' data is not within the file bounds", ggml_get_name(tensor)));
+            }
+        }
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -70,6 +77,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_FUSE_GATE_UP    = 1 << 6; // build one tensor out of the file's gate and up experts
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -124,6 +132,16 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+
+    // a tensor the file does not have, built by interleaving two of its tensors per expert
+    struct llama_tensor_fused {
+        uint16_t idx;      // source file
+        size_t   offs_a;   // first source (gate), start of its data
+        size_t   offs_b;   // second source (up)
+        size_t   stride;   // bytes of one expert in a source
+        int64_t  n_expert;
+    };
+    std::map<std::string, llama_tensor_fused> fused_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 

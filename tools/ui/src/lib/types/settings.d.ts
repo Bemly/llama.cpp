@@ -1,6 +1,7 @@
 import type { ChatMessagePromptProgress, ChatMessageTimings } from './chat';
 import type { DatabaseMessageExtra } from './database';
 import type { OpenAIToolDefinition } from './mcp';
+import type { ToshChunk } from './tosh';
 import type { Icon } from '@lucide/svelte';
 import type { SETTING_CONFIG_DEFAULT, SETTINGS_SECTION_TITLES } from '$lib/constants';
 import type {
@@ -129,6 +130,9 @@ export interface SettingsChatServiceOptions {
 	onModel?: (model: string) => void;
 	onCompletionId?: (id: string) => void;
 	onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void;
+	onTosh?: (tosh: ToshChunk) => void;
+	/** "off" asks a server with a Tosh agent for raw inference, as an internal request such as a title wants */
+	toshAgent?: 'off';
 	onComplete?: (
 		response: string,
 		reasoningContent?: string,

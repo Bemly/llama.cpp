@@ -87,6 +87,9 @@ extern "C" {
 
     GGML_API void ggml_backend_tensor_set_async   (ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
     GGML_API void ggml_backend_tensor_get_async   (ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
+    // group the device-to-host reads between begin and end into as few waits as the backend allows
+    GGML_API void ggml_backend_read_batch_begin(ggml_backend_t backend);
+    GGML_API void ggml_backend_read_batch_end  (ggml_backend_t backend);
     GGML_API void ggml_backend_tensor_set_2d_async(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
 
@@ -321,6 +324,13 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // A second scheduler plans into this one's buffers; free the borrower before the owner.
+    GGML_API void                 ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src);
+    // Point the backends and the compute buffers at one of the two prepared shape slots.
+    GGML_API void                 ggml_backend_sched_set_shape_slot(ggml_backend_sched_t sched, int slot);
+    // Drop the state prepared for one slot, before building a different shape into it.
+    GGML_API void                 ggml_backend_sched_reset_shape_slot(ggml_backend_sched_t sched, int slot);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
@@ -404,6 +414,13 @@ extern "C" {
     // create a new meta device from "simple" devices, meta buffer type/buffer/backend is then derived from this:
     // TODO: this looks a bit strange - a backend API creates a device. I think we should try
     //       express this as a backend registry functionality instead
+    // Two prepared sets of per-device state, so alternating graph shapes costs no rebuild.
+    // -1 turns the slots off and restores the rotating containers.
+    GGML_API void ggml_backend_meta_set_shape_slot(ggml_backend_t meta_backend, int slot);
+    GGML_API void ggml_backend_meta_reset_shape_slot(ggml_backend_t meta_backend, int slot);
+    GGML_API void ggml_backend_meta_buffer_set_shape_slot(ggml_backend_buffer_t buffer, int slot);
+    GGML_API void ggml_backend_meta_buffer_reset_shape_slot(ggml_backend_buffer_t buffer, int slot);
+
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 

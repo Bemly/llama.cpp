@@ -47,6 +47,12 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
+
+// Plan into another allocator's buffers without owning them: the borrower never frees or grows
+// them, and a plan that needs more memory fails instead.
+GGML_API void           ggml_gallocr_share_buffers(ggml_gallocr_t dst, ggml_gallocr_t src);
+GGML_API void           ggml_gallocr_set_shape_slot(ggml_gallocr_t galloc, int slot);
+GGML_API void           ggml_gallocr_reset_shape_slot(ggml_gallocr_t galloc, int slot);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph

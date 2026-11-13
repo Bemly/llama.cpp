@@ -208,12 +208,15 @@ struct clip_hparams {
     }
 
     void set_warmup_n_tokens(int n_tokens) {
-        int n_tok_per_side = static_cast<int>(std::sqrt(n_tokens));
-        GGML_ASSERT(n_tok_per_side * n_tok_per_side == n_tokens && "n_tokens must be n*n");
-        // do not warmup with more tokens than the max allowed
-        if (custom_image_max_tokens > 0 && n_tokens > custom_image_max_tokens) {
-            n_tok_per_side = std::max(1, static_cast<int>(std::sqrt(custom_image_max_tokens)));
+        // the cap has to shrink the warmup too: without flash attention this graph holds the
+        // whole score matrix, and on a small card it is the warmup that fails to allocate
+        const bool capped = custom_image_max_tokens > 0 && custom_image_max_tokens < n_tokens;
+        if (capped) {
+            n_tokens = custom_image_max_tokens;
         }
+        int n_tok_per_side = static_cast<int>(std::sqrt(n_tokens));
+        GGML_ASSERT(n_tok_per_side > 0);
+        GGML_ASSERT((capped || n_tok_per_side * n_tok_per_side == n_tokens) && "n_tokens must be n*n");
         warmup_image_size = n_tok_per_side * patch_size * n_merge;
     }
     // sam vit deepseek-ocr

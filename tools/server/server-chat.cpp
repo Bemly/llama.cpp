@@ -107,8 +107,10 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 chatcmpl_messages.push_back(item);
             } else if (exists_and_is_string(item, "role") &&
                 item.at("role") == "assistant" &&
-                exists_and_is_string(item, "type") &&
-                item.at("type") == "message"
+                // 'type' is optional on an output message, and clients replaying a
+                // stream they cut short send the turn without it
+                (!item.contains("type") ||
+                    (exists_and_is_string(item, "type") && item.at("type") == "message"))
             ) {
                 // #responses_create-input-input_item_list-item-output_message
                 auto chatcmpl_content = json::array();

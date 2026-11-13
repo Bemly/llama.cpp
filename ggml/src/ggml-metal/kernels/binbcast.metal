@@ -165,6 +165,10 @@ template [[host_name("kernel_bin_fuse_f32_f32_f32")]]   kernel kernel_bin_fuse_t
 template [[host_name("kernel_bin_fuse_f32_f32_f32_4")]] kernel kernel_bin_fuse_t kernel_bin_fuse_impl<float4, float4, float4>;
 template [[host_name("kernel_bin_fuse_f16_f16_f16")]]   kernel kernel_bin_fuse_t kernel_bin_fuse_impl<half,   half,   half>;
 template [[host_name("kernel_bin_fuse_f16_f16_f16_4")]] kernel kernel_bin_fuse_t kernel_bin_fuse_impl<half4,  half4,  half4>;
+// f16 src1 against an f32 accumulator: the upcast add for the f16 allreduce transport.
+// (bf16 src1 is deliberately not instantiated: the scalar bf16e kernels fault the AMD driver
+// on these cards - see .bench/bf16-stage/fault-hunt.md.)
+template [[host_name("kernel_bin_fuse_f32_f16_f32")]]   kernel kernel_bin_fuse_t kernel_bin_fuse_impl<float,  half,   float>;
 
 kernel void kernel_add_id(
         constant ggml_metal_kargs_add_id & args,
@@ -224,5 +228,40 @@ template [[host_name("kernel_repeat_f16")]] kernel kernel_repeat_t kernel_repeat
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_repeat_bf16")]] kernel kernel_repeat_t kernel_repeat<bfloat>;
 #endif
+
+// gradient of a repeat: each dst element sums its copies in src (src index = dst index + r*ne)
+kernel void kernel_repeat_back_f32(
+        constant ggml_metal_kargs_repeat & args,
+        device const char * src0,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = tgpig.x;
+
+    const int nr0 = args.ne00/args.ne0;
+    const int nr1 = args.ne01/args.ne1;
+    const int nr2 = args.ne02/args.ne2;
+    const int nr3 = args.ne03/args.ne3;
+
+    device char * dst_ptr = dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        float sum = 0.0f;
+        for (int r3 = 0; r3 < nr3; ++r3) {
+            for (int r2 = 0; r2 < nr2; ++r2) {
+                for (int r1 = 0; r1 < nr1; ++r1) {
+                    device const char * row = src0 + (i3 + r3*args.ne3)*args.nb03 + (i2 + r2*args.ne2)*args.nb02 + (i1 + r1*args.ne1)*args.nb01;
+                    for (int r0 = 0; r0 < nr0; ++r0) {
+                        sum += *((device const float *)(row + (i0 + r0*args.ne0)*args.nb00));
+                    }
+                }
+            }
+        }
+        *((device float *)(dst_ptr + i0*args.nb0)) = sum;
+    }
+}
 template [[host_name("kernel_repeat_i32")]] kernel kernel_repeat_t kernel_repeat<int>;
 template [[host_name("kernel_repeat_i16")]] kernel kernel_repeat_t kernel_repeat<short>;

@@ -430,7 +430,15 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant
+        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant
+        GGML_TYPE_TURBO4_0 = 45, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
+        GGML_TYPE_TQ3_1S  = 46, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
+        GGML_TYPE_TQ4_1S  = 47, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        // Prism ML types; the ids match the published GGUFs, and 48..141 are unused
+        GGML_TYPE_PQ2_0   = 142, // Q2_0 codec at group 128
+        GGML_TYPE_PTQ1_0  = 143, // ternary at group 128
+        GGML_TYPE_COUNT   = 144,
     };
 
     // [TAG_GGML_PREC]
@@ -454,6 +462,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_GRADIENT         = 2, // the product is a gradient: backends that sum in half accumulate in f32
     };
 
     // model file types
@@ -486,6 +495,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0   = 128, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PTQ1_0  = 129, // except 1d tensors
     };
 
     // available tensor operations:
@@ -585,6 +596,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_TURBO_WHT,
 
         GGML_OP_UNARY,
 
@@ -600,6 +612,16 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_TOSH_DMOE_PUBLISH,
+        GGML_OP_TOSH_DMOE_JOIN,
+        GGML_OP_TOSH_DMOE_OBSERVE,
+
+        GGML_OP_COUNT_EQUAL_MASKED,
+        GGML_OP_CROSS_ENTROPY_ROWS,
+        GGML_OP_CROSS_ENTROPY_ROWS_BACK,
+        GGML_OP_FLASH_ATTN_EXT_BACK,
+        GGML_OP_GATED_DELTA_NET_BACK,
 
         GGML_OP_COUNT,
     };
@@ -1080,6 +1102,13 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // number of rows where a equals b and the mask is set
+    GGML_API struct ggml_tensor * ggml_count_equal_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // predictions, i32 [n]
+            struct ggml_tensor  * b,  // targets, i32 [n]
+            struct ggml_tensor  * c); // mask, f32 [n]: 1 for rows to count, 0 to skip
+
     // if a is the same shape as b, and a is not parameter, return a
     // otherwise, return a new tensor: repeat(a) to fit in b
     GGML_API struct ggml_tensor * ggml_repeat(
@@ -1497,6 +1526,45 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    // Mixed expert execution: publish hands the layer's routing to a host executor and returns,
+    // per routed expert, its resident slot or -1; join takes the resident rows from `gpu` and the
+    // rest from the host. Both run on one backend, so the layer never splits the graph.
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_publish(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,        // [n_embd, n_tokens] f32
+            struct ggml_tensor  * ids,        // [n_expert_used, n_tokens] i32
+            struct ggml_tensor  * residency,  // [n_expert] i32, slot or -1
+            int                   il);
+
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gpu,        // [n_embd, n_expert_used, n_tokens] f32
+            struct ggml_tensor  * slots,      // publish's result
+            int                   il);
+
+    // wide batches: ids of experts routed to at most `rows` rows of the chunk and not resident
+    // become -1, and the host computes them; join_wide writes the host rows in place
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_publish_wide(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * residency,
+            int                   il,
+            int                   rows,
+            int                   tail);      // the chunk's last `tail` tokens stay on the GPU
+
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_join_wide(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gpu,
+            struct ggml_tensor  * wide_ids,
+            int                   il);
+
+    // copies a layer's routing to the host for the residency policy, nothing else
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_observe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,        // [n_expert_used, n_tokens] i32
+            int                   il);
+
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
@@ -2521,6 +2589,28 @@ extern "C" {
            struct ggml_tensor  * d,
            bool                  masked);
 
+    enum ggml_flash_attn_ext_back_target {
+        GGML_FLASH_ATTN_EXT_BACK_STATS = 0, // [2, n_batch, n_head, ne3]: (logsumexp, dot(grad_o, o)) per q row
+        GGML_FLASH_ATTN_EXT_BACK_DQ    = 1, // same shape as q
+        GGML_FLASH_ATTN_EXT_BACK_DKV   = 2, // [n_embd_k, n_kv, n_head_kv, 2*ne3]: dk in ne3 [0, ne3), dv in [ne3, 2*ne3)
+    };
+
+    // backward of ggml_flash_attn_ext in 3 passes, the softmax is recomputed per row
+    // o:      the ggml_flash_attn_ext result, its op_params are reused
+    // grad_o: gradient of o, same shape
+    // stats:  result of the STATS target, NULL for STATS
+    // requires n_embd_k == n_embd_v, no sinks, max_bias == 0, logit_softcap == 0
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * o,
+            struct ggml_tensor  * grad_o,
+            struct ggml_tensor  * stats,
+            enum ggml_flash_attn_ext_back_target target);
+
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
@@ -2658,6 +2748,31 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // g and beta arrive before their activations (scalar gate only):
+    //   beta -> sigmoid(beta), g -> a[h] * softplus(g + dt_bias[h])
+    // dt_bias and a are F32 with one value per head
+    // backward of ggml_gated_delta_net with a scalar gate: the gradients of q, k, v, g, beta and the initial state,
+    // packed in that order in one f32 vector; grad is the gradient of the op's output (its state rows are ignored)
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * grad);
+
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * a);
+
+    // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
+    // Applies WHT rotation to 128-element groups along ne[0]: sign1 -> butterfly -> sign2 -> normalize
+    // direction: 0 = forward (signs1 -> WHT -> signs2), 1 = inverse (signs2 -> WHT -> signs1)
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction,
+            int                   group_size,    // 0 = auto (64 or 128 from ne[0])
+            struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
 
     // DSA lightning indexer
     //
@@ -2819,6 +2934,25 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    // cross-entropy of each row of logits against one label index per row: logsumexp(a[:, r]) - a[b[r], r]
+    GGML_API struct ggml_tensor * ggml_cross_entropy_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // logits, f32 [n_classes, n]
+            struct ggml_tensor  * b); // labels, i32 [n]
+    GGML_API struct ggml_tensor * ggml_cross_entropy_rows_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // gradient of each row's loss, f32 [n]
+            struct ggml_tensor  * b,  // logits, f32 [n_classes, n]
+            struct ggml_tensor  * c); // labels, i32 [n]
+
+    // mean cross-entropy over the rows whose mask is set (assistant-only loss for instruction tuning),
+    // 0 when no row is: sum(rows*mask) / max(sum(mask), 1)
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // logits, f32 [n_classes, n]
+            struct ggml_tensor  * b,  // labels, i32 [n]
+            struct ggml_tensor  * c); // mask, f32 [n]: 1 for rows in the loss, 0 for the rest
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

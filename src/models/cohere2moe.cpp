@@ -40,18 +40,9 @@ void llama_model_cohere2moe::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_cohere2moe::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
-    // Trunk-only: the GGUF declares MTP layers in metadata but the actual MTP
-    // tensors live in a separate file. Mark MTP tensors NOT_REQUIRED so the
-    // trunk loads cleanly.
-    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
-    const bool trunk_only = (hparams.n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
-    const int trunk_flags = mtp_only  ? TENSOR_NOT_REQUIRED : 0;
-    int mtp_flags         = trunk_only ? TENSOR_NOT_REQUIRED : 0;
-
-    if (!ml.load_mtp) {
-        mtp_flags |= TENSOR_SKIP;
-    }
+    const auto nf = nextn_flags(ml);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -334,8 +325,10 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
 
     res->add_input(std::move(inp));
 
+    const bool kv_only = mtp_kv_only();
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
     auto * inp_attn = build_attn_inp_kv_iswa();
 
     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, cohere2moe_norm_type, il);
@@ -370,6 +363,11 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
     cb(Qcur, "mtp_Qcur", il);
     cb(Kcur, "mtp_Kcur", il);
     cb(Vcur, "mtp_Vcur", il);
+
+    if (kv_only) {
+        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
+        return;
+    }
 
     cur = build_attn(inp_attn,
             layer.wo, layer.wo_b, layer.wo_s,

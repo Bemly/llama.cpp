@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <vector>
 
@@ -209,13 +210,31 @@ struct llama_context {
             ggml_opt_result_t       result_eval,
             int64_t                 idata_split,
             ggml_opt_epoch_callback callback_train,
-            ggml_opt_epoch_callback callback_eval);
+            ggml_opt_epoch_callback callback_eval,
+            int64_t                 resume_from_batch = -1);
+
+    // Optimizer state access for checkpointing (delegated to ggml_opt API)
+    int64_t opt_get_iter();
+
+    // Optimizer state persistence
+    bool opt_save_state(const char* filename);
+    bool opt_load_state(const char* filename);
+
+    // Clean up optimizer context to free memory and allow reinitialization
+    void opt_cleanup();
+
+    // Request early exit from training epoch (thread-safe)
+    void opt_request_stop();
+
+    // Reset the stop flag to allow training to continue
+    void opt_reset_stop();
 
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
+            const std::vector<int32_t>     & masks_sparse,
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,
@@ -361,6 +380,16 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    uint32_t original_n_ctx_train = 0;
+
+    // optimizer state loading (deferred until after ggml_opt_build)
+    std::string pending_optimizer_checkpoint_path;
+    bool should_load_optimizer_tensors = false;
+    bool optimizer_tensors_loaded = false;
+    ggml_opt_loss_type opt_loss_type = GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
+
+    // early exit flag for training epochs (thread-safe)
+    std::atomic<bool> training_should_stop{ false };
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
@@ -380,6 +409,24 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // the Hadamard transform coverage is checked once, on the first reserved graph
+    bool hadamard_verified = false;
+
+    // A second prepared {graph, scheduler} pair, so a session alternating between two shapes
+    // rebuilds neither. It borrows the first one's buffers, and is declared after `sched` so it
+    // is destroyed before them.
+    std::array<llm_graph_result_ptr, 2> gf_res_alt;
+    llm_graph_result *     gf_res_alt_active = nullptr;
+    ggml_backend_sched_ptr sched_alt;
+    ggml_backend_sched_t   sched_owner = nullptr; // the scheduler that owns the compute buffers
+    int                    shape_slot  = 0;
+    int                    shape_slots_filled = 0;
+
+    // Drop the second prepared shape and go back to a single scheduler.
+    void shape_cache_disable();
+    // Both prepared shapes are stale: rebuild them on next use.
+    void shape_cache_invalidate();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -493,7 +493,47 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // set on an allocator that plans into another one's buffers
+    bool shared;
 };
+
+void ggml_gallocr_share_buffers(ggml_gallocr_t dst, ggml_gallocr_t src) {
+    GGML_ASSERT(dst->n_buffers == src->n_buffers);
+    for (int i = 0; i < dst->n_buffers; i++) {
+        GGML_ASSERT(dst->buffers[i] == NULL);
+        dst->buffers[i] = src->buffers[i];
+    }
+    dst->shared = true;
+}
+
+// The per-shape state lives in the compute buffers, reachable only through their allocator.
+static void ggml_gallocr_shape_slot(ggml_gallocr_t galloc, int slot, bool reset) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+            continue;
+        }
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+            ggml_backend_buffer_t chunk = galloc->buffers[i]->chunks[c];
+            if (chunk == NULL) {
+                continue;
+            }
+            if (reset) {
+                ggml_backend_meta_buffer_reset_shape_slot(chunk, slot);
+            } else {
+                ggml_backend_meta_buffer_set_shape_slot(chunk, slot);
+            }
+        }
+    }
+}
+
+void ggml_gallocr_set_shape_slot(ggml_gallocr_t galloc, int slot) {
+    ggml_gallocr_shape_slot(galloc, slot, false);
+}
+
+void ggml_gallocr_reset_shape_slot(ggml_gallocr_t galloc, int slot) {
+    ggml_gallocr_shape_slot(galloc, slot, true);
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -550,7 +590,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
                     break;
                 }
             }
-            if (!freed) {
+            if (!freed && !galloc->shared) {
                 ggml_vbuffer_free(galloc->buffers[i]);
             }
         }
@@ -922,6 +962,12 @@ static bool ggml_gallocr_reserve_n_impl(
                 realloc = true;
             }
         }
+        if (realloc && galloc->shared) {
+            // too small for this plan: fail, rather than free memory this allocator does not own
+            GGML_LOG_DEBUG("%s: shared %s buffer would have to grow to %.02f MiB\n",
+                __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size / 1024.0 / 1024.0);
+            return false;
+        }
         if (realloc) {
 #ifndef NDEBUG
             {
@@ -1043,6 +1089,19 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #endif
                 return true;
             }
+        }
+    }
+
+
+    // check leafs
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
+        if (!ggml_gallocr_node_needs_realloc(galloc, leaf, &leaf_alloc->leaf)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, leaf->name);
+#endif
+            return true;
         }
     }
 

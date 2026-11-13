@@ -782,7 +782,6 @@ size_t llama_memory_recurrent::size_p_bytes() const {
 }
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    GGML_UNUSED(flags);
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
@@ -859,7 +858,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    state_write_data(io, cell_ranges_data, (flags & LLAMA_STATE_SEQ_FLAGS_COMPACT) && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -912,7 +911,33 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+// cached copies of an f32 state stay exact by default: a rounded copy changes what the model answers after a restore
+static ggml_type rs_save_type() {
+    static const ggml_type t = [] {
+        const char * e = getenv("TOSH_RS_STATE_TYPE");
+        const std::string v = e ? e : "f32";
+        return v == "f16" ? GGML_TYPE_F16 : v == "bf16" ? GGML_TYPE_BF16 : v == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
+    }();
+    return t;
+}
+
+static bool rs_save_small(const ggml_tensor * t, bool compact) {
+    return compact && rs_save_type() != GGML_TYPE_F32 && t->type == GGML_TYPE_F32 && ggml_nelements(t) > 0;
+}
+
+static void rs_write_small(llama_io_write_i & io, ggml_tensor * t, size_t offset, size_t size, int64_t n_per_row) {
+    io.write_tensor_quantized(t, offset, size, rs_save_type(), n_per_row);
+}
+
+static void rs_read_small(llama_io_read_i & io, ggml_type type, ggml_tensor * t, size_t offset, size_t size, int64_t n_per_row) {
+    std::vector<float> f(size/sizeof(float));
+    std::vector<uint8_t> q(ggml_row_size(type, n_per_row)*(f.size()/n_per_row));
+    io.read(q.data(), q.size());
+    ggml_get_type_traits(type)->to_float(q.data(), f.data(), (int64_t) f.size());
+    ggml_backend_tensor_set(t, f.data(), offset, size);
+}
+
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, bool compact) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
@@ -925,20 +950,27 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
         if (r_l[il] == nullptr) continue;
 
+        const bool r_small = rs_save_small(r_l[il], compact);
+
         // Write R tensor type
-        const int32_t r_type_i = (int32_t)r_l[il]->type;
+        const int32_t r_type_i = r_small ? (int32_t) rs_save_type() : (int32_t)r_l[il]->type;
         io.write(&r_type_i, sizeof(r_type_i));
 
         // Write row size of R tensor
         const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-        io.write(&r_size_row, sizeof(r_size_row));
+        const uint64_t r_size_row_w = r_small ? ggml_row_size(rs_save_type(), hparams.n_embd_r()) : r_size_row;
+        io.write(&r_size_row_w, sizeof(r_size_row_w));
 
         // Write each logical cell row range. With pending recurrent rollback,
         // the logical current state may live in a rollback snapshot plane.
         for (const auto & range : cell_ranges) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * r_size_row;
-            io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+            if (r_small) {
+                rs_write_small(io, r_l[il], range.first * r_size_row, buf_size, hparams.n_embd_r());
+            } else {
+                io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+            }
         }
 
         // the PLE conv history is a second recurrent row, so it has to travel with the first
@@ -958,20 +990,27 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
 
+            const bool s_small = rs_save_small(s_l[il], compact);
+
             // Write S tensor type
-            const int32_t s_type_i = (int32_t)s_l[il]->type;
+            const int32_t s_type_i = s_small ? (int32_t) rs_save_type() : (int32_t)s_l[il]->type;
             io.write(&s_type_i, sizeof(s_type_i));
 
             // Write row size of S tensor
             const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            io.write(&s_size_row, sizeof(s_size_row));
+            const uint64_t s_size_row_w = s_small ? ggml_row_size(rs_save_type(), hparams.n_embd_s()) : s_size_row;
+            io.write(&s_size_row_w, sizeof(s_size_row_w));
 
             // Write each logical cell row range. With pending recurrent rollback,
             // the logical current state may live in a rollback snapshot plane.
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                if (s_small) {
+                    rs_write_small(io, s_l[il], range.first * s_size_row, buf_size, hparams.n_embd_s());
+                } else {
+                    io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                }
             }
         }
     } else {
@@ -1136,7 +1175,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         int32_t r_type_i_ref;
         io.read(&r_type_i_ref, sizeof(r_type_i_ref));
         const int32_t r_type_i = (int32_t) r_l[il]->type;
-        if (r_type_i != r_type_i_ref) {
+        const bool r_small = r_type_i == GGML_TYPE_F32 && (r_type_i_ref == GGML_TYPE_F16 || r_type_i_ref == GGML_TYPE_BF16 || r_type_i_ref == GGML_TYPE_Q8_0);
+        if (r_type_i != r_type_i_ref && !r_small) {
             LLAMA_LOG_ERROR("%s: mismatched r type (%d != %d, layer %d)\n", __func__, r_type_i, r_type_i_ref, il);
             return false;
         }
@@ -1145,14 +1185,19 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         uint64_t r_size_row_ref;
         io.read(&r_size_row_ref, sizeof(r_size_row_ref));
         const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-        if (r_size_row != r_size_row_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched r row size (%zu != %zu, layer %d)\n", __func__, r_size_row, (size_t) r_size_row_ref, il);
+        const size_t r_size_row_s = r_small ? ggml_row_size((ggml_type) r_type_i_ref, hparams.n_embd_r()) : r_size_row;
+        if (r_size_row_s != r_size_row_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched r row size (%zu != %zu, layer %d)\n", __func__, r_size_row_s, (size_t) r_size_row_ref, il);
             return false;
         }
 
         if (cell_count) {
             // Read and set the keys for the whole cell range
-            io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+            if (r_small) {
+                rs_read_small(io, (ggml_type) r_type_i_ref, r_l[il], head * r_size_row, cell_count * r_size_row, hparams.n_embd_r());
+            } else {
+                io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+            }
         }
 
         if (p_l[il] != nullptr) {
@@ -1179,8 +1224,9 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             int32_t s_type_i_ref;
             io.read(&s_type_i_ref, sizeof(s_type_i_ref));
             const int32_t s_type_i = (int32_t)s_l[il]->type;
+            const bool s_small = s_type_i == GGML_TYPE_F32 && (s_type_i_ref == GGML_TYPE_F16 || s_type_i_ref == GGML_TYPE_BF16 || s_type_i_ref == GGML_TYPE_Q8_0);
 
-            if (s_type_i != s_type_i_ref) {
+            if (s_type_i != s_type_i_ref && !s_small) {
                 LLAMA_LOG_ERROR("%s: mismatched s type (%d != %d, layer %d)\n", __func__, s_type_i, s_type_i_ref, il);
                 return false;
             }
@@ -1189,14 +1235,19 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             uint64_t s_size_row_ref;
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
             const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            if (s_size_row != s_size_row_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
+            const size_t s_size_row_s = s_small ? ggml_row_size((ggml_type) s_type_i_ref, hparams.n_embd_s()) : s_size_row;
+            if (s_size_row_s != s_size_row_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row_s, (size_t) s_size_row_ref, il);
                 return false;
             }
 
             if (cell_count) {
                 // Read and set the values for the whole cell range
-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                if (s_small) {
+                    rs_read_small(io, (ggml_type) s_type_i_ref, s_l[il], head * s_size_row, cell_count * s_size_row, hparams.n_embd_s());
+                } else {
+                    io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                }
             }
         }
     } else {

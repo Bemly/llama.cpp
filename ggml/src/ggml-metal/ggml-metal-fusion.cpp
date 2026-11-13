@@ -158,6 +158,36 @@ static bool ggml_metal_fusion_check_norm(
 }
 
 // SSM_CONV + UNARY (silu)
+// SCALE + SILU/SIGMOID [+ SCALE]: plain scales (no bias) around one activation, all F32 and contiguous
+static bool ggml_metal_fusion_check_scale_unary(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const int n = (int) fusion->ops.size();
+    for (int j = 0; j < n; j++) {
+        const ggml_tensor * t = nodes[j];
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || (j > 0 && t->src[0] != nodes[j - 1])) {
+            return false;
+        }
+        if (t->op == GGML_OP_SCALE && (t->src[1] || ggml_get_op_params_f32(t, 1) != 0.0f)) {
+            return false;
+        }
+    }
+    if (nodes[0]->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(nodes[0]->src[0])) {
+        return false;
+    }
+    const ggml_unary_op u = ggml_get_unary_op(nodes[1]);
+    return u == GGML_UNARY_OP_SILU || u == GGML_UNARY_OP_SIGMOID;
+}
+
 static bool ggml_metal_fusion_check_ssm_conv_silu(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -636,6 +666,11 @@ static bool ggml_metal_fusion_check_moe_reduce(
         if (!match.experts->data || !match.weights->data || !match.dst->data) {
             return false;
         }
+
+        // the fused kernel reads experts and weights while writing dst, so dst must not overlap either input
+        if (ggml_metal_fusion_overlap(match.dst, match.experts) || ggml_metal_fusion_overlap(match.dst, match.weights)) {
+            return false;
+        }
     }
 
     return true;
@@ -727,6 +762,9 @@ static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGM
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
+static const std::vector<ggml_op> ops_scale_unary       = { GGML_OP_SCALE, GGML_OP_UNARY };
+static const std::vector<ggml_op> ops_scale_unary_scale = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
+
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
 };
@@ -785,6 +823,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_SCALE_UNARY,    ops_scale_unary_scale,      {},     false, ggml_metal_fusion_check_scale_unary },
+    { GGML_METAL_FUSION_SCALE_UNARY,    ops_scale_unary,            {},     false, ggml_metal_fusion_check_scale_unary },
 };
 
 // ---- alloc deps -----------------------------------------------------------

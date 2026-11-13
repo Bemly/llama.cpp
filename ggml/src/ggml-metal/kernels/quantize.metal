@@ -19,12 +19,21 @@ kernel void kernel_cpy_t_t(
         return;
     }
 
-    const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+    int32_t i3 = i03;
+    int32_t i2 = i02;
+    int32_t i1 = i01;
+    int32_t i0 = 0;
 
-    const int32_t i3 = n/(args.ne2*args.ne1*args.ne0);
-    const int32_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
-    const int32_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
-    const int32_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+    // with the same shape on both sides a row maps to itself, and the 64-bit divisions
+    // below cost more than the copy
+    if (args.ne00 != args.ne0 || args.ne01 != args.ne1 || args.ne02 != args.ne2) {
+        const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+
+        i3 = n/(args.ne2*args.ne1*args.ne0);
+        i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
+        i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
+        i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+    }
 
     device T1 * dst_data = (device T1 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
 
@@ -35,7 +44,41 @@ kernel void kernel_cpy_t_t(
     }
 }
 
+template<typename T0, typename T1>
+kernel void kernel_cpy_contig_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int64_t i = (int64_t) tgpig[0]*ntg[0] + tpitg.x;
+
+    if (i >= args.nk0) {
+        return;
+    }
+
+    ((device T1 *) dst)[i] = (T1) ((device const T0 *) src0)[i];
+}
+
 typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
+
+template [[host_name("kernel_cpy_contig_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   float>;
+template [[host_name("kernel_cpy_contig_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   half>;
+template [[host_name("kernel_cpy_contig_f32_i32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   int32_t>;
+template [[host_name("kernel_cpy_contig_i32_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<int32_t, float>;
+template [[host_name("kernel_cpy_contig_i32_i32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<int32_t, int32_t>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_cpy_contig_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   bfloat>;
+#endif
+template [[host_name("kernel_cpy_contig_f32_bf16e")]]  kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   bf16e>;
+template [[host_name("kernel_cpy_contig_f16_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<half,    float>;
+template [[host_name("kernel_cpy_contig_f16_f16")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<half,    half>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_cpy_contig_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_contig_t_t<bfloat,  float>;
+template [[host_name("kernel_cpy_contig_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_contig_t_t<bfloat,  bfloat>;
+#endif
+template [[host_name("kernel_cpy_contig_bf16e_f32")]]  kernel kernel_cpy_t kernel_cpy_contig_t_t<bf16e,   float>;
 
 template [[host_name("kernel_cpy_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   float>;
 template [[host_name("kernel_cpy_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   half>;
@@ -45,12 +88,43 @@ template [[host_name("kernel_cpy_i32_i32")]]   kernel kernel_cpy_t kernel_cpy_t_
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_cpy_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy_t_t<float,   bfloat>;
 #endif
+template [[host_name("kernel_cpy_f32_bf16e")]]  kernel kernel_cpy_t kernel_cpy_t_t<float,   bf16e>;
 template [[host_name("kernel_cpy_f16_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<half,    float>;
 template [[host_name("kernel_cpy_f16_f16")]]   kernel kernel_cpy_t kernel_cpy_t_t<half,    half>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  float>;
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
 #endif
+template [[host_name("kernel_cpy_bf16e_f32")]]  kernel kernel_cpy_t kernel_cpy_t_t<bf16e,   float>;
+
+// into a contiguous destination of another shape a row lands at its linear index, without the divisions above
+template<typename T0, typename T1>
+kernel void kernel_cpy_flat_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig[2];
+    const int32_t i02 = tgpig[1];
+    const int32_t i01 = ntg[1] == 1 ? tgpig[0]%args.ne01 : tgpig[0]*ntg[1] + tpitg.y;
+    const int32_t iw0 = ntg[1] == 1 ? tgpig[0]/args.ne01 : 0;
+    const int32_t i00 = iw0*ntg[0] + tpitg.x;
+
+    if (i01 >= args.ne01 || i00 >= args.ne00) {
+        return;
+    }
+
+    const int64_t n = (((int64_t) i03*args.ne02 + i02)*args.ne01 + i01)*args.ne00 + i00;
+
+    ((device T1 *) dst)[n] = (T1) *(device const T0 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + i00*args.nb00);
+}
+
+template [[host_name("kernel_cpy_flat_f32_f32")]] kernel kernel_cpy_t kernel_cpy_flat_t_t<float, float>;
+template [[host_name("kernel_cpy_flat_f32_f16")]] kernel kernel_cpy_t kernel_cpy_flat_t_t<float, half>;
+template [[host_name("kernel_cpy_flat_f16_f32")]] kernel kernel_cpy_t kernel_cpy_flat_t_t<half,  float>;
+template [[host_name("kernel_cpy_flat_f16_f16")]] kernel kernel_cpy_t kernel_cpy_flat_t_t<half,  half>;
 
 template<short QK,
          typename block_q,
@@ -94,6 +168,7 @@ typedef decltype(kernel_cpy_f32_q<QK8_0,  block_q8_0,  quantize_q8_0>)  cpy_f_q_
 template [[host_name("kernel_cpy_f32_q8_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK8_0,  block_q8_0,   quantize_q8_0>;
 template [[host_name("kernel_cpy_f32_q1_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK1_0,  block_q1_0,   quantize_q1_0>;
 template [[host_name("kernel_cpy_f32_q2_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK2_0,  block_q2_0,   quantize_q2_0>;
+template [[host_name("kernel_cpy_f32_pq2_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK_PQ2_0, block_pq2_0,   quantize_pq2_0>;
 template [[host_name("kernel_cpy_f32_q4_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK4_0,  block_q4_0,   quantize_q4_0>;
 template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK4_1,  block_q4_1,   quantize_q4_1>;
 template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_0,  block_q5_0,   quantize_q5_0>;
@@ -141,6 +216,8 @@ typedef decltype(kernel_cpy_q_f32<float4x4, block_q4_0, 2, dequantize_q4_0>) cpy
 
 template [[host_name("kernel_cpy_q1_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q1_0, 8, dequantize_q1_0>;
 template [[host_name("kernel_cpy_q2_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q2_0, 4, dequantize_q2_0>;
+template [[host_name("kernel_cpy_pq2_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_pq2_0, 8, dequantize_pq2_0>;
+template [[host_name("kernel_cpy_ptq1_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_ptq1_0, 8, dequantize_ptq1_0>;
 template [[host_name("kernel_cpy_q4_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_0, 2, dequantize_q4_0>;
 template [[host_name("kernel_cpy_q4_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_1, 2, dequantize_q4_1>;
 template [[host_name("kernel_cpy_q5_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_0, 2, dequantize_q5_0>;
@@ -151,6 +228,8 @@ template [[host_name("kernel_cpy_tq2_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32
 
 template [[host_name("kernel_cpy_q1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q1_0, 8, dequantize_q1_0>;
 template [[host_name("kernel_cpy_q2_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q2_0, 4, dequantize_q2_0>;
+template [[host_name("kernel_cpy_pq2_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_pq2_0, 8, dequantize_pq2_0>;
+template [[host_name("kernel_cpy_ptq1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_ptq1_0, 8, dequantize_ptq1_0>;
 template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_0, 2, dequantize_q4_0>;
 template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_1, 2, dequantize_q4_1>;
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
@@ -262,6 +341,52 @@ template [[host_name("kernel_concat_q5_0")]] kernel kernel_concat_q_t kernel_con
 template [[host_name("kernel_concat_q5_1")]] kernel kernel_concat_q_t kernel_concat_q<block_q5_1>;
 template [[host_name("kernel_concat_q8_0")]] kernel kernel_concat_q_t kernel_concat_q<block_q8_0>;
 
+// Blocks whose size is not a multiple of four are copied a short at a time: older GCN cards
+// read a dword off a word boundary as the aligned one.
+template<typename block_q>
+kernel void kernel_concat_q_al(
+        constant ggml_metal_kargs_concat & args,
+        device  const char * src0,
+        device  const char * src1,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = ntg.y == 1 ? tgpig.x : tgpig.x*ntg.y + tpitg.y;
+
+    if (i1 >= args.ne1) {
+        return;
+    }
+
+    int o[4] = {0, 0, 0, 0};
+    o[args.dim] = args.dim == 0 ? args.ne00 : (args.dim == 1 ? args.ne01 : (args.dim == 2 ? args.ne02 : args.ne03));
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        device const ushort * x;
+
+        if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
+            x = (device const ushort *)(src0 + (i3       )*args.nb03 + (i2       )*args.nb02 + (i1       )*args.nb01 + (i0       )*args.nb00);
+        } else {
+            x = (device const ushort *)(src1 + (i3 - o[3])*args.nb13 + (i2 - o[2])*args.nb12 + (i1 - o[1])*args.nb11 + (i0 - o[0])*args.nb10);
+        }
+
+        device ushort * y = (device ushort *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
+
+        for (short k = 0; k < (short) (sizeof(block_q)/2); ++k) {
+            y[k] = x[k];
+        }
+    }
+}
+
+typedef decltype(kernel_concat_q_al<block_q4_0>) kernel_concat_q_al_t;
+
+template [[host_name("kernel_concat_q4_0_al")]] kernel kernel_concat_q_al_t kernel_concat_q_al<block_q4_0>;
+template [[host_name("kernel_concat_q5_0_al")]] kernel kernel_concat_q_al_t kernel_concat_q_al<block_q5_0>;
+template [[host_name("kernel_concat_q8_0_al")]] kernel kernel_concat_q_al_t kernel_concat_q_al<block_q8_0>;
+
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
 kernel void kernel_get_rows_q(
         constant ggml_metal_kargs_get_rows & args,
@@ -326,6 +451,7 @@ typedef decltype(kernel_get_rows_f<float, float>) get_rows_f_t;
 
 template [[host_name("kernel_get_rows_f32")]]  kernel get_rows_f_t kernel_get_rows_f<float, float>;
 template [[host_name("kernel_get_rows_f16")]]  kernel get_rows_f_t kernel_get_rows_f<half,  float>;
+template [[host_name("kernel_get_rows_bf16e")]] kernel get_rows_f_t kernel_get_rows_f<bf16e, float>;
 template [[host_name("kernel_get_rows_i32")]]  kernel get_rows_f_t kernel_get_rows_f<int32_t, int32_t>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_get_rows_bf16")]] kernel get_rows_f_t kernel_get_rows_f<bfloat, float>;
@@ -335,6 +461,8 @@ typedef decltype(kernel_get_rows_q<block_q4_0, 2, dequantize_q4_0>) get_rows_q_t
 
 template [[host_name("kernel_get_rows_q1_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q1_0,    8, dequantize_q1_0>;
 template [[host_name("kernel_get_rows_q2_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q2_0,    4, dequantize_q2_0>;
+template [[host_name("kernel_get_rows_pq2_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_pq2_0, 8, dequantize_pq2_0>;
+template [[host_name("kernel_get_rows_ptq1_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_ptq1_0, 8, dequantize_ptq1_0>;
 template [[host_name("kernel_get_rows_q4_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_0,    2, dequantize_q4_0>;
 template [[host_name("kernel_get_rows_q4_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_1,    2, dequantize_q4_1>;
 template [[host_name("kernel_get_rows_q5_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_0,    2, dequantize_q5_0>;
@@ -488,3 +616,81 @@ typedef decltype(kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_t
 template [[host_name("kernel_set_rows_f32_i64_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_tq2_0>;
 template [[host_name("kernel_set_rows_f32_i32_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_K, block_tq2_0, quantize_tq2_0>;
 
+
+// a transposed f32 view into a contiguous tensor, 32x32 tiles through threadgroup memory: the reads run along the
+// source rows and the writes along the destination rows, where the element-wise copy strides one of them
+kernel void kernel_cpy_transpose_f32(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        threadgroup  float * tile [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const int b0 = tgpig.x*32;
+    const int b1 = tgpig.y*32;
+    const int i2 = tgpig.z % args.ne02;
+    const int i3 = tgpig.z / args.ne02;
+    const int tx = tpitg.x;
+    const int ty = tpitg.y;
+
+    // src(i0, i1) with i1 contiguous
+    FOR_UNROLL (short k = 0; k < 32; k += 8) {
+        const int i0 = b0 + ty + k;
+        const int i1 = b1 + tx;
+        tile[(ty + k)*33 + tx] = i0 < args.ne00 && i1 < args.ne01 ?
+            *(device const float *) (src0 + i3*args.nb03 + i2*args.nb02 + (uint64_t) i1*args.nb01 + (uint64_t) i0*args.nb00) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short k = 0; k < 32; k += 8) {
+        const int i0 = b0 + tx;
+        const int i1 = b1 + ty + k;
+        if (i0 < args.ne00 && i1 < args.ne01) {
+            *(device float *) (dst + i3*args.nb3 + i2*args.nb2 + (uint64_t) i1*args.nb1 + (uint64_t) i0*args.nb0) = tile[tx*33 + ty + k];
+        }
+    }
+}
+
+// concat along dim 0 of a few leading columns and a transposed f32 view: the view goes through the same 32x32 tiles
+kernel void kernel_concat_t0_f32(
+        constant ggml_metal_kargs_concat & args,
+        device  const char * src0,
+        device  const char * src1,
+        device        char * dst,
+        threadgroup  float * tile [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const int b0 = tgpig.x*32;
+    const int b1 = tgpig.y*32;
+    const int i2 = tgpig.z % args.ne2;
+    const int i3 = tgpig.z / args.ne2;
+    const int tx = tpitg.x;
+    const int ty = tpitg.y;
+
+    device char * drow = dst + i3*args.nb3 + i2*args.nb2;
+
+    if (tgpig.x == 0) {
+        for (int e = ty*32 + tx; e < 32*args.ne00; e += 256) {
+            const int i1 = b1 + e/args.ne00;
+            const int j  = e%args.ne00;
+            if (i1 < args.ne1) {
+                *(device float *) (drow + (uint64_t) i1*args.nb1 + (uint64_t) j*args.nb0) =
+                    *(device const float *) (src0 + i3*args.nb03 + i2*args.nb02 + (uint64_t) i1*args.nb01 + (uint64_t) j*args.nb00);
+            }
+        }
+    }
+
+    FOR_UNROLL (short k = 0; k < 32; k += 8) {
+        const int j0 = b0 + ty + k;
+        const int i1 = b1 + tx;
+        tile[(ty + k)*33 + tx] = j0 < args.ne10 && i1 < args.ne1 ?
+            *(device const float *) (src1 + i3*args.nb13 + i2*args.nb12 + (uint64_t) i1*args.nb11 + (uint64_t) j0*args.nb10) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short k = 0; k < 32; k += 8) {
+        const int j0 = b0 + tx;
+        const int i1 = b1 + ty + k;
+        if (j0 < args.ne10 && i1 < args.ne1) {
+            *(device float *) (drow + (uint64_t) i1*args.nb1 + (uint64_t) (args.ne00 + j0)*args.nb0) = tile[tx*33 + ty + k];
+        }
+    }
+}

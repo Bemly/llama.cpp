@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 
-struct ggml_tensor;
+#include "ggml.h"
 
 class llama_io_write_i {
 public:
@@ -13,6 +13,9 @@ public:
 
     virtual void write(const void * src, size_t size) = 0;
     virtual void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
+
+    // rows of an f32 tensor stored as `type`
+    virtual void write_tensor_quantized(ggml_tensor * tensor, size_t offset, size_t size, ggml_type type, int64_t n_per_row);
 
     // bytes written so far
     virtual size_t n_bytes() = 0;

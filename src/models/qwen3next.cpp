@@ -35,9 +35,9 @@ void llama_model_qwen3next::load_arch_tensors(llama_model_loader & ml) {
         throw std::runtime_error(arch_name() + " model cannot have zero experts");
     }
 
-    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
-    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
-    int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+    const auto nf = nextn_flags(ml);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -658,6 +658,7 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        tok_embd = build_hadamard_lookup(tok_embd_w, tok_embd);
     } else {
         tok_embd = inp->embd;
     }

@@ -5,14 +5,18 @@ import { TITLE_GENERATION } from './title-generation.constants';
 import { FILE_GLOB_SEARCH_PICKERS } from './working-directory.constants';
 import {
 	Code,
+	Coffee,
 	Database,
+	Flower2,
 	Funnel,
 	ListRestart,
 	Monitor,
 	Moon,
 	PencilRuler,
 	SlidersVertical,
-	Sun
+	Sun,
+	TreePine,
+	Waves
 } from '@lucide/svelte';
 import { SyncableParameterType } from '$lib/enums';
 import { SettingsFieldType } from '$lib/enums/settings.enums';
@@ -63,13 +67,17 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 		settings: [
 			{
 				defaultValue: ColorMode.SYSTEM,
-				help: 'Choose the color theme for the interface. You can choose between System (follows your device settings), Light, or Dark.',
+				help: 'Choose System to follow your device, Light or Dark for neutral colors, or Sepia, Ocean, Forest, or Lavender for a color palette. Preview changes immediately; use Save settings to keep your choice.',
 				key: SETTINGS_KEYS.THEME,
 				label: 'Theme',
 				options: [
 					{ icon: Monitor, label: 'System', value: ColorMode.SYSTEM },
 					{ icon: Sun, label: 'Light', value: ColorMode.LIGHT },
-					{ icon: Moon, label: 'Dark', value: ColorMode.DARK }
+					{ icon: Moon, label: 'Dark', value: ColorMode.DARK },
+					{ icon: Coffee, label: 'Sepia', value: 'sepia' },
+					{ icon: Waves, label: 'Ocean', value: 'ocean' },
+					{ icon: TreePine, label: 'Forest', value: 'forest' },
+					{ icon: Flower2, label: 'Lavender', value: 'lavender' }
 				],
 				type: SettingsFieldType.SELECT
 			},

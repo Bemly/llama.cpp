@@ -15,6 +15,7 @@ set(LLAMA_CORE_SOURCES
     llama-batch.cpp
     llama-chat.cpp
     llama-context.cpp
+    llama-lora-training.cpp
     llama-cparams.cpp
     llama-grammar.cpp
     llama-graph.cpp
@@ -36,6 +37,7 @@ set(LLAMA_CORE_SOURCES
     llama-model-loader.cpp
     llama-model-saver.cpp
     llama-model.cpp
+    llama-tosh-dmoe.cpp
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp

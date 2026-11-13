@@ -1887,6 +1887,64 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals(false, result.at("stream").get<bool>());
     }
 
+    // Assistant items may omit 'type': clients that replay their own history
+    // rebuild the turn from stream deltas and only the completed item carries it
+    {
+        json input = json::parse(R"({
+            "input": [
+                {
+                    "role": "developer",
+                    "content": "developer1"
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "assistant1"
+                        }
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "content": "assistant2"
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "hello1"
+                        }
+                    ]
+                }
+            ],
+            "model": "test-model"
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        assert_equals((size_t)3, result.at("messages").size());
+
+        const auto & dev_msg = result.at("messages")[0];
+        assert_equals(std::string("developer"), dev_msg.at("role").get<std::string>());
+        assert_equals(std::string("developer1"), dev_msg.at("content")[0].at("text").get<std::string>());
+
+        // the two assistant items merge into one message
+        const auto & asst_msg = result.at("messages")[1];
+        assert_equals(std::string("assistant"), asst_msg.at("role").get<std::string>());
+        assert_equals(false, asst_msg.contains("type"));
+        assert_equals((size_t)2, asst_msg.at("content").size());
+        assert_equals(std::string("text"), asst_msg.at("content")[0].at("type").get<std::string>());
+        assert_equals(std::string("assistant1"), asst_msg.at("content")[0].at("text").get<std::string>());
+        assert_equals(std::string("text"), asst_msg.at("content")[1].at("type").get<std::string>());
+        assert_equals(std::string("assistant2"), asst_msg.at("content")[1].at("text").get<std::string>());
+
+        const auto & user_msg = result.at("messages")[2];
+        assert_equals(std::string("user"), user_msg.at("role").get<std::string>());
+        assert_equals(std::string("hello1"), user_msg.at("content")[0].at("text").get<std::string>());
+    }
+
     // Test string input
     {
         json input = json::parse(R"({
@@ -2125,6 +2183,39 @@ static void test_lfm2_parser(const std::string & template_path, bool detailed_de
         .expect(simple_assist_msg("", "", "empty_args", "{}"))
         .run();
 
+}
+
+// tool_choice "required" must end in a call: a short preamble is fine, a whole answer is not.
+static void test_required_tool_choice_grammar() {
+    auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+    for (bool thinking : { false, true })
+    for (auto format : { COMMON_REASONING_FORMAT_NONE, COMMON_REASONING_FORMAT_DEEPSEEK }) {
+        common_chat_templates_inputs inputs;
+        inputs.reasoning_format = format;
+        inputs.messages        = { message_user };
+        inputs.tools           = { run_in_terminal_tool };
+        inputs.tool_choice     = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        inputs.enable_thinking = thinking;
+        auto params  = common_chat_templates_apply(tmpls.get(), inputs);
+        GGML_ASSERT(!params.grammar_lazy);
+        auto matches = [&](const std::string & text) {
+            auto grammar = build_grammar(params.grammar);
+            return match_string_detailed(text, grammar.get()).success;
+        };
+
+        const std::string head = params.generation_prompt + (thinking ? "Checking.\n</think>\n\n" : "");
+        const std::string call = "<tool_call>\n<function=run_in_terminal>\n<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>";
+        const std::string answer(400, 'a');
+
+        GGML_ASSERT(matches(head + call));
+        GGML_ASSERT(matches(head + "Let me check.\n" + call));
+        GGML_ASSERT(!matches(head + answer));
+        GGML_ASSERT(!matches(head + answer + call));
+        if (thinking) {
+            // the reasoning itself stays free, also when it is kept in the text
+            GGML_ASSERT(matches(params.generation_prompt + answer + "\n</think>\n\n" + call));
+        }
+    }
 }
 
 static void test_template_output_peg_parsers(bool detailed_debug) {
@@ -6897,6 +6988,99 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Llama 4 - bare Python-style call list with no marker; the model also writes JSON calls and text before them
+    {
+        auto tst = peg_tester("models/templates/unsloth-Llama-4-Scout-17B-16E-Instruct.jinja", detailed_debug);
+        tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
+        // with tools offered, text is still the answer
+        tst.test("Hello, world!\nWhat's up?").tools({ special_function_tool }).expect(message_assist).run();
+        // an empty list is no call, and what follows it on a new line is the answer
+        tst.test("[]").tools({ special_function_tool }).expect(simple_assist_msg("")).run();
+        tst.test("[]\n\nHello, world!\nWhat's up?").tools({ special_function_tool }).expect(message_assist).run();
+        tst.test("[Wikipedia](https://www.wikipedia.org) has it.")
+            .tools({ get_time_tool })
+            .expect(simple_assist_msg("[Wikipedia](https://www.wikipedia.org) has it."))
+            .run();
+        tst.test("[special_function(arg1=1)]").tools({ special_function_tool }).expect(message_assist_call).run();
+        tst.test("[get_time(city=\"Paris\")]")
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls("get_time", "{\"city\":\"Paris\"}"))
+            .run();
+        tst.test("[special_function(arg1=1), get_time(city=\"Paris\")]")
+            .tools({ special_function_tool, get_time_tool })
+            .parallel_tool_calls(true)
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "get_time", R"({"city": "Paris"})", {} },
+            })
+            .run();
+        tst.test("Hello, world!\nWhat's up?\n\n[special_function(arg1=1)]")
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?\n\n", "", "special_function", R"({"arg1": 1})"))
+            .run();
+        tst.test(R"({"type": "function", "name": "special_function", "parameters": {"arg1": 1}})")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+        tst.test(R"([{"name": "special_function", "parameters": {"arg1": 1}}])")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+        tst.test(R"({"name": "special_function", "parameters": {"arg1": 1}}; {"name": "get_time", "parameters": {"city": "Paris"}})")
+            .tools({ special_function_tool, get_time_tool })
+            .parallel_tool_calls(true)
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "get_time", R"({"city": "Paris"})", {} },
+            })
+            .run();
+        tst.test("Let me check.\n\n" R"({"type": "function", "name": "get_time", "parameters": {"city": "Paris"}})")
+            .tools({ get_time_tool })
+            .expect(simple_assist_msg("Let me check.\n\n", "", "get_time", R"({"city": "Paris"})"))
+            .run();
+        // a JSON object that is not a call stays text
+        tst.test(R"(Use {"name": "Ana", "age": 3} as the input.)")
+            .tools({ get_time_tool })
+            .expect(simple_assist_msg(R"(Use {"name": "Ana", "age": 3} as the input.)"))
+            .run();
+        tst.test("[special_function(arg1=1)]")
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call)
+            .run();
+
+        // a call in the history renders, though the template iterates a content it may not get
+        common_chat_msg tool_result;
+        tool_result.role         = "tool";
+        tool_result.content      = "Sunny";
+        tool_result.tool_call_id = "call0";
+        tst.test("It is sunny.")
+            .tools({ special_function_tool })
+            .messages({ message_user, message_assist_call, tool_result })
+            .expect(simple_assist_msg("It is sunny."))
+            .run();
+
+        // a system message of the chat's own gets the answer rules the template keeps only for its default one
+        auto tmpls = read_templates("models/templates/unsloth-Llama-4-Scout-17B-16E-Instruct.jinja");
+        common_chat_msg system_msg;
+        system_msg.role    = "system";
+        system_msg.content = "You are a helpful assistant.";
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { system_msg, message_user };
+        inputs.tools                 = { special_function_tool };
+        inputs.add_generation_prompt = true;
+        auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        auto rules  = prompt.find("NEVER respond with empty brackets");
+        if (prompt.find("You are a helpful assistant.") == std::string::npos || rules == std::string::npos ||
+            rules > prompt.find("Here is a list of functions")) {
+            throw std::runtime_error("Llama 4: the answer rules are missing from a system message of the chat's own");
+        }
+        inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+        if (common_chat_templates_apply(tmpls.get(), inputs).prompt.find("NEVER respond with empty brackets") != std::string::npos) {
+            throw std::runtime_error("Llama 4: the answer rules were added with tools turned off");
+        }
+    }
+
     // GigaChat V3
     {
         auto tst = peg_tester("models/templates/GigaChat3-10B-A1.8B.jinja", detailed_debug);
@@ -7753,6 +7937,7 @@ int main(int argc, char ** argv) {
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
+        test_required_tool_choice_grammar();
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
     return 0;

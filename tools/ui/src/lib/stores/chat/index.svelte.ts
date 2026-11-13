@@ -38,7 +38,9 @@ import type {
 	ChatStreamCallbacks,
 	DatabaseMessage,
 	DatabaseMessageExtra,
-	ErrorDialogState
+	ErrorDialogState,
+	ToshChunk,
+	ToshMessageData
 } from '$lib/types';
 import {
 	findMessageById,
@@ -879,6 +881,40 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			conversationsStore.updateMessageAtIndex(idx, { content: streamedContent });
 		};
+
+		// what the server's Tosh agent reports: its steps while it works, its figures or a map request at the end
+		let tosh: ToshMessageData = {};
+
+		const recordTosh = (chunk: ToshChunk): void => {
+			const event = chunk.event;
+
+			if (event?.type === 'retract') {
+				streamedContent = '';
+				updateStreamingUI();
+
+				return;
+			}
+
+			if (event?.type === 'tool_call' && event.call) {
+				tosh = { ...tosh, steps: [...(tosh.steps ?? []), event.call] };
+			} else if (event?.type === 'progress' && typeof event.label === 'string') {
+				tosh = { ...tosh, progress: event.label };
+			} else if (!event) {
+				tosh = {
+					...tosh,
+					progress: undefined,
+					...(chunk.sketches?.length ? { sketches: chunk.sketches } : {}),
+					...(chunk.map_request ? { mapRequest: chunk.map_request } : {})
+				};
+			} else {
+				return;
+			}
+
+			conversationsStore.updateMessageAtIndex(
+				conversationsStore.findMessageIndex(currentMessageId),
+				{ tosh }
+			);
+		};
 		const cleanupStreamingState = () => {
 			this.setChatLoading(convId, false);
 			this.clearChatStreaming(convId, currentMessageId);
@@ -1022,6 +1058,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				}
 
 				console.error('Streaming error:', error);
+				if (tosh.progress) {
+					tosh = { ...tosh, progress: undefined };
+					conversationsStore.updateMessageAtIndex(
+						conversationsStore.findMessageIndex(currentMessageId),
+						{ tosh }
+					);
+				}
 				// keep whatever was streamed so far, the message stays in memory and in DB
 				await this.savePartialResponseIfNeeded(convId);
 				cleanupStreamingState();
@@ -1179,6 +1222,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 						toolCalls: toolCalls || ''
 					};
 
+					if (Object.keys(tosh).length) updateData.tosh = tosh;
+
 					if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
 
 					await DatabaseService.updateMessage(currentMessageId, updateData);
@@ -1224,6 +1269,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				onModel: streamCallbacks.onModel,
 				onReasoningChunk: streamCallbacks.onReasoningChunk,
 				onTimings: streamCallbacks.onTimings,
+				onTosh: recordTosh,
 				stream: true
 			},
 			convId,

@@ -308,3 +308,24 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
 
     return true;
 }
+
+void common_reasoning_budget_accept_prompt(struct llama_sampler * smpl, llama_token token) {
+    if (!smpl) {
+        return;
+    }
+
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+
+    if (ctx->state != REASONING_BUDGET_FORCING) {
+        common_reasoning_budget_accept(smpl, token);
+        return;
+    }
+
+    // counted as forced, a token after the start tag would use up the end tag before it is written
+    const int32_t match = ctx->end_matcher.advance(token);
+    if (match >= 0) {
+        ctx->state = REASONING_BUDGET_DONE;
+        ctx->end_match = match;
+        COM_TRC("%s", "deactivated (the prompt closes the block)\n");
+    }
+}

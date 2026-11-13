@@ -92,7 +92,7 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SIGMOID) {
-            dst_ptr[i0] = (T) (1 / (1 + exp(-x)));
+            dst_ptr[i0] = (T) (args.post / (1 + exp(-x*args.pre)));
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU) {
@@ -108,7 +108,8 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SILU) {
-            dst_ptr[i0] = (T) (x / (1 + exp(-x)));
+            const TC xs = x*args.pre;
+            dst_ptr[i0] = (T) (args.post * xs / (1 + exp(-xs)));
         }
 
         if (FC_OP == OP_UNARY_NUM_ELU) {

@@ -232,6 +232,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     // [CS, S_v, n_chunks, H_v * n_seqs]
     ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v));
 
+    // training cannot differentiate through the in-place write of each chunk: the chunks are kept and joined after
+    std::vector<ggml_tensor *> chunk_out;
+
     for (int64_t chunk = 0; chunk < n_chunks; chunk++) {
         ggml_tensor * ch_k_cd    = get_slice_2d(ctx0, k_cd,    chunk); // [S_k,  CS, 1, H_k * n_seqs]
         ggml_tensor * ch_v_t     = get_slice_2d(ctx0, v_t,     chunk); // [ CS, S_v, 1, H_v * n_seqs]
@@ -259,7 +262,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * o_ch = ggml_add(ctx0, attn_inter, v_attn);
         cb(o_ch, "dnet_add_ch_attn_out", il);
 
-        v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        if (cparams.training) {
+            chunk_out.push_back(o_ch);
+        } else {
+            v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        }
 
         // kgdmulvnew = (key_gdiff).transpose(-1, -2) @ v_new
         // TODO: head broadcast might not work here - probably will need a transpose
@@ -271,6 +278,21 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         s = ggml_mul(ctx0, s, ch_g_last_exp_t);
         s = ggml_add(ctx0, s, kgv);
         cb(s, "dnet_add_ch_state", il);
+    }
+
+    // joined pairwise, so each chunk is copied about log2(n_chunks) times
+    while (chunk_out.size() > 1) {
+        std::vector<ggml_tensor *> joined;
+        for (size_t i = 0; i + 1 < chunk_out.size(); i += 2) {
+            joined.push_back(ggml_concat(ctx0, chunk_out[i], chunk_out[i + 1], 2));
+        }
+        if (chunk_out.size() % 2) {
+            joined.push_back(chunk_out.back());
+        }
+        chunk_out.swap(joined);
+    }
+    if (!chunk_out.empty()) {
+        v = chunk_out[0];
     }
 
     // truncate padded tokens
@@ -399,7 +421,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    ggml_tensor * result = build_gated_delta_net_op(q, k, v, g, b, s, /*K=*/1);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -420,6 +442,22 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
 
     return {output, new_state};
+}
+
+ggml_tensor * llm_build_delta_net_base::build_gated_delta_net_op(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * s,
+        int64_t       K) {
+    if (!gdn_raw.g) {
+        return ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    }
+    ggml_tensor * res = ggml_gated_delta_net(ctx0, q, k, v, gdn_raw.g, gdn_raw.b, s, K);
+    ggml_gated_delta_net_set_raw_gates(res, gdn_raw.dt, gdn_raw.a);
+    return res;
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net(
@@ -501,7 +539,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
+        // a rollback cannot reach past this ubatch, so slots deeper than its token count would
+        // only ever be restored as the wrong state: skip their copies. The ubatch token count is
+        // part of the graph reuse key, so the two topologies never share a cached graph.
+        const int64_t n_ut  = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t K_eff = getenv("TOSH_RS_SLOTS_FULL") ? K : std::min<int64_t>(K, n_ut + 1);
+
+        for (int64_t t = K - K_eff + 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
@@ -564,7 +608,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t K = cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_tensor * gdn_out = build_gated_delta_net_op(q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

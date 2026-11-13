@@ -56,6 +56,12 @@ struct ggml_metal_pipeline_with_params {
 
     bool c4;
     bool cnt;
+
+    // lanes per simdgroup the dispatch asks for; 0 keeps the 32-lane default
+    int sgw;
+
+    // most threadgroups a dispatch launches, for kernels that walk row blocks; 0 is one per block
+    int ntg;
 };
 
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline);
@@ -80,12 +86,24 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline);
 
+// (a + b) + c over float4, compiled at runtime; the TP2 boundary's residual add
+struct ggml_metal_pipeline_with_params ggml_metal_device_pipeline_add3(ggml_metal_device_t dev);
+// the same sum followed by an RMS norm and its weight, one threadgroup per row
+struct ggml_metal_pipeline_with_params ggml_metal_device_pipeline_add3_rms_mul(ggml_metal_device_t dev);
+// true when t still lacks the peer partial of a TP2 boundary and the caller is its residual add
+bool ggml_metal_fb_residual_take(ggml_metal_device_t dev, const struct ggml_tensor * t, struct ggml_metal_buffer_id * peer);
+// the add whose first source is t folds a TP2 partial, so no fusion may take it in
+bool ggml_metal_fb_residual_armed(ggml_metal_device_t dev, const struct ggml_tensor * t);
+
 void ggml_metal_encoder_set_bytes (ggml_metal_encoder_t encoder, void * data, size_t size, int idx);
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx);
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx);
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2);
+
+// ends the encoder, signals or waits on `ev` at `value` in the command buffer, and reopens it
+void ggml_metal_encoder_event(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf, void * ev, uint64_t value, bool signal);
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
@@ -108,11 +126,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst, bool contig);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_flat          (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool wave64);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat            (ggml_metal_library_t lib, enum ggml_type tsrc);
@@ -125,29 +144,48 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_bl
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_add        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max_back     (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back     (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat_back       (ggml_metal_library_t lib);
+// a kernel without function constants, compiled under its own name
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name           (ggml_metal_library_t lib, const char * name);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer_amd(ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_decode   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool rows, bool fold, bool raw, bool l2q, bool l2k);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_turbo_wht         (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_back(ggml_metal_library_t lib, const char * stage);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_ta(ggml_metal_library_t lib, const struct ggml_tensor * op, bool cs);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg, int nr0);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nt, int rt, bool add);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+
+// rows per simdgroup of the few-column mat-vec for this type, lane width and column count,
+// 0 if the batch does not take it
+int ggml_metal_mv_nc2_rows(enum ggml_type type, int simd_width, int ne11, int ne01, int ne00);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tosh_topk_moe     (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n, enum ggml_type tsrc);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n, enum ggml_type tsrc, bool w64);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_swiglu      (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_dense_swiglu    (ggml_metal_library_t lib, const struct ggml_tensor * w);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_mxfp4_swiglu_oai(ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht_fused        (ggml_metal_library_t lib, int n, int hd, int rep, int nk, bool w64);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k             (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix       (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -156,6 +194,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce        (ggml_metal_library_t lib, int32_t n_expert_used);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin               (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one           (ggml_metal_library_t lib, enum ggml_op op);
+// scalar f32-accumulator bin pipeline with an explicit src1 type (f16 allreduce transport):
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one_src1      (ggml_metal_library_t lib, enum ggml_op op, enum ggml_type tsrc1);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
@@ -298,7 +338,21 @@ struct ggml_metal_device_props {
 
     bool has_simdgroup_reduction;
     bool has_simdgroup_mm;
+    bool use_mm_manual;
     bool has_unified_memory;
+    // wave64 decode (experimental, opt-in): run the parameterized f16/q8_0 mat-vec
+    // kernels on the GPU for GCN/Vega instead of falling back to the CPU.
+    bool wave64_decode;
+
+    // Hardware SIMD-group width (threadExecutionWidth), probed at init.
+    // Apple Silicon and AMD RDNA report 32; AMD GCN/Vega report 64. The Metal
+    // kernels assume 32, so a non-32 width signals a wave64 device.
+    int simd_width;
+
+    // GCN before Vega reads a dword off a word boundary as the aligned one, so the mat-vec
+    // kernels take a pair of shorts there instead
+    bool needs_aligned_loads;
+
     bool has_bfloat;
     bool has_tensor;
     bool use_residency_sets;
@@ -323,6 +377,15 @@ ggml_metal_device_t ggml_metal_device_get(int device, int n_devices);
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 
+// per-context queue: the first context gets the shared device queue, later
+// ones an owned queue so their uploads can overlap compute
+void * ggml_metal_device_acquire_queue(ggml_metal_device_t dev, bool * owned); // id<MTLCommandQueue>
+void   ggml_metal_device_release_queue(ggml_metal_device_t dev, void * queue_raw, bool owned);
+
+// cached no-copy wrap of the host pages containing [data, data + size);
+// returns the id<MTLBuffer> (borrowed) and the blit offset, NULL on failure
+void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, size_t size, size_t * offs);
+
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset);
@@ -338,6 +401,16 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+void *                      ggml_metal_device_dmoe_event(ggml_metal_device_t dev);
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_stage(ggml_metal_device_t dev, size_t layer_stride);
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_tables(ggml_metal_device_t dev);
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_obs_ring(ggml_metal_device_t dev);
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_wide_stage(ggml_metal_device_t dev, size_t bytes);
+size_t ggml_metal_private_bytes(void);
+void * ggml_metal_device_dmoe_reach_event(ggml_metal_device_t dev);
+#endif
 
 struct ggml_metal_fusion_info;
 
@@ -359,7 +432,26 @@ bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+void   ggml_metal_buffer_set_tensor_2d(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
+                                       size_t n_copies, size_t stride_tensor, size_t stride_data);
 void   ggml_metal_buffer_get_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
+// small host<->device transfers through the device's persistent staging buffer
+// (synchronous); false when the size exceeds the stage, so callers fall back
+bool   ggml_metal_device_stage_set(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_dst, const void * data, size_t size);
+bool   ggml_metal_device_stage_set_2d(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_dst, const void * data, size_t size,
+                                      size_t n_copies, size_t stride_tensor, size_t stride_data);
+bool   ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_src, void * data, size_t size);
+
+// TOSH_MOE_PROFILE: per-tensor-name transfer accounting; no-op when disabled
+void   ggml_metal_prof_note(const char * name, size_t size, bool d2h);
+
+// batch small synchronous reads into one device round-trip
+void   ggml_metal_device_read_batch_begin(ggml_metal_device_t dev);
+void   ggml_metal_device_read_batch_end  (ggml_metal_device_t dev);
+
+// wait out the in-flight staged uploads (stage_set defers its waits)
+void   ggml_metal_device_upload_drain(ggml_metal_device_t dev);
 bool   ggml_metal_buffer_cpy_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * src, struct ggml_tensor * dst);
 void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 

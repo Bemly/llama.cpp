@@ -57,6 +57,8 @@ struct tool_call_structure;
 
 constexpr size_t COMMON_CHAT_MAX_PERMUTE = 6;
 
+namespace autoparser { struct generation_params; }
+
 class common_chat_peg_builder : public common_peg_parser_builder {
   public:
     // Tag constants (from former common_chat_peg_base_builder)
@@ -115,6 +117,13 @@ class common_chat_peg_builder : public common_peg_parser_builder {
 
     // Return a parser that parses all elements of tag, but leading and trailing spaces are optional
     common_peg_parser optspace(const std::string & tag);
+
+    // Text before the calls under tool_choice "required": still parsed as `content`, but the grammar
+    // only allows a short preamble, so the model always reaches `call_start`. When the reasoning is
+    // in that text (thinking on, not extracted) it stays free up to `think_end`.
+    common_peg_parser required_preamble(const common_peg_parser & content, const std::string & call_start,
+                                        const autoparser::generation_params & inputs,
+                                        const std::string & think_start = "", const std::string & think_end = "");
 
     // Legacy-compatible helper for building standard JSON tool calls
     // Used by tests and manual parsers

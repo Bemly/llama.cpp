@@ -129,6 +129,8 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
 # extra artifacts
+option(TOSH_ENABLE_DYNAMIC_MOE "tosh: dynamic MoE expert execution" OFF)
+
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS     "llama: build tools"                                                                ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             ${LLAMA_STANDALONE})

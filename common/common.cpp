@@ -8,6 +8,10 @@
 #include "../src/llama-ext.h"
 
 #include "fit.h"
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-hostcache.h"
+#endif
+#include "tosh-plan.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -397,6 +401,18 @@ void common_init() {
     llama_log_set(common_log_default_callback, NULL);
 }
 
+// Stamped by build-engines.sh from VERSION. Passed unquoted so the value needs no
+// escaping through cmake, hence the stringify.
+#ifndef TOSH_VERSION
+#define TOSH_VERSION unknown
+#endif
+#define TOSH_STRINGIFY2(x) #x
+#define TOSH_STRINGIFY(x) TOSH_STRINGIFY2(x)
+
+const char * common_tosh_version(void) {
+    return TOSH_STRINGIFY(TOSH_VERSION);
+}
+
 void common_params_print_info(const common_params & params, bool print_devices) {
 #ifdef NDEBUG
     const char * build_type = "";
@@ -404,6 +420,14 @@ void common_params_print_info(const common_params & params, bool print_devices) 
     const char * build_type = " (debug)";
 #endif
     COM_TRC("%s: build %d (%s) with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
+
+    // The build number above only tracks the upstream commit, unchanged across
+    // releases that only touch the patch. No env var means a direct CLI run.
+    {
+        const char * app_version = std::getenv("TOSH_APP_VERSION");
+        COM_INF("%s: ToshLLM engine %s (app %s)\n", __func__, common_tosh_version(),
+                app_version ? app_version : "standalone");
+    }
 
     const int verbosity = common_log_get_verbosity_thold();
     COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
@@ -1229,6 +1253,23 @@ common_decision_type common_get_decision_type(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    {
+        tosh_plan plan;
+        const bool planned = tosh_plan_apply(params, &plan);
+        if (!planned && plan.state == TOSH_PLAN_NOT_PLANNED && !params.dynamic_moe && getenv("TOSH_AUTO") == nullptr) {
+            LOG_INF("Tosh MoE: standard\n");
+        }
+        if (!planned && plan.state != TOSH_PLAN_UNSUPPORTED) {
+            tosh_plan_checkpoints(params);
+        }
+        // no plan fits: loading with the defaults would hand memory to a layout nobody checked
+        if (plan.state == TOSH_PLAN_UNSUPPORTED && getenv("TOSH_AUTO_DRY_RUN") == nullptr) {
+            LOG_ERR("%s: TOSH_AUTO found no configuration that fits (%s), the model is not loaded\n", __func__, plan.primary_reason.c_str());
+            tosh_plan_report_load("PLAN_REFUSED", plan.primary_reason.c_str());
+            return;
+        }
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1268,6 +1309,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        // a host memory lock that failed during the load is an allocation failure, not a bad model
+        const char * err = tosh_hostcache_error();
+        tosh_plan_report_load(err && strstr(err, "NOT_LOCKABLE") ? "ALLOCATION_FAILED" : "MODEL_LOAD_FAILED", err);
+#else
+        tosh_plan_report_load("MODEL_LOAD_FAILED");
+#endif
         return;
     }
 
@@ -1361,6 +1409,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        const char * err = tosh_hostcache_error();
+        tosh_plan_report_load(err && strstr(err, "NOT_LOCKABLE") ? "ALLOCATION_FAILED" : "CONTEXT_FAILED", err);
+#else
+        tosh_plan_report_load("CONTEXT_FAILED");
+#endif
         return;
     }
 
@@ -1369,6 +1423,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
+}
+
+void common_init_result::release() {
+    pimpl->context.reset();
+    pimpl->model.reset();
 }
 
 llama_model * common_init_result::model() {
@@ -1426,7 +1485,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);
 
-        const auto cvec = common_control_vector_load(params.control_vectors);
+        const auto cvec = common_control_vector_load(params.control_vectors, llama_model_n_layer(model));
         if (cvec.n_embd == -1) {
             return res;
         }
@@ -1511,6 +1570,16 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
     }
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    // an expert cache that could not be locked would page: fail rather than run on it
+    if (!tosh_hostcache_warmup_done()) {
+        COM_ERR("%s: %s\n", __func__, tosh_hostcache_error() ? tosh_hostcache_error() : "the expert cache failed");
+        tosh_plan_report_load("ALLOCATION_FAILED", tosh_hostcache_error());
+        res->release();
+        return res;
+    }
+#endif
+    tosh_plan_report_load("READY");
 
     return res;
 }
@@ -1942,7 +2011,7 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
 // Control vector utils
 //
 
-static common_control_vector_data common_control_vector_load_one(const common_control_vector_load_info & load_info) {
+static common_control_vector_data common_control_vector_load_one(const common_control_vector_load_info & load_info, int32_t n_layer) {
     common_control_vector_data result = { -1, {} };
 
     ggml_context * ctx = nullptr;
@@ -1983,6 +2052,10 @@ static common_control_vector_data common_control_vector_load_one(const common_co
             COM_ERR("invalid (zero) direction tensor layer index in %s\n", load_info.fname.c_str());
             result.n_embd = -1;
             break;
+        } else if (layer_idx > n_layer) {
+            COM_ERR("direction tensor layer index %d exceeds the model layer count %d in %s\n", layer_idx, n_layer, load_info.fname.c_str());
+            result.n_embd = -1;
+            break;
         }
 
         struct ggml_tensor * tensor = ggml_get_tensor(ctx, name.c_str());
@@ -2006,10 +2079,10 @@ static common_control_vector_data common_control_vector_load_one(const common_co
         }
 
         // extend if necessary - do not store data for layer 0 (it's not used)
-        result.data.resize(std::max(result.data.size(), static_cast<size_t>(result.n_embd * layer_idx)), 0.0f);
+        result.data.resize(std::max(result.data.size(), (size_t) result.n_embd * layer_idx), 0.0f);
 
         const float * src = (const float *) tensor->data;
-        float * dst = result.data.data() + result.n_embd * (layer_idx - 1);  // layer 1 at [0]
+        float * dst = result.data.data() + (size_t) result.n_embd * (layer_idx - 1);  // layer 1 at [0]
         for (int j = 0; j < result.n_embd; j++) {
             dst[j] += src[j] * load_info.strength;  // allows multiple directions for same layer in same file
         }
@@ -2027,11 +2100,11 @@ static common_control_vector_data common_control_vector_load_one(const common_co
     return result;
 }
 
-common_control_vector_data common_control_vector_load(const std::vector<common_control_vector_load_info> & load_infos) {
+common_control_vector_data common_control_vector_load(const std::vector<common_control_vector_load_info> & load_infos, int32_t n_layer) {
     common_control_vector_data result = { -1, {} };
 
     for (const auto & info : load_infos) {
-        auto cur = common_control_vector_load_one(info);
+        auto cur = common_control_vector_load_one(info, n_layer);
 
         if (cur.n_embd == -1) {
             result.n_embd = -1;

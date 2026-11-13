@@ -43,6 +43,10 @@ set(BUILD_COMPILER "${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
 
 if(CMAKE_VS_PLATFORM_NAME)
     set(BUILD_TARGET ${CMAKE_VS_PLATFORM_NAME})
+elseif(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    # cross-building on Apple leaves CMAKE_SYSTEM_PROCESSOR on the host arch, which then
+    # reports an arm64 build for an x86_64 binary
+    set(BUILD_TARGET "${CMAKE_SYSTEM_NAME} ${CMAKE_OSX_ARCHITECTURES}")
 else()
     set(BUILD_TARGET "${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
 endif()

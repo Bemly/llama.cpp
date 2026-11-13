@@ -5,6 +5,8 @@
 #include "server-queue.h"
 #include "server-mcp.h"
 
+#include <set>
+
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -43,9 +45,19 @@ struct server_tools {
     // set when --tools-runtime is configured; routes every tool call through an isolate
     std::unique_ptr<server_tools_runtime> runtime;
 
+    // servers whose tools only the agent may list and call, and the key its requests carry
+    std::set<std::string> agent_only;
+    std::string           agent_key;
+    // requests carry a key the server checked, so built-in tools may run for other computers
+    bool                  keyed = false;
+
     void setup(const std::vector<std::string> & enabled_tools,
                server_mcp & mcp_mgr,
-               const std::string & tools_runtime);
+               const std::string & tools_runtime,
+               const std::string & hidden_server = "",
+               const std::set<std::string> & agent_only_servers = {},
+               const std::string & agent_request_key = "",
+               bool requests_keyed = false);
 
     server_http_context::handler_t handle_get;
     server_http_context::handler_t handle_post;

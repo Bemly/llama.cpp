@@ -615,6 +615,9 @@ struct llama_device {
 
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
+    // where this group starts in the global --tensor-split list; groups past the first would
+    // otherwise all read the same leading entries
+    size_t                     dev_offset;
     const struct llama_model * model;
 };
 
@@ -737,6 +740,15 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // Prism ML Hadamard-folded weights (prism.hadamard.*): the forward transform is applied to the
+    // activation of every folded matmul, the inverse to rows looked up from latent tables
+    std::unordered_map<std::string, uint32_t> hadamard_weight_blocks;
+    std::unordered_map<std::string, uint32_t> hadamard_inverse_blocks;
+    std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
+    bool hadamard_gdn_v_grouped = false;
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -745,6 +757,12 @@ struct llama_model {
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+
+    // one per group, so each carries its own offset; the single-group case still uses the above
+    std::vector<llama_meta_device_get_split_state_userdata> get_split_state_uds;
+
+    // devices per tensor-parallel group, 1 when there are no groups
+    size_t tensor_group_size = 1;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
@@ -827,6 +845,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_FUSE_GATE_UP;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
@@ -845,6 +864,13 @@ struct llama_model_base : public llama_model {
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
 
+    // helper: tensor flags for a file that holds the trunk, the NextN layers, or both
+    struct nextn_flags_t {
+        int trunk; // TENSOR_NOT_REQUIRED when the file holds only the NextN layers
+        int mtp;   // TENSOR_NOT_REQUIRED when the file holds only the trunk, TENSOR_SKIP when MTP is not loaded
+    };
+    nextn_flags_t nextn_flags(llama_model_loader & ml, llm_tensor trunk_probe = LLM_TENSOR_ATTN_NORM) const;
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 
@@ -852,6 +878,9 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    void load_hadamard_hparams(llama_model_loader & ml);
+    void create_hadamard_tensors(bool no_alloc);
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

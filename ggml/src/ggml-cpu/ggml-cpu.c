@@ -7,6 +7,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "ggml-quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -212,6 +213,22 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_turbo2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -234,6 +251,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q2_0] = {
         .from_float               = quantize_row_q2_0,
         .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_PQ2_0] = {
+        .from_float               = quantize_row_pq2_0,
+        .vec_dot                  = ggml_vec_dot_pq2_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_PTQ1_0] = {
+        .from_float               = quantize_row_ptq1_0,
+        .vec_dot                  = ggml_vec_dot_ptq1_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
@@ -412,6 +441,36 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO2_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo2_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo4_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ3_1S] = {
+        .from_float               = (ggml_from_float_t) quantize_row_tq3_1s_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq3_1s_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ4_1S] = {
+        .from_float               = (ggml_from_float_t) quantize_row_tq4_1s_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4_1s_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
     },
 };
 
@@ -1508,6 +1567,48 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     float tmp[16];
 
+    // a few tokens on one expert (decode, a verify window): unpack each weight block once for all of them
+    static ggml_vec_dot_multi_t multi_cache[GGML_TYPE_COUNT];
+    static bool multi_init[GGML_TYPE_COUNT];
+    if (!multi_init[type]) {
+        multi_cache[type] = getenv("GGML_CPU_NO_MULTI_DOT") ? NULL : ggml_get_vec_dot_multi(type);
+        multi_init[type] = true;
+    }
+    ggml_vec_dot_multi_t const vec_dot_multi = multi_cache[type];
+
+    if (vec_dot_multi != NULL && ir1_end - ir1_start >= 2) {
+        const void * cols[16];
+        float * dsts[16];
+        float res[4];
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            int nc = 0;
+            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1, ++nc) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+                cols[nc] = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                    ? (i11      + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12));
+                dsts[nc] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+            }
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                for (int c0 = 0; c0 < nc; c0 += 4) {
+                    const int k = MIN(4, nc - c0);
+                    if (k == 1) {
+                        vec_dot(ne00, res, 0, src0_cur + ir0*nb01, 0, cols[c0], 0, 1);
+                    } else {
+                        vec_dot_multi(ne00, k, res, src0_cur + ir0*nb01, cols + c0);
+                    }
+                    for (int c = 0; c < k; ++c) {
+                        dsts[c0 + c][ir0] = res[c];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
@@ -1826,6 +1927,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_count_equal(params, tensor);
             } break;
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            {
+                ggml_compute_forward_count_equal_masked(params, tensor);
+            } break;
         case GGML_OP_REPEAT:
             {
                 ggml_compute_forward_repeat(params, tensor);
@@ -2089,6 +2194,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                ggml_compute_forward_gated_delta_net_back(params, tensor);
+            } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                ggml_compute_forward_turbo_wht(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2133,6 +2246,20 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             {
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
+            }
+            break;
+        case GGML_OP_CROSS_ENTROPY_ROWS:
+            {
+                ggml_compute_forward_cross_entropy_rows(params, tensor);
+            }
+            break;
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
+            {
+                ggml_compute_forward_flash_attn_ext_back(params, tensor);
+            } break;
+        case GGML_OP_CROSS_ENTROPY_ROWS_BACK:
+            {
+                ggml_compute_forward_cross_entropy_rows_back(params, tensor);
             }
             break;
         case GGML_OP_OPT_STEP_ADAMW:
@@ -2279,12 +2406,15 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
+        case GGML_OP_COUNT_EQUAL_MASKED:
             {
                 n_tasks = 1;
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_BACK:
+        case GGML_OP_TURBO_WHT:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2426,6 +2556,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -2488,6 +2619,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        case GGML_OP_CROSS_ENTROPY_ROWS:
+        case GGML_OP_CROSS_ENTROPY_ROWS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
@@ -3022,12 +3155,33 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                     } break;
+                case GGML_OP_FLASH_ATTN_EXT_BACK:
+                    {
+                        const int64_t DK = node->src[1]->ne[0];
+                        const int64_t DV = node->src[2]->ne[0];
+
+                        // per-thread F32 copy of one K row and one V row
+                        cur = sizeof(float)*(DK + DV + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_BACK:
+                    {
+                        // per thread: the state at each chunk start, the states of one chunk, and the running dS
+                        const int64_t S_v = node->src[2]->ne[0];
+                        const int64_t T   = node->src[2]->ne[2];
+                        const int64_t C   = 64;
+                        const int64_t n_chunks = (T + C - 1)/C;
+                        cur = sizeof(float)*((n_chunks + C + 3)*S_v*S_v + 8*S_v + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
+                case GGML_OP_TURBO_WHT:
+                    {
+                        cur = 0;
                     } break;
                 case GGML_OP_COUNT:
                     {
@@ -3471,6 +3625,84 @@ enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct g
     cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
 
     return ggml_graph_compute(cgraph, &cplan);
+}
+
+// TurboQuant vec_dot: dequantize the turbo block to f32, then dot with the f32 operand.
+static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    float * tmp = (float *)malloc(n * sizeof(float));
+    GGML_ASSERT(tmp != NULL);
+    ggml_get_type_traits(GGML_TYPE_TURBO3_0)->to_float(vx, tmp, n);
+    const float * y = (const float *)vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += tmp[i] * y[i];
+    free(tmp);
+    *s = sum;
+}
+
+static void ggml_vec_dot_turbo2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    float * tmp = (float *)malloc(n * sizeof(float));
+    GGML_ASSERT(tmp != NULL);
+    ggml_get_type_traits(GGML_TYPE_TURBO2_0)->to_float(vx, tmp, n);
+    const float * y = (const float *)vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += tmp[i] * y[i];
+    free(tmp);
+    *s = sum;
+}
+
+static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    float * tmp = (float *)malloc(n * sizeof(float));
+    GGML_ASSERT(tmp != NULL);
+    ggml_get_type_traits(GGML_TYPE_TURBO4_0)->to_float(vx, tmp, n);
+    const float * y = (const float *)vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += tmp[i] * y[i];
+    free(tmp);
+    *s = sum;
+}
+
+static void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    float * tmp = (float *)malloc(n * sizeof(float));
+    float * tmp2 = (float *)malloc(n * sizeof(float));
+    GGML_ASSERT(tmp != NULL && tmp2 != NULL);
+    ggml_get_type_traits(GGML_TYPE_TQ3_1S)->to_float(vx, tmp, n);
+    ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(vy, tmp2, n);
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += tmp[i] * tmp2[i];
+    free(tmp); free(tmp2);
+    *s = sum;
+}
+
+static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    float * tmp = (float *)malloc(n * sizeof(float));
+    float * tmp2 = (float *)malloc(n * sizeof(float));
+    GGML_ASSERT(tmp != NULL && tmp2 != NULL);
+    ggml_get_type_traits(GGML_TYPE_TQ4_1S)->to_float(vx, tmp, n);
+    ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(vy, tmp2, n);
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += tmp[i] * tmp2[i];
+    free(tmp); free(tmp2);
+    *s = sum;
 }
 
 void ggml_cpu_fp32_to_fp32(const float * x, float * y, int64_t n) {
@@ -3933,4 +4165,8 @@ void ggml_cpu_init(void) {
     }
 
     ggml_critical_section_end();
+}
+
+ggml_cpu_vec_dot_multi_t ggml_cpu_get_vec_dot_multi(enum ggml_type type) {
+    return getenv("GGML_CPU_NO_MULTI_DOT") ? NULL : (ggml_cpu_vec_dot_multi_t) ggml_get_vec_dot_multi(type);
 }

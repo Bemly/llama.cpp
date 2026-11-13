@@ -1,5 +1,10 @@
 #include "llama-model-loader.h"
 
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-hostcache.h"
+#endif
+
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -39,6 +44,9 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
         case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
+        case LLAMA_FTYPE_MOSTLY_PQ2_0:
+        case LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY: name = LLAMA_FTYPE_PREFIX "PQ2_0 - 2.13 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_PTQ1_0:    name = LLAMA_FTYPE_PREFIX "PTQ1_0 - 1.75 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
@@ -408,8 +416,11 @@ namespace GGUFMeta {
         return get_arr(llm_kv(kid), result, required);
     }
 
+    template bool llama_model_loader::get_arr<std::string>(const std::string & key, std::vector<std::string> & result, bool required);
+    template bool llama_model_loader::get_arr<int32_t>(const std::string & key, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<int,     4>>(enum llm_kv kid, std::array<int,     4>   & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
@@ -438,6 +449,9 @@ namespace GGUFMeta {
     }
 
     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
+    template bool llama_model_loader::get_key<bool>       (const std::string & key, bool & result,        bool required);
+    template bool llama_model_loader::get_key<uint32_t>   (const std::string & key, uint32_t & result,    bool required);
+    template bool llama_model_loader::get_key<std::string>(const std::string & key, std::string & result, bool required);
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
@@ -779,6 +793,8 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
+            case GGML_TYPE_PQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_PQ2_0;   break;
+            case GGML_TYPE_PTQ1_0:  ftype = LLAMA_FTYPE_MOSTLY_PTQ1_0;  break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -1128,6 +1144,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            max_n_tensors += hparams.n_layer()*3; // expert slot banks
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
@@ -1334,6 +1351,65 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
+
+    // one tensor out of the file's gate and up experts: the rows of an expert sit together,
+    // so the graph issues one mul_mat_id where it would issue two
+    if (flags & TENSOR_FUSE_GATE_UP) {
+        const std::string fused_name = tn.str();
+        const size_t pos = fused_name.find("gate_up");
+        GGML_ASSERT(pos != std::string::npos && ne.size() == 3);
+
+        std::string name_a = fused_name; name_a.replace(pos, 7, "gate");
+        std::string name_b = fused_name; name_b.replace(pos, 7, "up");
+
+        const auto * wa = get_weight(name_a.c_str());
+        const auto * wb = get_weight(name_b.c_str());
+        if (wa == nullptr || wb == nullptr) {
+            return NULL;
+        }
+
+        const ggml_tensor * ta = wa->tensor;
+        const ggml_tensor * tb = wb->tensor;
+        const int64_t n_embd_a   = ne.begin()[0];
+        const int64_t n_ff_fused = ne.begin()[1];
+        const int64_t n_exp_a    = ne.begin()[2];
+        if (ta->type != tb->type || wa->idx != wb->idx ||
+            ta->ne[0] != n_embd_a || tb->ne[0] != n_embd_a ||
+            ta->ne[1] != n_ff_fused/2 || tb->ne[1] != n_ff_fused/2 ||
+            ta->ne[2] != n_exp_a || tb->ne[2] != n_exp_a) {
+            return NULL;
+        }
+
+        ggml_tensor t_meta = *ta;
+        t_meta.ne[1] = n_ff_fused;
+        t_meta.nb[2] = t_meta.nb[1]*t_meta.ne[1];
+        t_meta.nb[3] = t_meta.nb[2]*t_meta.ne[2];
+        ggml_set_name(&t_meta, fused_name.c_str());
+
+        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+        if (buft == nullptr) {
+            return NULL;
+        }
+        // the fused tensor has no place in the file: a mapped CPU buffer cannot hold it and a
+        // repacking one only takes whole tensors, so those keep the file's two tensors
+        ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);   // null for the plain CPU type
+        const bool on_cpu = buft_dev == nullptr || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (on_cpu && (use_mmap || buft != ggml_backend_cpu_buffer_type())) {
+            return NULL;
+        }
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_tensor * fused = ggml_dup_tensor(ctx, &t_meta);
+        ggml_set_name(fused, fused_name.c_str());
+
+        fused_map.emplace(fused_name, llama_tensor_fused {
+                wa->idx, wa->offs, wb->offs, ggml_nbytes(ta)/(size_t) n_exp_a, n_exp_a });
+
+        n_created += 2;   // both file tensors are consumed here
+
+        return fused;
+    }
+
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
@@ -1607,6 +1683,31 @@ bool llama_model_loader::load_all_data(
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
     }
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    // bounded host cache: start it before the other weights are read, so filling it overlaps the load
+    if (tosh_hostcache_on()) {
+        int n_layer = 0, n_expert = 0;
+        for (ggml_tensor * cur : tensors) {
+            const char * name = ggml_get_name(cur);
+            int il = -1;
+            if (cur->buffer == nullptr || !ggml_backend_buffer_is_host(cur->buffer) || !tosh_hostcache_is_bank_name(name) ||
+                sscanf(name, "blk.%d.", &il) != 1) continue;
+            const auto it_fused = fused_map.find(name);
+            if (it_fused != fused_map.end()) {
+                const auto & fu = it_fused->second;
+                tosh_hostcache_note_fused_tensor(cur->data, ggml_nbytes(cur), files.at(fu.idx)->file_id(), fu.offs_a, fu.offs_b);
+            } else {
+                const auto & w = require_weight(name);
+                tosh_hostcache_note_file_tensor(cur->data, ggml_nbytes(cur), files.at(w.idx)->file_id(), w.offs);
+            }
+            const int part = strstr(name, ".ffn_up_exps.") ? 1 : strstr(name, ".ffn_down_exps.") ? 2 : 0;
+            tosh_hostcache_bind(il, part, cur->data, cur->nb[2], (int) cur->ne[2]);
+            n_layer = std::max(n_layer, il + 1);
+            n_expert = (int) cur->ne[2];
+        }
+        if (n_layer > 0) tosh_hostcache_start(n_layer, n_expert);
+    }
+#endif
 
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
@@ -1624,6 +1725,42 @@ bool llama_model_loader::load_all_data(
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
+            const auto it_fused = fused_map.find(ggml_get_name(cur));
+            if (it_fused != fused_map.end()) {
+                const auto & fu = it_fused->second;
+                const size_t dst_stride = ggml_nbytes(cur)/(size_t) fu.n_expert;
+                GGML_ASSERT(dst_stride == 2*fu.stride);
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+                if ((tosh_hostcache_on() || getenv("TOSH_DMOE_HOST_BYTECHECK")) && ggml_backend_buffer_is_host(cur->buffer) &&
+                    tosh_hostcache_is_bank_name(ggml_get_name(cur))) {
+                    tosh_hostcache_note_fused_tensor(cur->data, ggml_nbytes(cur), files.at(fu.idx)->file_id(), fu.offs_a, fu.offs_b);
+                    if (tosh_hostcache_on()) {
+                        size_done += ggml_nbytes(cur);
+                        continue;
+                    }
+                }
+#endif
+
+                std::vector<uint8_t> buf(dst_stride);
+                const auto & file = files.at(fu.idx);
+                const uint8_t * map_addr = mappings.empty() ? nullptr : (const uint8_t *) mappings.at(fu.idx)->addr();
+
+                for (int64_t e = 0; e < fu.n_expert; ++e) {
+                    if (map_addr) {
+                        memcpy(buf.data(),             map_addr + fu.offs_a + e*fu.stride, fu.stride);
+                        memcpy(buf.data() + fu.stride, map_addr + fu.offs_b + e*fu.stride, fu.stride);
+                    } else {
+                        file->seek(fu.offs_a + e*fu.stride, SEEK_SET);
+                        file->read_raw(buf.data(), fu.stride);
+                        file->seek(fu.offs_b + e*fu.stride, SEEK_SET);
+                        file->read_raw(buf.data() + fu.stride, fu.stride);
+                    }
+                    ggml_backend_tensor_set(cur, buf.data(), e*dst_stride, dst_stride);
+                }
+
+                size_done += ggml_nbytes(cur);
+                continue;
+            }
             // this can happen with split experts models
             continue;
         }
@@ -1671,6 +1808,17 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+            // experimental bounded host cache: the expert bank stays in the file, read on demand
+            if ((tosh_hostcache_on() || getenv("TOSH_DMOE_HOST_BYTECHECK")) && ggml_backend_buffer_is_host(cur->buffer) &&
+                tosh_hostcache_is_bank_name(ggml_get_name(cur))) {
+                tosh_hostcache_note_file_tensor(cur->data, n_size, file->file_id(), weight->offs);
+                if (tosh_hostcache_on()) {
+                    size_done += n_size;
+                    continue;
+                }
+            }
+#endif
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
@@ -1776,12 +1924,28 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
+            // pin the pages backing the weights kept in system memory for faster H2D copies
+            bool (*reg_fn)(void *, size_t) = nullptr;
+            void (*unreg_fn)(void *) = nullptr;
+            for (size_t i = 0; i < ggml_backend_dev_count() && !reg_fn; i++) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
+                reg_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+                unreg_fn = (void (*)(void *))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+            }
+
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
                 mapping->unmap_fragment(0, mmap_used.first);
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
+                }
+                if (mmap_used.second > mmap_used.first) {
+                    size_t n_registered = mapping->register_host(mmap_used.first, mmap_used.second, reg_fn, unreg_fn);
+                    if (n_registered > 0) {
+                        LLAMA_LOG_INFO("%s: pinned %.2f MiB of mapped model memory for faster H2D transfers\n",
+                                __func__, n_registered / 1024.0 / 1024.0);
+                    }
                 }
             }
         }

@@ -12,12 +12,26 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+// Activation-side transform of a Hadamard-folded weight (Prism ML): optional
+// head regroup, then optional sign flip, then the normalized blockwise Hadamard.
+struct llama_hadamard_transform {
+    ggml_tensor * rot;
+    ggml_tensor * signs; // nullptr for identity sign mode
+    // perm_rep > 1: the activation arrives as [hd, nk, rep] and the fold expects [hd, rep, nk]
+    int64_t perm_hd  = 0;
+    int64_t perm_nk  = 0;
+    int64_t perm_rep = 0;
+};
+using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
+
 struct llama_cparams;
+struct llama_vocab;
 struct llama_layer;
 struct llama_prec_policy;
 
@@ -795,6 +809,8 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     const llama_prec_policy * prec_policy = nullptr;
+    const llama_hadamard_rotations * hadamard_rotations;
+    const llama_hadamard_rotations * hadamard_inverses;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1038,6 +1054,11 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     const llama_prec_policy * prec_policy;
+    const llama_hadamard_rotations * hadamard_rotations;
+    const llama_hadamard_rotations * hadamard_inverses;
+
+    // folded weights that share an input share its transform
+    mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1061,11 +1082,32 @@ struct llm_graph_context {
              ggml_tensor * cur,
                      int   il) const;
 
+    // input of a matmul against w, with w's Hadamard transform applied when w is folded; a draft
+    // reading the target's tensors passes the target's maps
+    ggml_tensor * build_hadamard_input(
+              ggml_tensor * w,
+              ggml_tensor * cur,
+              const llama_hadamard_rotations * rotations = nullptr) const;
+
+    // rows looked up from table, back in the primal basis when table is Hadamard-latent
+    ggml_tensor * build_hadamard_lookup(
+              ggml_tensor * table,
+              ggml_tensor * rows,
+              const llama_hadamard_rotations * inverses = nullptr) const;
+
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
+
+    // logits of a draft head over the frequent prefix of a large vocabulary plus the control
+    // tokens at its end; the rest stay 0, which a top candidate always beats
+    ggml_tensor * build_mtp_head(
+        const llama_model & model,
+              ggml_tensor * head_w,
+              ggml_tensor * head_s,
+              ggml_tensor * cur) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
@@ -1141,7 +1183,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * overlap = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1167,7 +1210,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * overlap = nullptr) const;
 
     //
     // inputs
@@ -1232,6 +1276,22 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
+                    int   il) const;
+
+    // true on the MTP catch-up decode, whose output nobody reads: the graph can end at the K/V store
+    bool mtp_kv_only() const;
+
+    // write K/V into the cache without attending, for passes whose output nobody reads
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+                    int   il) const;
+
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv_iswa * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
                     int   il) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;

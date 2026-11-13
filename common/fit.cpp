@@ -181,7 +181,7 @@ static void common_params_fit_impl(
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+        throw common_params_fit_exception("automatic fitting is not implemented for --split-mode tensor");
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
@@ -892,7 +892,7 @@ enum common_params_fit_status common_fit_params(
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
-        LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
+        LOG_WRN("%s: not fitting params to free device memory: %s; continuing with the parameters as given\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;
     } catch (const std::runtime_error & e) {
         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());

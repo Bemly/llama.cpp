@@ -5,6 +5,12 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <thread>
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -175,12 +181,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
-    // an MTP-only file carries the MTP block, the embeddings and the LM head, but no trunk
-    const bool mtp_only    = n_layer_nextn > 0 && ml.get_weight(tn(LLM_TENSOR_HC_ATTN_NORM, "weight", 0).str().c_str()) == nullptr;
-    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
-    const int  mtp_flags   = ml.load_mtp ? 0 : TENSOR_SKIP;
+    const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a head shared with its target may leave the embeddings and the LM head to it
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -189,7 +195,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    if (output == NULL) {
+    if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -526,6 +532,19 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, cur);
 }
 
+// a draft head without embeddings or an LM head of its own borrows its target's
+static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams, const llama_model & model, const char * name) {
+    if (cparams.ctx_other == nullptr) {
+        throw std::runtime_error(format("qwen4exp MTP: this head has no '%s' of its own; "
+                                        "load it as a draft of its target model (-md)", name));
+    }
+    const llama_model & other = *llama_get_model(cparams.ctx_other);
+    if (other.hparams.n_embd != model.hparams.n_embd || other.vocab.n_tokens() != model.vocab.n_tokens()) {
+        throw std::runtime_error(format("qwen4exp MTP: draft and target disagree on the shape of '%s'", name));
+    }
+    return other;
+}
+
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build{}) {
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "qwen4exp MTP has a single block");
@@ -555,7 +574,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    ggml_tensor * tok_embd_w = model.tok_embd ? model.tok_embd : qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h = inp->h;
@@ -610,7 +630,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    const llama_model & head = model.output ? model : qwen4exp_shared_model(cparams, model, "output.weight");
+    cur = build_lora_mm(head.output, cur, head.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -714,6 +735,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->tail_idxs);
 
     // set_input fills them all, so keep them allocated even when no op reads them
+    ggml_build_forward_expand(gf, inp->k_idxs);
     ggml_build_forward_expand(gf, inp->pool_cells);
     ggml_build_forward_expand(gf, inp->pool_idxs);
     ggml_build_forward_expand(gf, inp->pool_mask);
@@ -732,6 +754,9 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->new_pool_rep);
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
+    ggml_build_forward_expand(gf, inp->new_pool_idxs);
+    ggml_build_forward_expand(gf, inp->new_pool_rep);
+    ggml_build_forward_expand(gf, inp->new_pool_pos);
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
@@ -1221,6 +1246,55 @@ public:
     std::vector<llama_token> prev;
 };
 
+// The table is mapped from the file and read row by row. Asking for the pages first lets the
+// reads run together instead of one blocking fault per row.
+static void qwen4exp_ple_prefetch(const ggml_tensor * table, const std::vector<int32_t> & rows) {
+#if defined(__APPLE__) || defined(__linux__)
+    if (table == nullptr || table->data == nullptr) {
+        return;
+    }
+    static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const size_t row_size = ggml_row_size(table->type, table->ne[0]);
+
+    // a row may straddle two pages, so both ends are asked for
+    std::vector<uintptr_t> pages;
+    pages.reserve(rows.size() * 2);
+    for (const int32_t r : rows) {
+        const uintptr_t first = (uintptr_t) table->data + (size_t) r * row_size;
+        pages.push_back(first & ~(page - 1));
+        pages.push_back((first + row_size - 1) & ~(page - 1));
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+
+    auto advise = [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            madvise((void *) pages[i], page, MADV_WILLNEED);
+        }
+    };
+
+    // the request itself costs time per page, which a prompt-sized batch spreads over a few threads
+    constexpr size_t n_threads   = 4;
+    constexpr size_t min_threads = 2048;
+    if (pages.size() < min_threads) {
+        advise(0, pages.size());
+        return;
+    }
+    std::vector<std::thread> workers;
+    const size_t step = (pages.size() + n_threads - 1) / n_threads;
+    for (size_t t = 1; t < n_threads; ++t) {
+        workers.emplace_back(advise, std::min(pages.size(), t * step), std::min(pages.size(), (t + 1) * step));
+    }
+    advise(0, std::min(pages.size(), step));
+    for (auto & w : workers) {
+        w.join();
+    }
+#else
+    GGML_UNUSED(table);
+    GGML_UNUSED(rows);
+#endif
+}
+
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hparams = model.hparams;
 
@@ -1285,9 +1359,18 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
-        const bool prefetch = model.can_prefetch.count(ple);
+        static const bool tosh_prefetch = [] {
+            const char * v = getenv("TOSH_PLE_PREFETCH");
+            return v == nullptr || atoi(v) != 0;
+        }();
+        const bool prefetch = tosh_prefetch && model.can_prefetch.count(ple);
         if (prefetch) {
+#if defined(__APPLE__)
+            // llama_prefetch only acts on Linux and Windows
+            qwen4exp_ple_prefetch(ple, idx);
+#else
             llama_prefetch_rows(ple, idx.data(), idx.size());
+#endif
         }
     }
 

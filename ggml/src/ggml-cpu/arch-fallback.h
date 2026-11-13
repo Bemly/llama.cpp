@@ -1,6 +1,13 @@
 
 #pragma once
 
+// only x86 has a SIMD dot for the Prism group-128 types
+#if defined(GGML_CPU_GENERIC) || !(defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64))
+#define ggml_vec_dot_pq2_0_q8_0_generic ggml_vec_dot_pq2_0_q8_0
+#define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_get_vec_dot_multi_generic ggml_get_vec_dot_multi
+#endif
+
 // Rename `_generic` functions if no native implementation is available.
 // This effectively selects the generic implementation.
 
@@ -87,7 +94,6 @@
 #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 // quants.c
-#define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4

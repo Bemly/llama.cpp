@@ -99,6 +99,9 @@ json format_error_response(const std::string & message, const enum error_type ty
 //
 
 std::string random_string();
+
+// compares two secrets in time that does not depend on where they differ
+bool same_secret(const std::string & a, const std::string & b);
 std::string gen_chatcmplid();
 std::string gen_tool_call_id();
 

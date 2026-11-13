@@ -11,6 +11,8 @@ struct caps {
     bool supports_tools = true;
     bool supports_tool_calls = true;
     bool supports_system_role = true;
+    // a system message after the conversation started reaches the prompt (some templates drop or reject it)
+    bool supports_late_system = true;
     bool supports_parallel_tool_calls = true;
 
     // supports preserve reasoning trace in the full history, not just the last assistant message
