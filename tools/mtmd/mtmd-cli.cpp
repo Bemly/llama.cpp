@@ -159,7 +159,10 @@ struct mtmd_cli_context {
         mparams.device           = params.mmproj_device;
         mparams.print_timings    = true;
         mparams.n_threads        = params.cpuparams.n_threads;
-        mparams.flash_attn_type  = params.flash_attn_type;
+        // encoder heads (e.g. 72/80) the GPU FA kernels lack would run FA on the CPU when forced,
+        // so a forced LLM setting lets the encoder resolve FA per backend
+        mparams.flash_attn_type  = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED
+            ? LLAMA_FLASH_ATTN_TYPE_AUTO : params.flash_attn_type;
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;

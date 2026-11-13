@@ -1249,7 +1249,10 @@ private:
             mparams.device           = params_base.mmproj_device;
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
-            mparams.flash_attn_type  = params_base.flash_attn_type;
+            // encoder heads (e.g. 72/80) the GPU FA kernels lack would run FA on the CPU when forced,
+            // so a forced LLM setting lets the encoder resolve FA per backend
+            mparams.flash_attn_type  = params_base.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED
+                ? LLAMA_FLASH_ATTN_TYPE_AUTO : params_base.flash_attn_type;
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;

@@ -403,7 +403,7 @@ static const cmd_params cmd_params_defaults = {
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
-    /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
+    /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_ENABLED },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
