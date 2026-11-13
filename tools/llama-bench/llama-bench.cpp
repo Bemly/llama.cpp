@@ -521,6 +521,15 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
+    if (s == "turbo2") {
+        return GGML_TYPE_TURBO2_0;
+    }
+    if (s == "turbo3") {
+        return GGML_TYPE_TURBO3_0;
+    }
+    if (s == "turbo4") {
+        return GGML_TYPE_TURBO4_0;
+    }
 
     return GGML_TYPE_COUNT;
 }
@@ -2119,7 +2128,9 @@ struct markdown_printer : public printer {
     }
 
     void print_footer() override {
-        fprintf(fout, "\nbuild: %s (%d)\n", test::build_commit.c_str(), test::build_number);
+        // the build number only tracks upstream, so name the engine version too
+        fprintf(fout, "\nbuild: %s (%d), ToshLLM engine %s\n", test::build_commit.c_str(), test::build_number,
+                common_tosh_version());
     }
 };
 

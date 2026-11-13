@@ -31,10 +31,18 @@
 #define N_SG_Q2_0 2
 
 #define N_R0_PQ2_0 8
+#define N_R0_PQ2_0_H 8
+#define N_R0_PQ2_0_NC 8
 #define N_SG_PQ2_0 2
 
+#define N_R0_PTQ1_0 4
+#define N_R0_PTQ1_0_NC 8
+#define N_R0_PTQ1_0_W64 8
+#define N_SG_PTQ1_0_W64 1
+#define N_SG_PTQ1_0 2
+
 #define N_R0_Q4_0 4
-#define N_SG_Q4_0 2
+#define N_SG_Q4_0 1
 
 #define N_R0_Q4_1 4
 #define N_SG_Q4_1 2
@@ -55,22 +63,22 @@
 #endif
 #define N_SG_Q8_0 4
 
-#define N_R0_MXFP4 2
-#define N_SG_MXFP4 2
+#define N_R0_MXFP4 4
+#define N_SG_MXFP4 1
 
 #define N_R0_Q2_K 4
-#define N_SG_Q2_K 2
+#define N_SG_Q2_K 1
 
-#define N_R0_Q3_K 2
+#define N_R0_Q3_K 4
 #define N_SG_Q3_K 2
 
 #define N_R0_Q4_K 2
 #define N_SG_Q4_K 2
 
-#define N_R0_Q5_K 1
-#define N_SG_Q5_K 2
+#define N_R0_Q5_K 2
+#define N_SG_Q5_K 1
 
-#define N_R0_Q6_K 2
+#define N_R0_Q6_K 4
 #define N_SG_Q6_K 2
 
 #define N_R0_IQ1_S 4
@@ -105,6 +113,7 @@
 #define N_SG_IQ4_NL 2
 
 #define N_R0_IQ4_XS 2
+#define N_R0_IQ4_XS_NC_W64 4
 #define N_SG_IQ4_XS 2
 
 #define N_R0_TQ2_0 4
@@ -138,6 +147,8 @@
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
 #define FC_GROUP_NORM                  2500
+#define FC_TURBO_WHT                   2600
+#define FC_FWHT                        2700
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -156,6 +167,9 @@
 #define OP_LIGHTNING_INDEXER_NKPSG   8
 #define OP_LIGHTNING_INDEXER_NSG     8
 #define OP_LIGHTNING_INDEXER_NBPTG   8
+// GPUs without simdgroup matrices: keys and query rows per threadgroup of the scalar kernel
+#define OP_LIGHTNING_INDEXER_AMD_NK  64
+#define OP_LIGHTNING_INDEXER_AMD_NB   4
 
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
@@ -256,6 +270,8 @@ typedef struct {
     float    val;
     float    min;
     float    max;
+    float    pre;  // SILU/SIGMOID: input and output factors of a fused SCALE
+    float    post;
 } ggml_metal_kargs_unary;
 
 typedef struct {
@@ -508,7 +524,49 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+    int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
 } ggml_metal_kargs_flash_attn_ext_vec;
+
+// the AMD kernels take their own copy: a field added to the upstream vec struct changes the
+// constant buffer layout and with it the code the Metal compiler emits for them
+typedef struct {
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;
+    int32_t  ne_12_2; // assume K and V are same shape
+    int32_t  ne_12_3;
+    int32_t  ns10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ns20;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne31;
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    float    scale;
+    float    max_bias;
+    float    m0;
+    float    m1;
+    int32_t  n_head_log2;
+    float    logit_softcap;
+    int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+    int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
+    int32_t  n_kv_max_padded; // sparse: length of the per-row index list
+} ggml_metal_kargs_flash_attn_ext_amd;
 
 typedef struct {
     int32_t  ne30;
@@ -556,7 +614,7 @@ typedef struct {
     uint64_t nbq_d;       // dst strides by role (dst is [DV,H,N,B], Q is [DK,N,H,B])
     uint64_t nbh_d;       // nbq_d = dst nb[2], nbh_d = dst nb[1], nbb_d = dst nb[3]
     uint64_t nbb_d;
-} ggml_metal_kargs_flash_attn_ext_amd;
+} ggml_metal_kargs_flash_attn_ext_rdna2;
 
 typedef struct {
     int32_t  ne02;        // n_head
@@ -605,6 +663,17 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mv;
+
+// Three independent decode projections sharing the same activation. The Metal
+// backend recognizes adjacent Q/V/K MUL_MAT nodes and launches them as one grid;
+// each segment retains its own strides because mixed GGUF quants are common.
+typedef struct {
+    ggml_metal_kargs_mul_mv q;
+    ggml_metal_kargs_mul_mv v;
+    ggml_metal_kargs_mul_mv k;
+    uint32_t                nwg_q;
+    uint32_t                nwg_v;
+} ggml_metal_kargs_mul_mv_qvk;
 
 typedef struct {
     int32_t  ne00;
@@ -685,6 +754,14 @@ typedef struct {
     int32_t  nr0;
 } ggml_metal_kargs_mul_mv_id;
 
+typedef struct {
+    ggml_metal_kargs_mul_mv_id mv;
+    uint64_t nbg1; // per-expert stride of the gate bias
+    uint64_t nbu1; // and of the up bias
+    float    alpha;
+    float    limit;
+} ggml_metal_kargs_mul_mv_id_swiglu_oai;
+
 // NORM
 // RMS_NORM
 typedef struct {
@@ -702,6 +779,21 @@ typedef struct {
     uint64_t nbf3[3];
     float    scale;
 } ggml_metal_kargs_norm;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+} ggml_metal_kargs_rms_norm_back;
 
 typedef struct {
     int32_t  ne00;
@@ -987,12 +1079,57 @@ typedef struct {
 } ggml_metal_kargs_soft_max;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    scale;
+} ggml_metal_kargs_soft_max_back;
+
+typedef struct {
+    int32_t  ne00;   // classes per row
+    uint64_t nb01;   // logits row stride
+    uint64_t nb1;    // gradient row stride (backward only)
+} ggml_metal_kargs_cross_entropy_rows;
+
+typedef struct {
+    int32_t  n;
+} ggml_metal_kargs_count_equal_masked;
+
+typedef struct {
+    int32_t  ne01;      // queries
+    int32_t  ne02;      // query heads
+    int32_t  ne11;      // keys
+    int32_t  ne12;      // key/value heads
+    int32_t  ne13;      // sequences: dv sits after the dk of every one of them in the DKV result
+    uint64_t nb01, nb02, nb03;  // q
+    uint64_t nb11, nb12, nb13;  // k
+    uint64_t nb21, nb22, nb23;  // v
+    uint64_t nb31, nb32, nb33;  // mask (f16)
+    int32_t  ne32, ne33;        // mask heads and sequences, broadcast
+    int32_t  has_mask;
+    uint64_t nbo1, nbo2, nbo3;  // o: [dv, heads, queries]
+    uint64_t nbg1, nbg2, nbg3;  // gradient of o, same layout
+    uint64_t nbs1, nbs2, nbs3;  // stats: [2, queries, heads]
+    uint64_t nb1, nb2, nb3;     // result
+    float    scale;
+} ggml_metal_kargs_flash_attn_ext_back;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;
     uint64_t nb00;
     uint64_t nb01;
     uint64_t nb02;
+    int64_t  ne10;
     int64_t  ne11;
     uint64_t nb10;
     uint64_t nb11;
@@ -1077,8 +1214,33 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
-    uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
+    uint64_t s_nb1;  // cache row stride when the state is read straight from the cache
+    uint64_t sd_nb1; // cache row stride when the new state is written straight into it
+    float    eps_q;  // l2 norm of q and k done in the kernel: x / sqrt(sum(x^2) + eps)
+    float    eps_k;
 } ggml_metal_kargs_gated_delta_net;
+
+typedef struct {
+    int32_t  H;   // value heads
+    int32_t  Hq;  // q/k heads, each shared by H/Hq value heads
+    int32_t  T;   // tokens per sequence
+    int32_t  B;   // sequences
+    int32_t  NT;  // chunks of 64 tokens per sequence
+    int32_t  has_dht;
+    uint64_t nb01, nb02, nb03; // q
+    uint64_t nb11, nb12, nb13; // k
+    uint64_t nb21, nb22, nb23; // v
+    uint64_t nb31, nb32, nb33; // g
+    uint64_t nb41, nb42, nb43; // beta
+    uint64_t nb52, nb53;       // initial state
+    uint64_t offs;             // the scratch, in bytes after the start of dst
+    float    scale;
+} ggml_metal_kargs_gated_delta_net_back;
+
+typedef struct {
+    int64_t  n_elements;
+    int32_t  direction;
+} ggml_metal_kargs_turbo_wht;
 
 typedef struct {
     int32_t  ne00;
@@ -1337,9 +1499,38 @@ typedef struct {
 } ggml_metal_kargs_moe_reduce;
 
 typedef struct {
+    int32_t n_expert;
+    int32_t n_expert_used;
+    int32_t nrows;
+    int32_t mode;            // 0 softmax, 1 sigmoid, 2 sqrt(softplus), 3 raw (delayed softmax)
+    int32_t with_norm;
+    int32_t delayed_softmax;
+    int32_t has_bias;
+    float   clamp;
+    float   scale;
+} ggml_metal_kargs_tosh_topk_moe;
+
+typedef struct {
     int32_t nrows;
     int32_t n_blk; // sign rows per activation row (K / N); 0 = no sign flip fused in
 } ggml_metal_kargs_fwht;
+
+typedef struct {
+    int32_t nrows;  // rows of the output, one transform block each
+    int32_t nsign;  // width of the sign vector, 0 for none
+} ggml_metal_kargs_fwht_fused;
+
+typedef struct {
+    int32_t  ne00;   // row width, a whole number of 1024 blocks
+    float    eps;
+    uint64_t nb01;   // row strides of the input, the norm output and the transform output
+    uint64_t nb1n;
+    uint64_t nb1h;
+    int32_t  write_norm;
+    int32_t  add;    // the row is the sum of two inputs, written out as well
+    uint64_t nb11;
+    uint64_t nb1a;
+} ggml_metal_kargs_rms_norm_fwht;
 
 typedef struct {
     int64_t  ne0;
@@ -1501,5 +1692,17 @@ typedef struct {
 typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
+
+#if !defined(__METAL_VERSION__)
+#include <stdlib.h>
+// getenv walks the whole environment under a lock, and the encode path asks the same names once
+// per node and token: each call site reads its variable once
+#ifdef __cplusplus
+#define TOSH_ENV(name) ([]() -> const char * { static const char * tosh_env_v = getenv(name); return tosh_env_v; }())
+#else
+#define TOSH_ENV(name) ({ static int tosh_env_i = 0; static const char * tosh_env_v = NULL; \
+    if (!tosh_env_i) { tosh_env_v = getenv(name); tosh_env_i = 1; } tosh_env_v; })
+#endif
+#endif
 
 #endif // GGML_METAL_IMPL

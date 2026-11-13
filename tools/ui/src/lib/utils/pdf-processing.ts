@@ -48,6 +48,42 @@ async function getFileAsBuffer(file: File): Promise<ArrayBuffer> {
 }
 
 /**
+ * The PDF's own text page by page, for a PDF sent as page images: "[Page N]" before each page and an end line, or
+ * an empty string when it has no usable text layer, as a scan has none.
+ * @param file - The PDF file to process
+ * @returns Promise resolving to the text layer, or ''
+ */
+export async function convertPDFToTextLayer(file: File): Promise<string> {
+	if (!browser) {
+		return '';
+	}
+
+	try {
+		const buffer = await getFileAsBuffer(file);
+		const pdf = await pdfjs.getDocument({ data: buffer }).promise;
+		const pages: string[] = [];
+
+		for (let i = 1; i <= pdf.numPages; i++) {
+			const page = await pdf.getPage(i);
+			const content = await page.getTextContent();
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const text = content.items.map((item: any) => (item.str ?? '') + (item.hasEOL ? '\n' : ' ')).join('');
+			pages.push(text.replace(/[ \t]+\n/g, '\n').trim());
+		}
+
+		if (pages.join('').replace(/\s/g, '').length < 80) {
+			return '';
+		}
+
+		return pages.map((text, i) => `[Page ${i + 1}]\n${text}`).join('\n') + '\n[End of text layer]';
+	} catch (error) {
+		console.warn('Could not read the PDF text layer:', error);
+
+		return '';
+	}
+}
+
+/**
  * Extract text content from a PDF file
  * @param file - The PDF file to process
  * @returns Promise resolving to the extracted text content
@@ -86,10 +122,10 @@ export async function convertPDFToText(file: File): Promise<string> {
 /**
  * Convert PDF pages to PNG images as data URLs
  * @param file - The PDF file to convert
- * @param scale - Rendering scale factor (default: 1.5)
+ * @param megapixels - Size each page is drawn at, as the image size setting lets it reach the model (default: scale 1.5)
  * @returns Promise resolving to array of PNG data URLs
  */
-export async function convertPDFToImage(file: File, scale: number = 1.5): Promise<string[]> {
+export async function convertPDFToImage(file: File, megapixels: number = 0): Promise<string[]> {
 	if (!browser) {
 		throw new Error('PDF processing is only available in the browser');
 	}
@@ -101,6 +137,12 @@ export async function convertPDFToImage(file: File, scale: number = 1.5): Promis
 
 		for (let i = 1; i <= doc.numPages; i++) {
 			const page = await doc.getPage(i);
+			const base = page.getViewport({ scale: 1 });
+			// a scan's figures need the pixels the setting allows; scale 1.5 makes a letter page 1.1 MP
+			const scale =
+				megapixels > 0
+					? Math.max(1.5, Math.sqrt((megapixels * 1e6) / (base.width * base.height)))
+					: 1.5;
 			const viewport = page.getViewport({ scale });
 			const canvas = document.createElement('canvas');
 			const ctx = canvas.getContext('2d');
@@ -120,7 +162,10 @@ export async function convertPDFToImage(file: File, scale: number = 1.5): Promis
 
 			pages.push(
 				task.promise.then(() => {
-					return canvas.toDataURL(MimeTypeImage.PNG);
+					// a page drawn large is a scan photo by now: JPEG keeps it a few times smaller than PNG
+					return scale > 1.5
+						? canvas.toDataURL(MimeTypeImage.JPEG, 0.92)
+						: canvas.toDataURL(MimeTypeImage.PNG);
 				})
 			);
 		}

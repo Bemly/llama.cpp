@@ -16,17 +16,45 @@
 #include <algorithm>
 #include <atomic>
 #include <clocale>
-#include <exception>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <random>
+#include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 #include <unordered_map>
 
 #if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include <arpa/inet.h>
 #endif
 
 static std::function<void(int)> shutdown_handler;
+
+// an address only this computer reaches: loopback in IPv4 or IPv6, or a UNIX socket; a host name may resolve elsewhere
+static bool tosh_local_address(std::string host) {
+    if (host == "localhost" || string_ends_with(host, ".sock")) {
+        return true;
+    }
+    if (host.size() > 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    unsigned char v4[4];
+    if (inet_pton(AF_INET, host.c_str(), v4) == 1) {
+        return v4[0] == 127;
+    }
+    unsigned char v6[16];
+    if (inet_pton(AF_INET6, host.c_str(), v6) != 1) {
+        return false;
+    }
+    const unsigned char loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    const unsigned char mapped[12]   = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    return std::equal(v6, v6 + 16, loopback) || (std::equal(v6, v6 + 12, mapped) && v6[12] == 127);
+}
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
 static inline void signal_handler(int signal) {
@@ -58,6 +86,306 @@ void llama_server_terminate() {
     }
 }
 
+
+// The Tosh agent (--mcp-agent NAME) answers /v1/chat/completions with the "run" tool of the MCP server
+// NAME, which calls this server back for raw inference and /tools. The contract, per request:
+//   X-Tosh-Agent: off (or raw)  raw model inference, always
+//   X-Tosh-Agent: on            the agent; refused when the server runs none or the request brings tools
+//                               (with --mcp-agent-client-tools, tools of the client's own go to the agent too)
+//   no header                   the agent, unless the server takes it on request only (--mcp-agent-explicit)
+//                               and the request does not come from a page in a browser (the bundled web chat),
+//                               or the request brings tools, functions, a grammar, json_schema or
+//                               response_format: then raw, so clients that run their own tools are unaffected
+static std::string tosh_header(const server_http_req & req, const char * name) {
+    for (const auto & [key, value] : req.headers) {
+        std::string k = key, v = value;
+        std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+        std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+        if (k == name) {
+            return v;
+        }
+    }
+    return "";
+}
+
+static bool tosh_agent_constrained(const json & body, bool client_tools) {
+    for (const char * key : {"tools", "functions", "grammar", "json_schema", "response_format"}) {
+        if (client_tools && (std::string(key) == "tools" || std::string(key) == "functions")) {
+            continue;
+        }
+        if (body.contains(key) && !body.at(key).is_null() && !(body.at(key).is_array() && body.at(key).empty())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static json tosh_agent_answer(const json & out, int & status) {
+    status = 502;
+    auto failure = [](const std::string & message) {
+        return json{{"error", {{"message", message}, {"type", "agent_error"}}}};
+    };
+    if (out.contains("error")) {
+        return failure(out.at("error").is_string() ? out.at("error").get<std::string>() : out.at("error").dump());
+    }
+    if (!out.contains("plain_text_response") || !out.at("plain_text_response").is_string()) {
+        return failure("the agent gave no answer");
+    }
+    json answer;
+    try {
+        answer = json::parse(out.at("plain_text_response").get<std::string>());
+    } catch (const std::exception &) {
+        return failure("the agent gave no answer");
+    }
+    if (!answer.is_object()) {
+        return failure("the agent gave no answer");
+    }
+    if (answer.contains("error")) {
+        status = answer.value("status", 500);
+        answer.erase("status");
+        return answer;
+    }
+    status = 200;
+    return answer;
+}
+
+// the answer goes out once the agent has checked it, except the text of a pass it streamed live; before that
+// only progress events and keep-alives. `streamed` is the text already sent since the last retracted pass
+static std::vector<std::string> tosh_agent_chunks(const json & answer, int status, const json & head,
+                                                  const std::string & streamed, bool retracted, bool started) {
+    if (status != 200) {
+        return {"data: " + answer.dump() + "\n\n", "data: [DONE]\n\n"};
+    }
+    std::string content;
+    if (answer.contains("choices") && answer.at("choices").is_array() && !answer.at("choices").empty()) {
+        content = answer.at("choices").at(0).value("message", json::object()).value("content", "");
+    }
+    if (!streamed.empty() && content.compare(0, streamed.size(), streamed) == 0) {
+        content.erase(0, streamed.size());
+    } else if (retracted || !streamed.empty()) {
+        // a client that cannot drop the text it was shown reads the answer after it
+        content = "\n\n" + content;
+    }
+    json delta = {{"content", content}};
+    if (!started) {
+        delta["role"] = "assistant";
+    }
+    // calls to the client's own tools, which the client runs and sends back
+    json calls = json::array();
+    if (answer.contains("choices") && answer.at("choices").is_array() && !answer.at("choices").empty()) {
+        json message = answer.at("choices").at(0).value("message", json::object());
+        if (message.contains("tool_calls") && message.at("tool_calls").is_array()) {
+            calls = message.at("tool_calls");
+        }
+    }
+    for (size_t i = 0; i < calls.size(); i++) {
+        calls[i]["index"] = (int) i;
+    }
+    if (!calls.empty()) {
+        delta["tool_calls"] = calls;
+    }
+    // an answer the agent says was cut at its token limit keeps that reason, so a client can say so
+    std::string finish = calls.empty() ? "stop" : "tool_calls";
+    if (calls.empty() && answer.contains("choices") && answer.at("choices").is_array() && !answer.at("choices").empty() &&
+        answer.at("choices").at(0).value("finish_reason", "") == "length") {
+        finish = "length";
+    }
+    json first = head;
+    first["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}});
+    json last = head;
+    last["choices"] = json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", finish}}});
+    for (const char * key : {"usage", "tosh"}) {
+        if (answer.contains(key)) {
+            last[key] = answer.at(key);
+        }
+    }
+    return {"data: " + first.dump() + "\n\n", "data: " + last.dump() + "\n\n", "data: [DONE]\n\n"};
+}
+
+struct tosh_agent_state {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<json> events;
+    std::atomic<bool> cancelled{false};
+    bool done = false;
+    json out;
+};
+
+// a client that goes away stops the agent, its model passes and its tool calls, unless the request names its
+// conversation: then the agent runs to its end into the replay buffer, where the client picks the answer up again
+struct tosh_agent_res : server_res_spipe {
+    std::shared_ptr<tosh_agent_state> state;
+    void on_complete() override {
+        server_res_spipe::on_complete();
+        state->cancelled = true;
+        state->cv.notify_all();
+    }
+};
+
+static server_http_res_ptr tosh_agent_refuse(const std::string & message) {
+    auto res = std::make_unique<server_http_res>();
+    res->status = 400;
+    res->data = json{{"error", {{"message", message}, {"type", "invalid_request_error"}}}}.dump();
+    return res;
+}
+
+// 256 bits from the system's generator
+static std::string tosh_agent_key() {
+    std::random_device rd;
+    std::string key;
+    for (int i = 0; i < 8; i++) {
+        key += string_format("%08x", (unsigned) rd());
+    }
+    return key;
+}
+
+static server_http_context::handler_t tosh_agent_handler(server_http_context::handler_t raw,
+                                                         server_mcp & mcp_mgr,
+                                                         const common_params & params,
+                                                         const std::string & agent_key) {
+    return [raw, &mcp_mgr, &params, agent_key](const server_http_req & req) -> server_http_res_ptr {
+        const std::string mode = tosh_header(req, "x-tosh-agent");
+        if (mode == "off" || mode == "raw") {
+            return raw(req);
+        }
+        const bool asked = mode == "on";
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            return raw(req);
+        }
+        if (params.mcp_agent.empty()) {
+            return asked ? tosh_agent_refuse("this server runs no Tosh agent: start it with --mcp-agent") : raw(req);
+        }
+        if (!body.is_object() || tosh_agent_constrained(body, params.mcp_agent_client_tools)) {
+            return asked ? tosh_agent_refuse("a request for the Tosh agent cannot bring tools, functions, a grammar or a response format")
+                         : raw(req);
+        }
+        // browsers mark every request with one of these; a page never gets the MCP tools for its own loop
+        const bool browser = !tosh_header(req, "sec-fetch-site").empty() || !tosh_header(req, "origin").empty();
+        if (!asked && params.mcp_agent_explicit && !browser) {
+            return raw(req);
+        }
+        std::string host = params.hostnames.empty() ? "127.0.0.1" : params.hostnames.front();
+        if (host.empty() || host == "0.0.0.0" || host == "::") {
+            host = "127.0.0.1";
+        }
+        // an IPv6 literal goes in brackets, the % of its zone written %25 (RFC 6874)
+        if (host.find(':') != std::string::npos) {
+            std::string escaped;
+            for (char c : host) {
+                escaped += c == '%' ? std::string("%25") : std::string(1, c);
+            }
+            host = "[" + escaped + "]";
+        }
+        json args = {{"request", body},
+                     {"base_url", "http://" + host + ":" + std::to_string(params.port)},
+                     {"api_key", params.api_keys.empty() ? "" : params.api_keys.front()},
+                     {"agent_key", agent_key}};
+        if (!body.value("stream", false)) {
+            auto res = std::make_unique<server_http_res>();
+            int status = 502;
+            json answer = tosh_agent_answer(mcp_mgr.call_tool(params.mcp_agent, "run", args, req.should_stop), status);
+            res->status = status;
+            res->data = answer.dump();
+            return res;
+        }
+        auto state = std::make_shared<tosh_agent_state>();
+        std::thread([state, args, &mcp_mgr, name = params.mcp_agent]() {
+            json out = mcp_mgr.call_tool(name, "run", args,
+                [state]() { return state->cancelled.load(); },
+                [state](const json & progress) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->events.push_back(progress);
+                    state->cv.notify_all();
+                });
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->out = std::move(out);
+            state->done = true;
+            state->cv.notify_all();
+        }).detach();
+        auto res = std::make_unique<tosh_agent_res>();
+        res->set_req(&req);
+        res->state = state;
+        res->content_type = "text/event-stream";
+        res->status = 200;
+        json head = {{"id", "chatcmpl-tosh-" + tosh_agent_key().substr(0, 32)}, {"object", "chat.completion.chunk"},
+                     {"created", (int64_t) time(nullptr)},
+                     {"model", body.contains("model") && body.at("model").is_string() ? body.at("model").get<std::string>() : "tosh-agent"}};
+        auto gone = [self = res.get()]() { return self->should_stop(); };
+        res->set_next([state, gone, head, finals = std::vector<std::string>(), sent = size_t(0),
+                     streamed = std::string(), retracted = false, started = false](std::string & output) mutable -> bool {
+            if (finals.empty()) {
+                std::unique_lock<std::mutex> lock(state->mutex);
+                // a keep-alive every 5 s, but a client that went away is noticed within a second
+                for (int i = 0; i < 5 && !state->done && state->events.empty(); i++) {
+                    state->cv.wait_for(lock, std::chrono::seconds(1), [&] { return state->done || !state->events.empty(); });
+                    if (gone()) {
+                        state->cancelled = true;
+                        state->cv.notify_all();
+                        return false;
+                    }
+                }
+                if (!state->events.empty()) {
+                    json progress = state->events.front();
+                    state->events.pop_front();
+                    json event = progress.value("message", json());
+                    if (event.is_string()) {
+                        try {
+                            event = json::parse(event.get<std::string>());
+                        } catch (const std::exception &) {
+                        }
+                    }
+                    const std::string type = event.is_object() ? event.value("type", "") : "";
+                    // text of a pass the agent streams live goes out as the model writes it
+                    if (type == "delta") {
+                        json delta = json::object();
+                        for (const char * field : {"content", "reasoning_content"}) {
+                            if (event.contains(field) && event.at(field).is_string()) {
+                                std::string text = event.at(field).get<std::string>();
+                                if (std::string(field) == "content") {
+                                    streamed += text;
+                                    if (retracted && streamed.size() == text.size()) {
+                                        text = "\n\n" + text;
+                                    }
+                                }
+                                delta[field] = text;
+                            }
+                        }
+                        if (!started) {
+                            delta["role"] = "assistant";
+                            started = true;
+                        }
+                        json chunk = head;
+                        chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}});
+                        output = "data: " + chunk.dump() + "\n\n";
+                        return true;
+                    }
+                    // that pass ended in tool calls: its text was not the answer
+                    if (type == "retract") {
+                        retracted = retracted || !streamed.empty();
+                        streamed.clear();
+                    }
+                    json chunk = {{"object", "chat.completion.chunk"},
+                                  {"choices", json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", nullptr}}})},
+                                  {"tosh", {{"version", 1}, {"event", event}}}};
+                    output = "data: " + chunk.dump() + "\n\n";
+                    return true;
+                }
+                if (!state->done) {
+                    output = ": keep-alive\n\n";
+                    return true;
+                }
+                int status = 502;
+                finals = tosh_agent_chunks(tosh_agent_answer(state->out, status), status, head, streamed, retracted, started);
+            }
+            output = finals[sent++];
+            return sent < finals.size();
+        });
+        return res;
+    };
+}
 
 // wrapper function that handles exceptions and logs errors
 // this is to make sure handler_t never throws exceptions; instead, it returns an error response
@@ -170,7 +498,9 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 }
 
 // the API of every server; a router points the handlers in routes at its proxies before calling this
-static void server_register_routes(server_http_context & ctx_http, server_routes & routes) {
+// agent_key: shown by the Tosh agent to /tools for the servers only it may use, empty without --mcp-agent
+static void server_register_routes(server_http_context & ctx_http, server_routes & routes,
+                                   const common_params & params, server_mcp & mcp_mgr, const std::string & agent_key) {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
@@ -181,8 +511,10 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
+    // also without an agent, so that X-Tosh-Agent: on is refused instead of silently answered raw
+    auto chat_completions = tosh_agent_handler(routes.post_chat_completions, mcp_mgr, params, agent_key);
+    ctx_http.post("/chat/completions",         ex_wrapper(chat_completions));
+    ctx_http.post("/v1/chat/completions",      ex_wrapper(chat_completions));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
@@ -241,7 +573,8 @@ static bool server_setup_features(
         const common_params & params,
         server_mcp & mcp_mgr,
         server_tools & tools,
-        server_role_type role_type) {
+        server_role_type role_type,
+        const std::string & agent_key) {
     // return 403 for disabled features
     server_http_context::handler_t res_403 = [](const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
@@ -264,10 +597,11 @@ static bool server_setup_features(
     const bool loopback_only = std::all_of(params.hostnames.begin(), params.hostnames.end(), [](const std::string & h) {
         return string_ends_with(h, ".sock") || h == "localhost" || h == "::1" || h == "[::1]" || string_starts_with(h, "127.");
     });
+    // ToshLLM serves the LAN without a key on request: built-in tools then stay for this computer
+    // (server_tools local_only) and the warning below names what other computers reach, so this only warns
     if (tools_enabled && !loopback_only && params.api_keys.empty() && !params.server_tools_allow_unauth) {
-        SRV_ERR("%s", "security: server tools, MCP servers or MCP proxy are enabled on a non-loopback address without an API key\n");
-        SRV_ERR("%s", "set --api-key, bind to 127.0.0.1, or pass --allow-unauthenticated-tools on a trusted network\n");
-        return false;
+        SRV_WRN("%s", "security: server tools, MCP servers or MCP proxy are enabled on a non-loopback address without an API key\n");
+        SRV_WRN("%s", "set --api-key, bind to 127.0.0.1, or pass --allow-unauthenticated-tools on a trusted network\n");
     }
 
     std::vector<std::string> warn_names;
@@ -298,7 +632,14 @@ static bool server_setup_features(
 
     if (!params.server_tools.empty() || !mcp_mgr.empty()) {
         try {
-            tools.setup(params.server_tools, mcp_mgr, params.server_tools_runtime);
+            std::set<std::string> agent_only;
+            for (const auto & name : string_split<std::string>(params.mcp_agent_only, ',')) {
+                if (!name.empty()) {
+                    agent_only.insert(name);
+                }
+            }
+            tools.setup(params.server_tools, mcp_mgr, params.server_tools_runtime, params.mcp_agent, agent_only, agent_key,
+                        !params.api_keys.empty());
         } catch (const std::exception & e) {
             SRV_ERR("tools setup failed: %s\n", e.what());
             return false;
@@ -326,6 +667,31 @@ static bool server_setup_features(
             features += name;
         }
         SRV_WRN("security: %s enabled - do not expose to untrusted environments\n", features.c_str());
+    }
+
+    // serving others without a key is the administrator's choice, made knowing what they reach
+    if (params.api_keys.empty()) {
+        std::vector<std::string> open;
+        for (const auto & host : params.hostnames) {
+            if (!host.empty() && !tosh_local_address(host)) {
+                open.push_back(host);
+            }
+        }
+        if (!open.empty()) {
+            std::string what = role_type == SERVER_ROLE_ROUTER ? "the API and its models" : "the API and the model";
+            if (!mcp_mgr.empty()) {
+                what += ", the MCP servers " + string_join(mcp_mgr.server_names(), ", ");
+            }
+            if (params.ui_mcp_proxy) {
+                what += ", the web UI's MCP proxy";
+            }
+            if (!params.server_tools.empty()) {
+                what += " (built-in tools stay for this computer)";
+            }
+            SRV_WRN("security: listening on %s without an API key: other computers that can reach %s can use %s; "
+                    "--api-key makes clients send a key\n",
+                    string_join(open, ", ").c_str(), open.size() == 1 ? "it" : "them", what.c_str());
+        }
     }
 
     return true;
@@ -558,13 +924,16 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
     ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
 
-    server_register_routes(ctx_http, routes);
+    // new on every start
+    const std::string agent_key = params.mcp_agent.empty() ? "" : tosh_agent_key();
+
+    server_register_routes(ctx_http, routes, params, mcp_mgr, agent_key);
     server_register_stream_routes(ctx_http,
         models_routes->router_stream_get,
         models_routes->router_streams_lookup,
         models_routes->router_stream_delete);
 
-    if (!server_setup_features(ctx_http, params, mcp_mgr, tools, SERVER_ROLE_ROUTER)) {
+    if (!server_setup_features(ctx_http, params, mcp_mgr, tools, SERVER_ROLE_ROUTER, agent_key)) {
         return 1;
     }
 
@@ -660,13 +1029,16 @@ static int server_run_instance(common_params & params, server_role & role, commo
         return 1;
     }
 
-    server_register_routes(ctx_http, routes);
+    // new on every start
+    const std::string agent_key = params.mcp_agent.empty() ? "" : tosh_agent_key();
+
+    server_register_routes(ctx_http, routes, params, mcp_mgr, agent_key);
     server_register_stream_routes(ctx_http,
         server_stream_make_get_handler(),
         server_stream_make_lookup_handler(),
         server_stream_make_delete_handler());
 
-    if (!server_setup_features(ctx_http, params, mcp_mgr, tools, SERVER_ROLE_INSTANCE)) {
+    if (!server_setup_features(ctx_http, params, mcp_mgr, tools, SERVER_ROLE_INSTANCE, agent_key)) {
         return 1;
     }
 

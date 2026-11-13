@@ -322,8 +322,10 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llm_graph_params & params) : 
 
     res->add_input(std::move(inp));
 
+    const bool kv_only = mtp_kv_only();
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
     auto * inp_attn = build_attn_inp_kv_iswa();
 
     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, cohere2moe_norm_type, il);
@@ -351,6 +353,11 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llm_graph_params & params) : 
     cb(Qcur, "mtp_Qcur", il);
     cb(Kcur, "mtp_Kcur", il);
     cb(Vcur, "mtp_Vcur", il);
+
+    if (kv_only) {
+        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
+        return;
+    }
 
     cur = build_attn(inp_attn,
             layer.wo, layer.wo_b, layer.wo_s,

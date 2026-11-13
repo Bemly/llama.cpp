@@ -324,3 +324,10 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
 
     return true;
 }
+
+void common_reasoning_budget_accept_prompt(struct llama_sampler * smpl, llama_token token) {
+    if (!smpl) {
+        return;
+    }
+    common_reasoning_budget_accept_prefill(smpl, token);
+}

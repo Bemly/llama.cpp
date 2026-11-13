@@ -88,7 +88,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
             )
         );
 
-        auto content = p.content(p.until(TOOL_CALL_START));
+        auto content = p.required_preamble(p.content(p.until(TOOL_CALL_START)), TOOL_CALL_START, inputs, THINK_START, THINK_END);
 
         return generation_prompt + reasoning + content + tool_calls + end;
     });

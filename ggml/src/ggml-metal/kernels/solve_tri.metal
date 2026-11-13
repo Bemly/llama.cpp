@@ -3,6 +3,7 @@
 constant short FC_solve_tri_nsg [[function_constant(FC_SOLVE_TRI + 0)]];
 constant short FC_solve_tri_n   [[function_constant(FC_SOLVE_TRI + 1)]];
 constant short FC_solve_tri_k   [[function_constant(FC_SOLVE_TRI + 2)]];
+constant short FC_solve_tri_nw  [[function_constant(FC_SOLVE_TRI + 3)]];
 
 kernel void kernel_solve_tri_f32(
         constant ggml_metal_kargs_solve_tri & args,
@@ -14,7 +15,9 @@ kernel void kernel_solve_tri_f32(
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    constexpr short NW = N_SIMDWIDTH;
+    // real simd width from the host (64 on AMD GCN/Vega), so the lane
+    // partitioning and simd_sum below match the hardware simdgroup
+    const short NW = FC_solve_tri_nw;
 
     const short NSG = FC_solve_tri_nsg;
     const short N   = FC_solve_tri_n;

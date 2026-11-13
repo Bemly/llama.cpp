@@ -182,8 +182,9 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                 content_ends.insert(content_ends.end(), { "\n\n" + start, "\n" + start, start });
             }
 
-            return generation_prompt +
-                   (reasoning << p.content(p.until_one_of(content_ends)) << tool_calls);
+            auto content = p.required_preamble(p.content(p.until_one_of(content_ends)), "<tool_call>", inputs,
+                                                supports_reasoning ? "<think>" : "", supports_reasoning ? "</think>" : "");
+            return generation_prompt + (reasoning << content << tool_calls);
         }
 
         // Content only parser

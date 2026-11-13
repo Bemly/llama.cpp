@@ -104,6 +104,9 @@ std::filesystem::path get_server_exec_path();
 //
 
 std::string random_string();
+
+// compares two secrets in time that does not depend on where they differ
+bool same_secret(const std::string & a, const std::string & b);
 std::string gen_chatcmplid();
 std::string gen_tool_call_id();
 

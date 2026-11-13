@@ -1997,7 +1997,14 @@ static std::unique_ptr<server_tools_runtime> make_tools_runtime(const std::strin
 
 void server_tools::setup(const std::vector<std::string> & enabled_tools,
                          server_mcp & mcp_mgr,
-                         const std::string & tools_runtime) {
+                         const std::string & tools_runtime,
+                         const std::string & hidden_server,
+                         const std::set<std::string> & agent_only_servers,
+                         const std::string & agent_request_key,
+                         bool requests_keyed) {
+    agent_only = agent_only_servers;
+    agent_key  = agent_request_key;
+    keyed      = requests_keyed;
     if (!tools_runtime.empty()) {
         runtime = make_tools_runtime(tools_runtime);
     }
@@ -2044,6 +2051,10 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
         }
         size_t n_added = 0;
         for (const auto & def : mcp_mgr.list_tools()) {
+            // the agent answers chat requests; neither clients nor models call it as a tool
+            if (!hidden_server.empty() && def.server_name == hidden_server) {
+                continue;
+            }
             std::string mcp_name = def.server_name + "_" + def.name;
             if (seen_names.count(mcp_name)) {
                 SRV_WRN("MCP tool \"%s\" from server \"%s\" collides with an existing tool, skipping\n",
@@ -2059,11 +2070,45 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
         }
     }
 
-    handle_get = [this](const server_http_req &) -> server_http_res_ptr {
+    // A page in a browser runs its own agent loop on these tools, without the checks the Tosh agent
+    // puts around the MCP ones (math among them). It gets the built-in tools only; programs that are not
+    // browsers keep the whole list. Browsers mark every request with Sec-Fetch-Site or Origin.
+    auto from_browser = [](const server_http_req & req) {
+        return !get_header(req.headers, "sec-fetch-site").empty() || !get_header(req.headers, "origin").empty();
+    };
+
+    // Tools of an agent-only server are listed and run only for the agent, which proves itself with
+    // the key the engine handed it; any other client keeps the rest of the list.
+    auto hidden_from = [this](const server_http_req & req, const server_tool & tool) {
+        if (tool.type() != "mcp" || agent_only.empty()) {
+            return false;
+        }
+        const auto * mcp_tool = dynamic_cast<const server_mcp_tool *>(&tool);
+        if (mcp_tool == nullptr || agent_only.count(mcp_tool->server_name) == 0) {
+            return false;
+        }
+        return agent_key.empty() || !same_secret(get_header(req.headers, "x-tosh-agent-key"), agent_key);
+    };
+
+    // The built-in tools reach this computer's shell and files: another computer gets them only with the
+    // API key, which the server then checks on every request.
+    auto local_only = [this](const server_http_req & req, const server_tool & tool) {
+        if (tool.type() == "mcp" || keyed) {
+            return false;
+        }
+        const std::string & a = req.remote_addr;
+        return !(a.empty() || a == "::1" || a.rfind("127.", 0) == 0 || a.rfind("::ffff:127.", 0) == 0);
+    };
+
+    handle_get = [this, from_browser, hidden_from, local_only](const server_http_req & req) -> server_http_res_ptr {
         auto res = std::make_unique<server_http_res>();
         try {
             json result = json::array();
+            const bool browser = from_browser(req);
             for (const auto & t : tools) {
+                if ((browser && t->type() == "mcp") || hidden_from(req, *t) || local_only(req, *t)) {
+                    continue;
+                }
                 result.push_back(t->to_json());
             }
             res->data = safe_json_to_str(result);
@@ -2075,7 +2120,7 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
         return res;
     };
 
-    handle_post = [this](const server_http_req & req) -> server_http_res_ptr {
+    handle_post = [this, from_browser, hidden_from, local_only](const server_http_req & req) -> server_http_res_ptr {
         auto res = std::make_unique<server_tools_res>();
         try {
             json body = json::parse(req.body);
@@ -2119,6 +2164,22 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
             }
 
             server_tool & tool = find_tool(tools, tool_name, stream);
+            if (hidden_from(req, tool)) {
+                // the same answer as a tool that does not exist
+                throw std::invalid_argument(string_format("unknown tool \"%s\"", tool_name.c_str()));
+            }
+            if (local_only(req, tool)) {
+                res->status = 403;
+                res->data   = safe_json_to_str(format_error_response(
+                    "built-in tools run for this computer, or for others with the API key", ERROR_TYPE_PERMISSION));
+                return res;
+            }
+            if (from_browser(req) && tool.type() == "mcp") {
+                res->status = 403;
+                res->data   = safe_json_to_str(format_error_response(
+                    "MCP tools are not run for pages in a browser; use the Tosh agent", ERROR_TYPE_PERMISSION));
+                return res;
+            }
 
             if (stream) {
                 int id = res_id.fetch_add(1);

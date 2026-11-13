@@ -162,6 +162,12 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) batch small synchronous reads into one device round-trip;
+        // the define keeps ggml-metal buildable in trees without these members
+#define GGML_BACKEND_READ_BATCH 1
+        void (*read_batch_begin)(ggml_backend_t backend);
+        void (*read_batch_end)  (ggml_backend_t backend);
     };
 
     struct ggml_backend {

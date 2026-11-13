@@ -20,6 +20,7 @@ struct ggml_tensor;
 
 
 struct llama_cparams;
+struct llama_vocab;
 struct llama_layer;
 struct llama_model;
 struct llama_prec_policy;
@@ -1138,15 +1139,31 @@ struct llm_graph_context {
                      int   il) const;
 
     // apply the activation-side transform of a Hadamard-folded weight, if any
+    // a draft reading the target's tensors passes the target's transforms (default: this graph's hdmd)
     ggml_tensor * build_hadamard_input(
               ggml_tensor * w,
-              ggml_tensor * cur) const;
+              ggml_tensor * cur,
+      const llama_hadamard * h = nullptr) const;
+
+    // rows looked up from table, back in the primal basis when table is Hadamard-latent
+    ggml_tensor * build_hadamard_lookup(
+              ggml_tensor * table,
+              ggml_tensor * rows,
+      const llama_hadamard * h = nullptr) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
+
+    // logits of a draft head over the frequent prefix of a large vocabulary plus the control
+    // tokens at its end; the rest stay 0, which a top candidate always beats
+    ggml_tensor * build_mtp_head(
+        const llama_model & model,
+              ggml_tensor * head_w,
+              ggml_tensor * head_s,
+              ggml_tensor * cur) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see build_moe_cache_slots)
@@ -1232,7 +1249,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+             ggml_tensor * overlap = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1260,7 +1278,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+             ggml_tensor * overlap = nullptr) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     // with cpu_part, also the misses computed from the host experts, if the cache leaves any to the CPU
@@ -1348,6 +1367,22 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
+                    int   il) const;
+
+    // true on the MTP catch-up decode, whose output nobody reads: the graph can end at the K/V store
+    bool mtp_kv_only() const;
+
+    // write K/V into the cache without attending, for passes whose output nobody reads
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+                    int   il) const;
+
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv_iswa * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
                     int   il) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;

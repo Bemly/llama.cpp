@@ -205,6 +205,8 @@ public:
     // padded length of the longest cell list of the slices; 0 if kv_rows are not used (multiple streams)
     uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
+    void set_n_pad_graph(uint32_t n) { n_pad_graph = n; }
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -289,6 +291,9 @@ private:
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
+
+    // the floor of n_kv that keeps the graph the same across batches; training rebuilds it every step
+    uint32_t n_pad_graph = 256;
 
     // SWA
     const uint32_t n_swa = 0;

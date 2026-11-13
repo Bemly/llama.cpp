@@ -417,7 +417,11 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // a prompt-lookup window next to the MTP runs two tokens longer and must roll back cheaply too
+        const bool mtp = std::any_of(types.begin(), types.end(), [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+        const char * lookup = std::getenv("TOSH_MTP_LOOKUP");
+        const uint32_t extra = mtp && draft.n_max >= 1 && (lookup == nullptr || std::atoi(lookup) != 0) ? 2u : 0u;
+        return needs_rs_seq ? draft.n_max + extra : 0u;
     }
 };
 
@@ -495,6 +499,7 @@ struct common_params {
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+    bool    dynamic_moe        = false; // Tosh plans MoE memory: expert residency, host RAM and fallback
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
@@ -601,6 +606,7 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+    bool training          = false; // enable training mode (affects LoRA K/V gradient flow)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
 
@@ -662,6 +668,7 @@ struct common_params {
     std::string server_connect_code = "";
 
     std::string public_path   = "";                                                                         // NOLINT
+    std::string tiles_path    = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     std::vector<std::string> hostnames = {"127.0.0.1"};
@@ -710,6 +717,10 @@ struct common_params {
     // MCP server configs (Cursor-compatible JSON)
     std::string mcp_servers_config;   // path to JSON file with MCP server definitions
     std::string mcp_servers_json;     // inline JSON with MCP server definitions
+    std::string mcp_agent;            // MCP server whose "run" tool answers chat completions that bring no tools
+    bool        mcp_agent_explicit = false; // the agent answers only requests with X-Tosh-Agent: on
+    std::string mcp_agent_only;       // comma-separated MCP servers whose tools only the agent may list and call
+    bool        mcp_agent_client_tools = false; // requests with tools of their own go to the agent too
 
     // router server configs
     std::string models_dir    = "";     // directory containing models for the router server
@@ -799,6 +810,9 @@ void common_init();
 
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
+
+// engine version stamped from VERSION, unlike the upstream build number
+const char * common_tosh_version(void);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
@@ -1017,6 +1031,9 @@ struct common_init_result {
     void reset_samplers();
 
     std::vector<llama_adapter_lora_ptr> & lora();
+
+    // drops the model and context after a failure found once they exist
+    void release();
 
 private:
     struct impl;
@@ -1323,6 +1340,7 @@ struct common_no_init_allocator : std::allocator<T> {
 
 // sequence state data, filled by llama_state_seq_get_data_ext()
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
+using common_ckpt_buffer = common_state_data;
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;

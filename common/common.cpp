@@ -8,6 +8,10 @@
 #include "../src/llama-ext.h"
 
 #include "fit.h"
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-hostcache.h"
+#endif
+#include "tosh-plan.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -415,6 +419,18 @@ void common_init() {
     llama_log_set(common_log_default_callback, NULL);
 }
 
+// Stamped by build-engines.sh from VERSION. Passed unquoted so the value needs no
+// escaping through cmake, hence the stringify.
+#ifndef TOSH_VERSION
+#define TOSH_VERSION unknown
+#endif
+#define TOSH_STRINGIFY2(x) #x
+#define TOSH_STRINGIFY(x) TOSH_STRINGIFY2(x)
+
+const char * common_tosh_version(void) {
+    return TOSH_STRINGIFY(TOSH_VERSION);
+}
+
 void common_params_print_info(const common_params & params, bool print_devices) {
 #ifdef NDEBUG
     const char * build_type = "";
@@ -422,6 +438,14 @@ void common_params_print_info(const common_params & params, bool print_devices) 
     const char * build_type = " (debug)";
 #endif
     COM_TRC("%s: build %d (%s) with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
+
+    // The build number above only tracks the upstream commit, unchanged across
+    // releases that only touch the patch. No env var means a direct CLI run.
+    {
+        const char * app_version = std::getenv("TOSH_APP_VERSION");
+        COM_INF("%s: ToshLLM engine %s (app %s)\n", __func__, common_tosh_version(),
+                app_version ? app_version : "standalone");
+    }
 
     const int verbosity = common_log_get_verbosity_thold();
     COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
@@ -1275,6 +1299,23 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    {
+        tosh_plan plan;
+        const bool planned = tosh_plan_apply(params, &plan);
+        if (!planned && plan.state == TOSH_PLAN_NOT_PLANNED && !params.dynamic_moe && getenv("TOSH_AUTO") == nullptr) {
+            LOG_INF("Tosh MoE: standard\n");
+        }
+        if (!planned && plan.state != TOSH_PLAN_UNSUPPORTED) {
+            tosh_plan_checkpoints(params);
+        }
+        // no plan fits: loading with the defaults would hand memory to a layout nobody checked
+        if (plan.state == TOSH_PLAN_UNSUPPORTED && getenv("TOSH_AUTO_DRY_RUN") == nullptr) {
+            LOG_ERR("%s: TOSH_AUTO found no configuration that fits (%s), the model is not loaded\n", __func__, plan.primary_reason.c_str());
+            tosh_plan_report_load("PLAN_REFUSED", plan.primary_reason.c_str());
+            return;
+        }
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1282,6 +1323,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     llama_model * model = common_model_load(params.model.get_paths(), mparams);
     if (model == NULL) {
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        // a host memory lock that failed during the load is an allocation failure, not a bad model
+        const char * err = tosh_hostcache_error();
+        tosh_plan_report_load(err && strstr(err, "NOT_LOCKABLE") ? "ALLOCATION_FAILED" : "MODEL_LOAD_FAILED", err);
+#else
+        tosh_plan_report_load("MODEL_LOAD_FAILED");
+#endif
         return;
     }
 
@@ -1386,6 +1434,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        const char * err = tosh_hostcache_error();
+        tosh_plan_report_load(err && strstr(err, "NOT_LOCKABLE") ? "ALLOCATION_FAILED" : "CONTEXT_FAILED", err);
+#else
+        tosh_plan_report_load("CONTEXT_FAILED");
+#endif
         return;
     }
 
@@ -1394,6 +1448,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
+}
+
+void common_init_result::release() {
+    pimpl->context.reset();
+    pimpl->model.reset();
 }
 
 llama_model * common_init_result::model() {
@@ -1546,6 +1605,16 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
     }
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    // an expert cache that could not be locked would page: fail rather than run on it
+    if (!tosh_hostcache_warmup_done()) {
+        COM_ERR("%s: %s\n", __func__, tosh_hostcache_error() ? tosh_hostcache_error() : "the expert cache failed");
+        tosh_plan_report_load("ALLOCATION_FAILED", tosh_hostcache_error());
+        res->release();
+        return res;
+    }
+#endif
+    tosh_plan_report_load("READY");
 
     return res;
 }

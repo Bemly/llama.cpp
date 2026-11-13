@@ -11,6 +11,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1028,6 +1029,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
     bool use_dev_features = false;
 
+    // acceptance backoff: skip drafting while recent acceptance stays low (fall back to AR),
+    // probing periodically, so unpredictable content does not regress below the AR baseline
+    std::vector<float>   acc_ewma;     // per-seq EWMA of acceptance, starts at 1.0 (warm)
+    std::vector<int32_t> n_last_draft; // per-seq tokens drafted last step, 0 if skipped
+    std::vector<int32_t> steps_cold;   // per-seq skipped steps since the last probe
+    std::vector<int32_t> probe_gap;    // per-seq probe interval, doubles on a failed probe
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1162,6 +1170,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1331,17 +1340,47 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        static const float acc_min    = getenv("TOSH_DFLASH_ACC_MIN")   ? (float) atof(getenv("TOSH_DFLASH_ACC_MIN"))   : 0.6f;
+        static const int   probe_base = getenv("TOSH_DFLASH_PROBE")     ?         atoi(getenv("TOSH_DFLASH_PROBE"))     : 8;
+        static const int   probe_cap  = getenv("TOSH_DFLASH_PROBE_CAP") ?         atoi(getenv("TOSH_DFLASH_PROBE_CAP")) : 64;
+        if ((int) acc_ewma.size() != (int) n_seq) {
+            acc_ewma.assign(n_seq, 1.0f);
+            n_last_draft.assign(n_seq, 0);
+            steps_cold.assign(n_seq, 0);
+            probe_gap.assign(n_seq, probe_base);
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
             }
 
+            // while backed off, probe every probe_gap steps and double the gap on a failed probe,
+            // so a durable cold streak decays toward AR yet a late recovery is still caught
+            if (acc_ewma[seq_id] < acc_min) {
+                if (steps_cold[seq_id] < probe_gap[seq_id]) {
+                    n_last_draft[seq_id] = 0;
+                    steps_cold[seq_id]++;
+                    continue;
+                }
+                steps_cold[seq_id] = 0;
+                probe_gap[seq_id] = std::min(probe_gap[seq_id] * 2, probe_cap);
+            } else {
+                steps_cold[seq_id] = 0;
+                probe_gap[seq_id] = probe_base;
+            }
+
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            int32_t n_draft = params.n_max;
+            if (dp.n_max > 0) {
+                n_draft = std::min(n_draft, dp.n_max);
+            }
+            n_last_draft[seq_id] = n_draft;
+
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
@@ -1518,12 +1557,268 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (is_other || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        if ((int) acc_ewma.size() != (int) n_seq || n_last_draft[seq_id] <= 0) {
+            return;
+        }
+        static const float alpha = getenv("TOSH_DFLASH_EWMA") ? (float) atof(getenv("TOSH_DFLASH_EWMA")) : 0.5f;
+        const float acc = std::min(1.0f, (float) n_accepted / (float) n_last_draft[seq_id]);
+        const float a = acc > acc_ewma[seq_id] ? 0.2f : alpha;  // rise fast, fall at alpha
+        acc_ewma[seq_id] = a * acc_ewma[seq_id] + (1.0f - a) * acc;
+        n_last_draft[seq_id] = 0;
     }
 };
 
+// Prompt lookup: proposes what followed the longest earlier occurrence of the current suffix of the
+// history (prompt plus accepted tokens). Every trigram maps to its four most recent end positions in a
+// fixed open-addressing table, so appends are O(1) and memory stays bounded.
+struct common_suffix_drafter {
+    static constexpr int ways = 4;
+
+    struct slot {
+        uint64_t key = 0;   // trigram hash, 0 = empty
+        uint32_t pos[ways] = {};
+        uint8_t  n = 0;
+    };
+
+    int min_match = 3;
+    int max_match = 64;
+    std::vector<llama_token> hist;
+    std::vector<slot> table;
+    size_t mask = 0;
+    int last_match = 0;
+
+    void init(size_t capacity) {
+        size_t cap = 1;
+        while (cap < capacity*2) {
+            cap <<= 1;
+        }
+        table.assign(cap, slot{});
+        mask = cap - 1;
+        hist.clear();
+        hist.reserve(capacity);
+    }
+
+    void reset() {
+        hist.clear();
+        std::fill(table.begin(), table.end(), slot{});
+        last_match = 0;
+    }
+
+    static uint64_t mix(uint64_t x) {
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull;
+        x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull;
+        return x ^ (x >> 33);
+    }
+
+    uint64_t key_at(size_t end) const {
+        const uint64_t a = (uint32_t) hist[end - 2], b = (uint32_t) hist[end - 1], c = (uint32_t) hist[end];
+        return mix(a*0x9E3779B97F4A7C15ull ^ mix(b + 0x632BE59BD9B4E019ull) ^ (c << 1)) | 1ull;
+    }
+
+    slot * find(uint64_t key, bool insert) {
+        for (size_t i = key & mask, probes = 0; probes <= mask; i = (i + 1) & mask, ++probes) {
+            slot & sl = table[i];
+            if (sl.key == key) {
+                return &sl;
+            }
+            if (sl.key == 0) {
+                if (!insert) {
+                    return nullptr;
+                }
+                sl.key = key;
+                return &sl;
+            }
+        }
+        return nullptr;
+    }
+
+    void append(llama_token t) {
+        if (table.empty()) {
+            return;
+        }
+        hist.push_back(t);
+        const size_t end = hist.size() - 1;
+        if (end < 2) {
+            return;
+        }
+        slot * sl = find(key_at(end), true);
+        if (sl == nullptr) {
+            return;
+        }
+        for (int w = ways - 1; w > 0; --w) {
+            sl->pos[w] = sl->pos[w - 1];
+        }
+        sl->pos[0] = (uint32_t) end;
+        if (sl->n < ways) {
+            sl->n++;
+        }
+    }
+
+    int propose(int max_k, llama_token * out) {
+        last_match = 0;
+        const size_t n = hist.size();
+        if (n < 4 || max_k <= 0 || table.empty()) {
+            return 0;
+        }
+        const size_t cur = n - 1;
+        const slot * sl = find(key_at(cur), false);
+        if (sl == nullptr) {
+            return 0;
+        }
+        size_t best_end = 0;
+        int best_len = 0;
+        for (int w = 0; w < sl->n; ++w) {
+            const size_t p = sl->pos[w];
+            if (p >= cur) {
+                continue;
+            }
+            int len = 0;
+            while (len < max_match && len <= (int) p && hist[p - len] == hist[cur - len]) {
+                len++;
+            }
+            if (len > best_len) {   // most recent first, so ties keep the newer
+                best_len = len;
+                best_end = p;
+            }
+        }
+        if (best_len < min_match) {
+            return 0;
+        }
+        last_match = best_len;
+        int k = 0;
+        for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) {
+            out[k++] = hist[q];
+        }
+        return k;
+    }
+};
+
+// Per verify round: the MTP window, or a lookup window when its expected committed tokens per
+// millisecond beat the MTP's by a margin. Costs are measured round times per window size (sizes not
+// seen yet are scaled from seen ones by a prior shape); lookup acceptance is learned per bucket of
+// match length. Taking the lookup whenever it proposed more lost on ordinary text.
+struct common_speculative_lookup_policy {
+    static constexpr int max_t   = 8;
+    static constexpr int buckets = 4;
+
+    int    t_cap;
+    double margin = 0.03;
+    std::array<double, max_t + 1> cost{}, cost_n{};
+    std::array<double, max_t + 1> mtp_tok{}, mtp_n{};
+    std::array<double, buckets>   ok{}, bad{};
+
+    explicit common_speculative_lookup_policy(int t) : t_cap(std::clamp(t, 1, max_t)) {}
+
+    static int bucket(int match) {
+        return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
+    }
+
+    double lookup_rate(int match) const {
+        static constexpr double prior_q[buckets] = { 0.75, 0.88, 0.93, 0.96 };
+        static constexpr double prior_n = 4.0;
+        const int b = bucket(match);
+        return (ok[b] + prior_n*prior_q[b]) / (ok[b] + bad[b] + prior_n);
+    }
+
+    double cost_ms(int t) const {
+        static constexpr double shape[max_t + 1] = { 0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6 };
+        t = std::clamp(t, 1, max_t);
+        if (cost_n[t] > 0) {
+            return cost[t];
+        }
+        double num = 0.0, den = 0.0;
+        for (int u = 1; u <= max_t; ++u) {
+            if (cost_n[u] > 0) {
+                const double w = std::min(cost_n[u], 20.0);
+                num += w*cost[u]*shape[t]/shape[u];
+                den += w;
+            }
+        }
+        return den > 0 ? num/den : shape[t];
+    }
+
+    double mtp_tokens(int t) const {
+        return mtp_n[t] > 0 ? mtp_tok[t] : 1.0 + 0.7*(t - 1);
+    }
+
+    // window size t counts the committed token, so t - 1 drafts; 0 keeps the MTP window
+    int choose(int t_mtp, int lookup_k, int match) const {
+        t_mtp = std::clamp(t_mtp, 1, t_cap);
+        const double base = mtp_tokens(t_mtp) / cost_ms(t_mtp);
+        const double q = lookup_rate(match);
+        double e = 1.0, qi = 1.0, best = 0.0;
+        int best_t = 0;
+        for (int k = 1; k <= std::min(lookup_k, t_cap - 1); ++k) {
+            qi *= q;
+            e  += qi;
+            const double r = e / cost_ms(k + 1);
+            if (r > best) {
+                best   = r;
+                best_t = k + 1;
+            }
+        }
+        if (best_t > 0 && best > base*(1.0 + margin)) {
+            return best_t;
+        }
+        // a guessed cost could keep a size from ever being measured: try it a few times first
+        const int t_full = std::min(lookup_k, t_cap - 1) + 1;
+        if (t_full > t_mtp && cost_n[t_full] < 3 && q >= 0.85) {
+            return t_full;
+        }
+        return 0;
+    }
+
+    void observe(bool lookup, int t, int accepted, int match, double round_ms) {
+        static constexpr double cost_alpha = 0.1;
+        static constexpr double tok_alpha  = 0.05;
+        static constexpr double decay      = 0.97;
+        t = std::clamp(t, 1, max_t);
+        if (round_ms > 0) {
+            cost[t] = cost_n[t] > 0 ? (1.0 - cost_alpha)*cost[t] + cost_alpha*round_ms : round_ms;
+            cost_n[t] += 1.0;
+        }
+        if (lookup) {
+            const int b = bucket(match);
+            ok[b]  = decay*ok[b] + accepted;
+            bad[b] = decay*bad[b] + (accepted < t - 1 ? 1.0 : 0.0);
+        } else {
+            const double got = accepted + 1.0;
+            mtp_tok[t] = mtp_n[t] > 0 ? (1.0 - tok_alpha)*mtp_tok[t] + tok_alpha*got : got;
+            mtp_n[t] += 1.0;
+        }
+    }
+};
+
+static bool common_speculative_mtp_lookup_enabled() {
+    const char * v = getenv("TOSH_MTP_LOOKUP");
+    return v == nullptr || atoi(v) != 0;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+    // acceptance backoff, same policy as the DFlash planner
+    std::vector<float>   acc_ewma;     // per-seq EWMA of acceptance, starts at 1.0 (warm)
+    std::vector<int32_t> n_last_draft; // per-seq tokens drafted last step, 0 if skipped
+    std::vector<int32_t> steps_cold;   // per-seq skipped steps since the last probe
+    std::vector<int32_t> probe_gap;    // per-seq probe interval, doubles on a failed probe
+
+    // prompt lookup next to the MTP: its window may run two tokens past the MTP's
+    bool use_lookup = false;
+    std::unique_ptr<common_speculative_lookup_policy> lookup_policy;
+    std::vector<common_suffix_drafter> sfx;
+    struct round_state {
+        int64_t   t_us = -1;
+        llama_pos pos  = -1;
+        int       t    = 1;
+        int       match = 0;
+        bool      lookup = false;
+        int       t_prev = 0;   // window of the round before: a change of size rebuilds the verify graph
+    };
+    std::vector<round_state> rounds;
+
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     common_batch batch;
@@ -1569,6 +1864,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    dev_rows    = false;
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
+
+    // catch-up rows stashed while a sequence is backed off, replayed in one decode when it is
+    // about to draft again: per-token catch-up decodes are pure overhead if no draft reads them
+    struct cold_row { llama_token id; llama_pos pos; };
+    std::vector<std::vector<cold_row>> cold_rows;
+    std::vector<std::vector<float>>    cold_h;
+
+    static constexpr size_t cold_max = 128;
+
+    bool  cold_defer = true;
+    float acc_min    = 0.60f;
+    int   probe_base = 8;
+    int   probe_cap  = 24;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1624,7 +1932,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // ctx_other is also set for Qwen MTP so the KVMem factory can follow
-        // the target slot-pool. Shared-KV (Gemma4) is the same memory object.
+        // the target slot-pool, and a qwen4exp head borrows its target's embeddings but keeps
+        // its own cache. Shared-KV (Gemma4) is the same memory object.
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt
                 && llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt);
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -1641,8 +1950,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+        use_lookup = common_speculative_mtp_lookup_enabled() && !chain_heads && !is_mem_shared && this->params.n_max >= 1;
+        if (use_lookup) {
+            this->n_max = std::min(this->params.n_max + 2, common_speculative_lookup_policy::max_t - 1);
+            lookup_policy = std::make_unique<common_speculative_lookup_policy>(this->n_max + 1);
+            sfx.resize(n_seq);
+            rounds.assign(n_seq, {});
+        }
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+
+        cold_rows.assign(n_seq, {});
+        cold_h.assign(n_seq, {});
+
+        cold_defer = getenv("TOSH_MTP_COLD_DEFER_DISABLE") == nullptr;
+        // 0.65 sat above the acceptance real content reaches, so it backed off where drafting
+        // still paid; 0.60 keeps the win and still catches the unpredictable case.
+        acc_min    = getenv("TOSH_MTP_ACC_MIN")   ? (float) atof(getenv("TOSH_MTP_ACC_MIN"))   : acc_min;
+        probe_base = getenv("TOSH_MTP_PROBE")     ?         atoi(getenv("TOSH_MTP_PROBE"))     : probe_base;
+        probe_cap  = getenv("TOSH_MTP_PROBE_CAP") ?         atoi(getenv("TOSH_MTP_PROBE_CAP")) : probe_cap;
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1683,6 +2009,58 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         backend_chains.clear();
     }
 
+    // true if draft() will skip this seq, i.e. nothing will read its draft KV this step. mirrors
+    // the backoff gate exactly, and process() runs before draft() without touching that state
+    bool cold_step(llama_seq_id seq_id) const {
+        if (!cold_defer || (int) acc_ewma.size() != (int) n_seq) {
+            return false;
+        }
+
+        // a batch that verifies a draft can have its tail rejected and resent, so its rows must
+        // reach the KV now: only a plain single-token append is safe to hold back
+        if (n_last_draft[seq_id] != 0 || i_batch_end[seq_id] != i_batch_beg[seq_id]) {
+            return false;
+        }
+
+        return acc_ewma[seq_id] < acc_min && steps_cold[seq_id] < probe_gap[seq_id];
+    }
+
+    bool cold_flush(llama_seq_id seq_id) {
+        if (cold_rows[seq_id].empty()) {
+            return true;
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+
+        // a context shift or a checkpoint restore moves the draft KV under the stash; replaying it
+        // then would write at the wrong offset, so drop it and let the next catch-up decode resync
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+        bool ok = cold_rows[seq_id][0].pos == pos_max + 1;
+        if (ok) {
+            batch.clear();
+            for (size_t i = 0; i < cold_rows[seq_id].size(); ++i) {
+                const int32_t idx = batch.add(cold_rows[seq_id][i].id, cold_rows[seq_id][i].pos, seq_id, false);
+                batch.set_embd_state(idx, { cold_h[seq_id].data() + (size_t) i * n_embd, 1, (size_t) n_embd });
+            }
+
+            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (rc != 0) {
+                SPC_ERR("llama_process(ctx_dft) cold flush failed rc=%d (seq_id=%d, n=%d)\n",
+                        (int) rc, (int) seq_id, (int) cold_rows[seq_id].size());
+                ok = false;
+            }
+        } else {
+            SPC_WRN("draft KV moved under the cold stash (seq_id=%d, pos_max=%d, stash pos=%d), dropping it\n",
+                    (int) seq_id, (int) pos_max, (int) cold_rows[seq_id][0].pos);
+        }
+
+        cold_rows[seq_id].clear();
+        cold_h[seq_id].clear();
+
+        return ok;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
@@ -1690,6 +2068,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
+        }
+
+        cold_rows[seq_id].clear();
+        cold_h[seq_id].clear();
+
+        if (use_lookup) {
+            auto & sd = sfx[seq_id];
+            if (sd.table.empty()) {
+                sd.init((size_t) llama_n_ctx(this->params.ctx_tgt) + 4096);
+            }
+            sd.reset();
+            for (llama_token t : prompt) {
+                sd.append(t);
+            }
+            rounds[seq_id] = {};
         }
 
         auto * ctx_dft = this->params.ctx_dft;
@@ -1736,6 +2129,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        const bool can_defer = !is_mem_shared && !chain_heads;
+
+        // a deferred seq appends one token, whose h row is pending_h on the host even with dev_rows;
+        // a vision token carries an embedding instead of an id, so it is never stashed
+        auto defer_row = [&](llama_seq_id seq_id) {
+            if (!can_defer || !cold_step(seq_id) || cold_rows[seq_id].size() >= cold_max) {
+                return false;
+            }
+            return i_batch_beg[seq_id] < 0 || batch_in.tokens[i_batch_beg[seq_id]].id != LLAMA_TOKEN_NULL;
+        };
+
+        // flush before the batch is built: cold_flush reuses `batch`
+        if (can_defer) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const bool keep = defer_row(seq_id);
+                if (!cold_rows[seq_id].empty() && !keep) {
+                    cold_flush(seq_id);
+                }
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -1762,6 +2176,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const llama_seq_id seq_id = t.seq_id;
 
+                // stash the rows of backed-off sequences instead of decoding them
+                if (defer_row(seq_id)) {
+                    GGML_ASSERT(k == i_batch_beg[seq_id]);
+                    cold_rows[seq_id].push_back({ t.id, t.pos[0] });
+                    cold_h[seq_id].insert(cold_h[seq_id].end(), pending_h[seq_id].begin(), pending_h[seq_id].end());
+                    continue;
+                }
+
                 // vision tokens carry an embedding instead of an id
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
                     ? batch.add(t.id, t.pos[0], seq_id, false)
@@ -1777,6 +2199,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
                 batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+            }
+
+            if (batch.size() == 0) {
+                return finish_process(batch_in, row_bytes);
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1810,6 +2236,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return false;
             }
         }
+
+        return finish_process(batch_in, row_bytes);
+    }
+
+    bool finish_process(const common_batch & batch_in, size_t row_bytes) {
+        GGML_UNUSED(batch_in);
+
+        auto * ctx_tgt = this->params.ctx_tgt;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
@@ -1860,6 +2294,54 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        // "drafting" is cleared inside the loop when a seq drops out (p_min/n_max), so it can't
+        // report which seqs drafted; this latches that for the acceptance-backoff bookkeeping
+        std::vector<bool> drafted_this_step(n_seq, false);
+
+        if ((int) acc_ewma.size() != (int) n_seq) {
+            acc_ewma.assign(n_seq, 1.0f);
+            n_last_draft.assign(n_seq, 0);
+            steps_cold.assign(n_seq, 0);
+            probe_gap.assign(n_seq, probe_base);
+        }
+
+        const int64_t t_now = ggml_time_us();
+        int n_active = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            n_active += dparams[seq_id].drafting ? 1 : 0;
+        }
+        if (use_lookup) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                auto & rs = rounds[seq_id];
+                if (!dp.drafting || dp.prompt == nullptr) {
+                    continue;
+                }
+                // the round since the last draft call: its accepted tokens are the positions it advanced;
+                // another sequence sharing the steps would make the time not this window's
+                if (rs.t_us >= 0 && n_active == 1) {
+                    const int adv = (int) (dp.pos0 - rs.pos);
+                    const double ms = (t_now - rs.t_us) / 1000.0;
+                    if (adv >= 1 && adv <= rs.t && ms > 0.0 && ms < 5000.0) {
+                        // the round that changed size paid a graph rebuild: its acceptance counts, its time does not
+                        lookup_policy->observe(rs.lookup, rs.t, adv - 1, rs.match, rs.t == rs.t_prev ? ms : 0.0);
+                    }
+                }
+                rs.t_us = -1;
+                // the history is the prompt so far plus the last sampled token
+                auto & sd = sfx[seq_id];
+                const llama_tokens & pr = *dp.prompt;
+                if (sd.hist.size() > pr.size() + 1 || (!sd.hist.empty() && sd.hist.size() <= pr.size() && sd.hist.back() != pr[sd.hist.size() - 1])) {
+                    sd.reset();
+                }
+                for (size_t k = sd.hist.size(); k < pr.size(); ++k) {
+                    sd.append(pr[k]);
+                }
+                if (sd.hist.size() == pr.size()) {
+                    sd.append(dp.id_last);
+                }
+            }
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1868,8 +2350,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            // while backed off, probe every probe_gap steps and double the gap on a failed probe,
+            // so a durable cold streak decays toward AR yet a late recovery is still caught
+            if (acc_ewma[seq_id] < acc_min) {
+                if (steps_cold[seq_id] < probe_gap[seq_id]) {
+                    n_last_draft[seq_id] = 0;
+                    steps_cold[seq_id]++;
+                    continue;
+                }
+                steps_cold[seq_id] = 0;
+                probe_gap[seq_id] = std::min(probe_gap[seq_id] * 2, probe_cap);
+            } else {
+                steps_cold[seq_id] = 0;
+                probe_gap[seq_id] = probe_base;
+            }
+
             n_drafting++;
             drafting[seq_id] = true;
+            drafted_this_step[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
                 dp.result_q = nullptr;
@@ -2013,6 +2511,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
+            }
+            if (drafted_this_step[seq_id]) {
+                n_last_draft[seq_id] = (int32_t) dp.result->size();
+            }
+
+            if (use_lookup) {
+                auto & rs = rounds[seq_id];
+                auto & result = *dp.result;
+                const int t_prev = rs.t;
+                rs = {};
+                rs.t_prev = t_prev;
+                rs.t = (int) result.size() + 1;
+                // a lookup window competes only where the MTP's own first guess agrees with it
+                if (!result.empty()) {
+                    llama_token buf[common_speculative_lookup_policy::max_t];
+                    const int cap = std::min(this->n_max, dp.n_max > 0 ? dp.n_max : this->n_max);
+                    const int k = sfx[seq_id].propose(cap, buf);
+                    if (k > 0 && buf[0] == result[0]) {
+                        const int t = lookup_policy->choose(rs.t, k, sfx[seq_id].last_match);
+                        if (t > 0) {
+                            result.assign(buf, buf + (t - 1));
+                            // the window's tokens carry no draft distribution, so the target
+                            // verifies them by match instead of by rejection
+                            if (dp.result_q) {
+                                dp.result_q->clear();
+                            }
+                            rs.t      = t;
+                            rs.lookup = true;
+                            rs.match  = sfx[seq_id].last_match;
+                            n_last_draft[seq_id] = (int32_t) result.size();
+                        }
+                    }
+                }
+                rs.t_us = t_now;
+                rs.pos  = dp.pos0;
             }
         }
     }
@@ -2020,6 +2556,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (use_lookup && rounds[seq_id].lookup) {
+            n_last_draft[seq_id] = 0;   // a lookup window says nothing about the MTP's acceptance
+        }
+        if ((int) acc_ewma.size() == (int) n_seq && n_last_draft[seq_id] > 0) {
+            // one rejected draft of two halved the average at 0.5 and turned drafting off while
+            // acceptance still paid; 0.92 follows the last dozen drafts instead
+            static const float alpha = getenv("TOSH_MTP_EWMA") ? (float) atof(getenv("TOSH_MTP_EWMA")) : 0.92f;
+            const float acc = std::min(1.0f, (float) n_accepted / (float) n_last_draft[seq_id]);
+            const float a = acc > acc_ewma[seq_id] ? 0.2f : alpha;  // rise fast, fall at alpha
+            acc_ewma[seq_id] = a * acc_ewma[seq_id] + (1.0f - a) * acc;
+            n_last_draft[seq_id] = 0;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -2635,9 +3184,13 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
 
     for (const auto type : spec->types) {
         switch (type) {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                // a lookup window may run two tokens past the MTP's
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max) +
+                        (common_speculative_mtp_lookup_enabled() && spec->draft.n_max >= 1 ? 2 : 0));
+                break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
-            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));

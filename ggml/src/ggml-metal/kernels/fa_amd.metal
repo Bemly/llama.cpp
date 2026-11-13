@@ -19,7 +19,7 @@ constant bool HAS_MASK_FA_AMD [[function_constant(FC_FLASH_ATTN_EXT_AMD + 0)]];
 
 template <int DK, int DV, int NBC>
 kernel void kernel_flash_attn_ext_amd_vec_dk(
-        constant ggml_metal_kargs_flash_attn_ext_amd & args,
+        constant ggml_metal_kargs_flash_attn_ext_rdna2 & args,
         device  const char * q,
         device  const char * k,
         device  const char * v,
@@ -214,7 +214,7 @@ kernel void kernel_flash_attn_ext_amd_reduce_dk(
 
 template <int DK, int DV, int NBC, int NQ>
 kernel void kernel_flash_attn_ext_amd_tile_dk(
-        constant ggml_metal_kargs_flash_attn_ext_amd & args,
+        constant ggml_metal_kargs_flash_attn_ext_rdna2 & args,
         device  const char * q,
         device  const char * k,
         device  const char * v,
@@ -422,7 +422,7 @@ template [[host_name("kernel_flash_attn_ext_amd_tile_dk512_nbc32")]] kernel flas
 // ─────────────────────────── prefill pf kernels ───────────────────────────
 // Ported from ToshLLM (patches/shared-metal/0001-6-metal-flash-attn-amd.patch and
 // patches/image/0066-image-metal-fa-nomask.patch), Copyright (C) 2026 Engelbert Delgado,
-// GPL-3.0-or-later; adapted 2026-11-13 to ggml_metal_kargs_flash_attn_ext_amd, F16 KV only.
+// GPL-3.0-or-later; adapted 2026-11-13 to ggml_metal_kargs_flash_attn_ext_rdna2, F16 KV only.
 //
 // BQ queries stay resident while the cache streams in blocks of BK, so the score matrix never
 // reaches device memory. Q, K and V are staged in LDS and both products run as 4x4 register
@@ -431,7 +431,7 @@ template [[host_name("kernel_flash_attn_ext_amd_tile_dk512_nbc32")]] kernel flas
 
 template <short DK, short BQ, short BK, short NT>
 kernel void kernel_flash_attn_ext_amd_pf_dk(
-        constant ggml_metal_kargs_flash_attn_ext_amd & args,
+        constant ggml_metal_kargs_flash_attn_ext_rdna2 & args,
         device  const char * q,
         device  const char * k,
         device  const char * v,
@@ -664,7 +664,7 @@ kernel void kernel_flash_attn_ext_amd_pf_dk(
 // no mask: K and V load together into their own LDS regions, one barrier fewer per block
 template <short DK, short BQ, short BK, short NT>
 kernel void kernel_flash_attn_ext_amd_pf_nomask_dk(
-        constant ggml_metal_kargs_flash_attn_ext_amd & args,
+        constant ggml_metal_kargs_flash_attn_ext_rdna2 & args,
         device  const char * q,
         device  const char * k,
         device  const char * v,

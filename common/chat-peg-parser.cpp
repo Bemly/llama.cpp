@@ -890,6 +890,72 @@ common_peg_parser common_chat_peg_builder::prefix(const std::string & s, const s
     return literal(s.substr(0, s.find(delimiter)));
 }
 
+// Codepoints of a marker, so a multibyte marker is cut on characters.
+static std::vector<uint32_t> marker_codepoints(const std::string & text) {
+    std::vector<uint32_t> cps;
+    for (size_t i = 0; i < text.size();) {
+        unsigned char c   = text[i];
+        size_t        len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : 4;
+        uint32_t      cp  = len == 1 ? c : c & (0x3F >> (len - 1));
+        for (size_t j = 1; j < len && i + j < text.size(); j++) {
+            cp = (cp << 6) | (text[i + j] & 0x3F);
+        }
+        cps.push_back(cp);
+        i += len;
+    }
+    return cps;
+}
+
+static std::string gbnf_codepoint(uint32_t cp) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "\\U%08X", cp);
+    return buf;
+}
+
+static std::string gbnf_literal(const std::string & text) {
+    std::string out = "\"";
+    for (uint32_t cp : marker_codepoints(text)) {
+        out += gbnf_codepoint(cp);
+    }
+    return out + "\"";
+}
+
+// One piece of text that does not start `marker`, looking at its first `depth` characters.
+static std::string gbnf_not_starting(const std::string & marker, size_t depth) {
+    auto        cps = marker_codepoints(marker);
+    std::string chunk;
+    std::string prefix;
+    for (size_t i = 0; i < cps.size() && i < depth; i++) {
+        chunk += (chunk.empty() ? "" : " | ") + (prefix.empty() ? "" : "\"" + prefix + "\" ") + "[^" + gbnf_codepoint(cps[i]) + "]";
+        prefix += gbnf_codepoint(cps[i]);
+    }
+    return "(" + chunk + ")";
+}
+
+common_peg_parser common_chat_peg_builder::required_preamble(const common_peg_parser &           content,
+                                                             const std::string &                 call_start,
+                                                             const autoparser::generation_params & inputs,
+                                                             const std::string &                 think_start,
+                                                             const std::string &                 think_end) {
+    if (inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+        return content;
+    }
+    if (call_start.empty()) {
+        return gbnf(content, "\"\"");
+    }
+    // At most 64 pieces of text that do not start the call marker.
+    std::string preamble = gbnf_not_starting(call_start, 3) + "{0,64}";
+    if (inputs.enable_thinking && inputs.reasoning_format == COMMON_REASONING_FORMAT_NONE) {
+        // The reasoning is in this text: free up to its end tag, bounded after it. Without the tags, unbounded.
+        if (think_start.empty() || think_end.empty()) {
+            return content;
+        }
+        preamble = "(" + gbnf_literal(think_start) + " " + gbnf_not_starting(think_end, SIZE_MAX) + "* " +
+                   gbnf_literal(think_end) + ")? " + preamble;
+    }
+    return gbnf(content, preamble);
+}
+
 common_peg_parser common_chat_peg_builder::optspace(const std::string & tag) {
     auto parser = eps();
     size_t end_of_prefix_space = tag.size();

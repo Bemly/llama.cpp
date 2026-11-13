@@ -369,7 +369,7 @@ bool server_http_context::init_listener(const common_params & params) {
         }
 
         // validate the API key
-        if (std::find(api_keys.begin(), api_keys.end(), req_api_key) != api_keys.end()) {
+        if (std::any_of(api_keys.begin(), api_keys.end(), [&](const std::string & key) { return same_secret(key, req_api_key); })) {
             return true; // API key is valid
         }
 
@@ -483,6 +483,16 @@ bool server_http_context::init_listener(const common_params & params) {
     //
     // Web UI setup
     //
+
+    // a map reads its tiles in byte ranges; the CORS middleware above answers for the origin
+    if (!params.tiles_path.empty()) {
+        httplib::Headers tile_headers = {{"Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag"}};
+        if (const auto is_found = srv->set_mount_point(params.api_prefix + "/tiles", params.tiles_path, tile_headers);
+            !is_found) {
+            SRV_ERR("tiles path not found: %s\n", params.tiles_path.c_str());
+            return false;
+        }
+    }
 
     // Use new `params.ui` field (backed by old `params.webui` for compat)
     if (!params.ui) {
@@ -798,7 +808,8 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -849,7 +860,8 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -901,7 +913,8 @@ void server_http_context::ws(const std::string & path, const server_http_context
             build_query_string(req),
             req.body,
             {},
-            should_stop
+            should_stop,
+            req.remote_addr
         };
         handler(request, conn);
     };
@@ -920,7 +933,8 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);

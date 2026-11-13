@@ -125,6 +125,11 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_cpu_init(void);
 
+    // one weight row against nc (1..4) activation rows of its vec_dot type, each block unpacked once for all of
+    // them, the same result as nc separate vec_dot calls; NULL for types without one
+    typedef void (*ggml_cpu_vec_dot_multi_t)(int n, int nc, float * s, const void * vx, const void * const * vy);
+    GGML_BACKEND_API ggml_cpu_vec_dot_multi_t ggml_cpu_get_vec_dot_multi(enum ggml_type type);
+
     //
     // CPU backend
     //

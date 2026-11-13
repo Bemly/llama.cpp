@@ -154,6 +154,35 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+// Tensor parallelism across every device drops generation as 1/N, because a synchronisation point
+// costs the same whatever it carries. Grouping the devices keeps the tensor split inside each
+// group and the layer split between groups, which trades some prefill for most of the generation
+// back. TOSH_MGPU_TENSOR_GROUP is the group size; unset or 0 keeps one group, as before.
+static size_t llama_tensor_group_size(size_t n_devs) {
+    const char * s = getenv("TOSH_MGPU_TENSOR_GROUP");
+    if (s == nullptr) {
+        return n_devs;
+    }
+
+    const long g = atol(s);
+    if (g <= 0 || (size_t) g >= n_devs) {
+        return n_devs;
+    }
+
+    if (n_devs % (size_t) g != 0) {
+        LLAMA_LOG_WARN("%s: TOSH_MGPU_TENSOR_GROUP=%ld does not divide %zu devices, using one group\n",
+                __func__, g, n_devs);
+        return n_devs;
+    }
+
+    // the grouping is invisible in the log otherwise, so there is no way to tell whether the
+    // variable took effect
+    LLAMA_LOG_INFO("%s: TOSH_MGPU_TENSOR_GROUP=%ld: %zu devices in %zu groups of %ld\n",
+            __func__, g, n_devs, n_devs / (size_t) g, g);
+
+    return (size_t) g;
+}
+
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
@@ -171,12 +200,23 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
             }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
-            model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
+            const size_t n_group = llama_tensor_group_size(n_devs);
+            if (n_group < n_devs) {
+                LLAMA_LOG_INFO("%s: grouping them into %zu Meta devices of %zu\n", __func__, n_devs/n_group, n_group);
+            }
+            model->tensor_group_size = n_group;
+            model->get_split_state_uds.clear();
+            model->get_split_state_uds.reserve(n_devs/n_group);
+            for (size_t base = 0; base < n_devs; base += n_group) {
+                model->get_split_state_uds.push_back({ n_group, base, model });
+            }
+            for (size_t i = 0, base = 0; base < n_devs; base += n_group, i++) {
+                model->devices.push_back({
+                    true, ggml_backend_meta_device(
+                    params.devices + base, n_group, llama_meta_device_get_split_state,
+                    &model->get_split_state_uds[i])
+                });
+            }
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});
@@ -212,12 +252,23 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
-            gpus.push_back({
-                true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
+            const size_t n_group = llama_tensor_group_size(devs.size());
+            if (n_group < devs.size()) {
+                LLAMA_LOG_INFO("%s: grouping them into %zu Meta devices of %zu\n", __func__, devs.size()/n_group, n_group);
+            }
+            model->tensor_group_size = n_group;
+            model->get_split_state_uds.clear();
+            model->get_split_state_uds.reserve(devs.size()/n_group);
+            for (size_t base = 0; base < devs.size(); base += n_group) {
+                model->get_split_state_uds.push_back({ n_group, base, model });
+            }
+            for (size_t i = 0, base = 0; base < devs.size(); base += n_group, i++) {
+                gpus.push_back({
+                    true, ggml_backend_meta_device(
+                    devs.data() + base, n_group, llama_meta_device_get_split_state,
+                    &model->get_split_state_uds[i])
+                });
+            }
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);

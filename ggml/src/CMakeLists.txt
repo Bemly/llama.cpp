@@ -183,6 +183,10 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
+if (TOSH_ENABLE_DYNAMIC_MOE)
+    set(TOSH_MOE_SOURCES ${CMAKE_SOURCE_DIR}/tosh-moe/tosh-dmoe.cpp ${CMAKE_SOURCE_DIR}/tosh-moe/tosh-hostcache.cpp)
+endif()
+
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -200,7 +204,14 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-turbo-quant.c
+            ${TOSH_MOE_SOURCES}
             gguf.cpp)
+
+if (TOSH_ENABLE_DYNAMIC_MOE)
+    target_include_directories(ggml-base PUBLIC ${CMAKE_SOURCE_DIR}/tosh-moe)
+    target_compile_definitions(ggml-base PUBLIC TOSH_ENABLE_DYNAMIC_MOE)
+endif()
 
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}

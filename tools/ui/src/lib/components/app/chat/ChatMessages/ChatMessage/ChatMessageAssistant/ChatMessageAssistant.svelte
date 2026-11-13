@@ -1,4 +1,5 @@
 <script lang="ts">
+	import ToshPanel from './ToshPanel.svelte';
 	import {
 		ChatMessageActionIcons,
 		ChatMessageAgenticContent,
@@ -191,6 +192,8 @@
 				/>
 			{/if}
 		</ChatMessageContextMenu>
+
+		<ToshPanel {message} />
 	{/if}
 
 	{#if showProcessingInfoBottom}

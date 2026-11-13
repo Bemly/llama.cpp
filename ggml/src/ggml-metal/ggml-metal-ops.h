@@ -55,6 +55,8 @@ bool ggml_metal_op_flash_attn_ext_amd_quant_supported(const struct ggml_tensor *
 size_t ggml_metal_op_flash_attn_ext_extra_rows(const struct ggml_tensor * op);
 
 size_t ggml_metal_op_argmax_extra(const struct ggml_tensor * op);
+size_t ggml_metal_op_gated_delta_net_back_extra(const struct ggml_tensor * op);
+size_t ggml_metal_op_out_prod_extra(const struct ggml_tensor * op);
 
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
@@ -71,18 +73,33 @@ int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_top_k_mask        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_soft_max_back     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_rms_norm_back     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_repeat_back       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_cross_entropy_rows(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_count_equal_masked(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flash_attn_ext_back(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_turbo_wht         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_out_prod          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pool_1d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pool_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_fwht              (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_fwht_fused        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+int ggml_metal_op_tosh_dmoe_publish (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_tosh_dmoe_join    (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_tosh_dmoe_observe (ggml_metal_op_t ctx, int idx);
+#endif
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
@@ -106,6 +123,8 @@ int ggml_metal_op_roll              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_arange            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_tosh_topk_moe     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_tosh_gate_add     (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_topk_moe          (ggml_metal_op_t ctx, int idx);

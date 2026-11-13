@@ -36,6 +36,24 @@ struct llm_build_delta_net_base : public llm_graph_context {
 
     virtual ~llm_build_delta_net_base() = default;
 
+    // gate inputs before their activations, for the fused operator to apply itself; the
+    // other paths keep the activated g and b they are given
+    struct {
+        ggml_tensor * g  = nullptr;
+        ggml_tensor * b  = nullptr;
+        ggml_tensor * dt = nullptr;
+        ggml_tensor * a  = nullptr;
+    } gdn_raw;
+
+    ggml_tensor * build_gated_delta_net_op(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                    int64_t   K);
+
     // returns pair of output and new state
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,

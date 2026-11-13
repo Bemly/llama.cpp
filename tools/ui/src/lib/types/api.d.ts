@@ -1,5 +1,6 @@
 import type { ChatMessagePromptProgress, ChatRole } from './chat';
 import type { ModelSidecar } from '$lib/constants';
+import type { ToshChunk } from './tosh';
 import type {
 	ContentPartType,
 	FileTypeAudio,
@@ -219,6 +220,8 @@ export interface ApiModelDetails {
 }
 
 export interface ApiLlamaCppServerProps {
+	/** The server answers chat requests that bring no tools with its own Tosh agent. */
+	tosh_agent?: boolean;
 	default_generation_settings: {
 		id: number;
 		id_task: number;
@@ -372,6 +375,7 @@ export interface ApiChatCompletionToolCall extends ApiChatCompletionToolCallDelt
 }
 
 export interface ApiChatCompletionStreamChunk {
+	tosh?: ToshChunk;
 	id?: string;
 	object?: string;
 	model?: string;

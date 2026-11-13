@@ -33,7 +33,11 @@ import {
 } from '$lib/enums';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
-import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
+import type {
+	DatabaseMessageExtraMcpPrompt,
+	DatabaseMessageExtraMcpResource,
+	ToshChunk
+} from '$lib/types';
 import type {
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
@@ -276,6 +280,12 @@ export class ChatService {
 						type: ContentPartType.IMAGE_URL
 					});
 				}
+				if (pdfFile.textLayer) {
+					contentParts.push({
+						text: formatAttachmentText(AttachmentLabel.PDF_FILE, `${pdfFile.name} (text layer)`, pdfFile.textLayer),
+						type: ContentPartType.TEXT
+					});
+				}
 			} else {
 				contentParts.push({
 					text: formatAttachmentText(AttachmentLabel.PDF_FILE, pdfFile.name, pdfFile.content),
@@ -392,7 +402,8 @@ export class ChatService {
 					onChunk: (chunk: string) => {
 						titleResponse += chunk;
 					},
-					stream: true
+					stream: true,
+					toshAgent: 'off'
 				},
 				undefined,
 				signal
@@ -444,7 +455,9 @@ export class ChatService {
 		conversationId?: string,
 		abortSignal?: AbortSignal,
 		onConnectionState?: (state: StreamConnectionState) => void,
-		streamModel?: string | null
+		streamModel?: string | null,
+		onTosh?: (tosh: ToshChunk) => void,
+		maxTokens?: number
 	): Promise<void> {
 		let reader = response.body?.getReader();
 
@@ -474,12 +487,16 @@ export class ChatService {
 
 		let decoder = new TextDecoder();
 		let aggregatedContent = '';
+		// text of an agent pass that may still end in tool calls: shown, never kept as the answer
+		let drafted = false;
 		let fullReasoningContent = '';
 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
 		let lastTimings: ChatMessageTimings | undefined;
 		// why the model stopped, length once the output limit cut the answer
 		let finishReason: string | undefined;
 		let streamFinished = false;
+		// an error the server sends inside the stream, after its 200: the message must say it, not end empty
+		let streamError: (Error & { contextInfo?: { n_prompt_tokens: number; n_ctx: number } }) | undefined;
 		let modelEmitted = false;
 		let idEmitted = false;
 		let toolCallIndexOffset = 0;
@@ -627,6 +644,60 @@ export class ChatService {
 
 							try {
 								const parsed: ApiChatCompletionStreamChunk = JSON.parse(data);
+								const failure = (parsed as unknown as { error?: ApiErrorResponse['error'] }).error;
+
+								if (failure && typeof failure === 'object') {
+									streamError = new Error(ChatService.toldFailure(failure.message || 'Server error'));
+									streamError.name = 'ServerError';
+
+									if ('n_prompt_tokens' in failure && 'n_ctx' in failure) {
+										streamError.contextInfo = {
+											n_ctx: failure.n_ctx,
+											n_prompt_tokens: failure.n_prompt_tokens
+										};
+									}
+
+									// a draft shown before the error is no answer
+									if (drafted) {
+										drafted = false;
+										aggregatedContent = '';
+
+										if (!abortSignal?.aborted) onTosh?.({ event: { type: 'retract' } });
+									}
+
+									streamFinished = true;
+
+									continue;
+								}
+
+								// the Tosh agent's progress and metadata; a retract drops the text streamed so far
+								if (parsed.tosh && typeof parsed.tosh === 'object') {
+									const event = parsed.tosh.event;
+									const used = parsed.tosh.context?.used;
+
+									// an agent's answer has no timings: the context meter reads its count instead
+									if (!event && typeof used === 'number' && !lastTimings) {
+										lastTimings = { prompt_n: used, cache_n: 0, predicted_n: 0 };
+									}
+
+									if (event?.type === 'retract') {
+										aggregatedContent = '';
+										drafted = false;
+									}
+
+									if (!abortSignal?.aborted) onTosh?.(parsed.tosh);
+
+									if (
+										event?.type === 'draft' &&
+										typeof event.content === 'string' &&
+										event.content
+									) {
+										drafted = true;
+
+										if (!abortSignal?.aborted) onChunk?.(event.content);
+									}
+								}
+
 								const choice = parsed.choices?.[0];
 
 								if (choice?.finish_reason) finishReason = choice.finish_reason;
@@ -659,6 +730,14 @@ export class ChatService {
 
 								if (content) {
 									finalizeOpenToolCallBatch();
+
+									// the answer replaces the draft shown before it
+									if (drafted) {
+										drafted = false;
+
+										if (!abortSignal?.aborted) onTosh?.({ event: { type: 'retract' } });
+									}
+
 									aggregatedContent += content;
 
 									if (!abortSignal?.aborted) {
@@ -692,7 +771,13 @@ export class ChatService {
 
 				if (streamFinished) break;
 
-				if (!conversationId) break;
+				if (!conversationId) {
+					onConnectionState?.(StreamConnectionState.LOST);
+					streamError = new Error('The connection ended before the answer did');
+					streamFinished = true;
+
+					break;
+				}
 
 				if (!madeProgress) {
 					onConnectionState?.(StreamConnectionState.LOST);
@@ -728,7 +813,12 @@ export class ChatService {
 
 				const newReader = resumeResp.body?.getReader();
 
-				if (!newReader) break;
+				if (!newReader) {
+					onConnectionState?.(StreamConnectionState.LOST);
+					onError?.(new Error('Stream connection lost and could not be resumed'));
+
+					break;
+				}
 
 				try {
 					reader.releaseLock();
@@ -750,6 +840,35 @@ export class ChatService {
 
 				if (conversationId) {
 					ChatService.clearStreamState(conversationId);
+				}
+
+				if (streamError) {
+					// what arrived before the error stays, said to be incomplete
+					if (aggregatedContent.trim()) {
+						const note = '\n\n_The answer stopped with an error before it ended, so it is incomplete._';
+
+						aggregatedContent += note;
+
+						if (!abortSignal?.aborted) onChunk?.(note);
+					}
+
+					onError?.(streamError);
+
+					return;
+				}
+
+				// an answer cut at its token limit says so, unless the agent already did; one that wrote fewer
+				// tokens than it was allowed was cut by the context
+				if (finishReason === 'length' && aggregatedContent && !/incomplet[ae]\._\s*$/.test(aggregatedContent)) {
+					const written = lastTimings?.predicted_n ?? 0;
+					const byContext = !!maxTokens && maxTokens > 0 && written > 0 && written < maxTokens;
+					const note = byContext
+						? "\n\n_The answer was cut when the conversation filled the model's context, so it is incomplete._"
+						: '\n\n_The answer was cut at the limit of tokens per answer, so it is incomplete._';
+
+					aggregatedContent += note;
+
+					if (!abortSignal?.aborted) onChunk?.(note);
 				}
 
 				const finalToolCalls =
@@ -1083,6 +1202,7 @@ export class ChatService {
 			onReasoningChunk,
 			onTimings,
 			onToolCallChunk,
+			onTosh,
 			presence_penalty,
 			reasoningEffort,
 			// Penalty parameters
@@ -1099,6 +1219,7 @@ export class ChatService {
 			tools,
 			top_k,
 			top_p,
+			toshAgent,
 			typ_p,
 			xtc_probability,
 			xtc_threshold
@@ -1253,6 +1374,8 @@ export class ChatService {
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };
 
+			if (toshAgent) headers['X-Tosh-Agent'] = toshAgent;
+
 			// tag streaming requests with the conversation id, this single header is the opt in for the
 			// server side replay buffer and powers discoverActiveStream on tab reopen. with an explicit
 			// model the ::model suffix keeps the per model session distinct
@@ -1300,7 +1423,9 @@ export class ChatService {
 					conversationId,
 					signal,
 					onConnectionState,
-					options.model
+					options.model,
+					onTosh,
+					options.max_tokens ?? undefined
 				);
 
 				return;
@@ -1622,6 +1747,13 @@ export class ChatService {
 		onTimingsCallback(timings, promptProgress);
 	}
 
+	/** The engine's own words for a GPU that failed say nothing to the user; an agent's text for it is kept. */
+	private static toldFailure(message: string): string {
+		return /^compute error|error state|kIOAccel|failed to process mtmd/i.test(message)
+			? 'The engine failed on the GPU while processing the request, so it did not finish. Send the message again once the server is back.'
+			: message;
+	}
+
 	/**
 	 * Parses error response and creates appropriate error with context information
 	 * @param response - HTTP response object
@@ -1633,7 +1765,7 @@ export class ChatService {
 		try {
 			const errorText = await response.text();
 			const errorData: ApiErrorResponse = JSON.parse(errorText);
-			const message = errorData.error?.message || 'Unknown server error';
+			const message = ChatService.toldFailure(errorData.error?.message || 'Unknown server error');
 			const error = new Error(message) as Error & {
 				contextInfo?: { n_prompt_tokens: number; n_ctx: number };
 			};

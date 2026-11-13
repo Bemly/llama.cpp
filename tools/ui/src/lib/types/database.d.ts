@@ -1,3 +1,4 @@
+import type { ToshMessageData } from './tosh';
 import { AttachmentType, ReasoningEffort, ToolSource } from '$lib/enums';
 import type { ChatMessageTimings, ChatMessageType, ChatRole } from '$lib/types/chat';
 import type { Group } from '$lib/types/groups';
@@ -74,6 +75,8 @@ export interface DatabaseMessageExtraPdfFile {
 	content: string;
 	images?: string[];
 	processedAsImages: boolean;
+	/** The PDF's own text page by page, sent beside its page images. */
+	textLayer?: string;
 }
 
 export interface DatabaseMessageExtraTextFile {
@@ -127,6 +130,8 @@ export interface DatabaseMessage {
 	thinking?: string;
 	/** Reasoning content produced by the model (separate from visible content) */
 	reasoningContent?: string;
+	/** What the server's Tosh agent reported for this answer: its steps, a sketch, a map */
+	tosh?: ToshMessageData;
 	/** Serialized JSON array of tool calls made by assistant messages */
 	toolCalls?: string;
 	/** Chat completion id streamed by the server, used to target realtime control (e.g. end reasoning) */

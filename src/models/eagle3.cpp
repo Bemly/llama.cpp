@@ -162,12 +162,14 @@ llama_model_eagle3::graph<false>::graph(const llm_graph_params & params) : llm_g
     // 1. Token embeddings (e.g.from eagle3's own tok_embd for Llama 3.3 70B, or target model for Llama 3.1 8B)
     // 2. g_embeddings from encoder
     auto * tok_embd = model.tok_embd;
+    const llama_hadamard * embd_hdmd = nullptr;
     if (model.tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "EAGLE3 decoder requires token embeddings (own or from target model)");
         tok_embd = model_other->tok_embd;
+        embd_hdmd = &model_other->hdmd;
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -179,6 +181,7 @@ llama_model_eagle3::graph<false>::graph(const llm_graph_params & params) : llm_g
     ggml_set_input(inp->embd);
 
     ggml_tensor * inp_embd = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    inp_embd = build_hadamard_lookup(tok_embd, inp_embd, embd_hdmd);
     cb(inp_embd, "inp_embd", -1);
 
     ggml_tensor * inp_g = inp->embd;
@@ -290,6 +293,7 @@ llama_model_eagle3::graph<false>::graph(const llm_graph_params & params) : llm_g
 
         GGML_ASSERT(model_other->output != nullptr && "EAGLE3 decoder requires an output projection (own or from target model)");
         output = model_other->output;
+        cur = build_hadamard_input(output, cur, &model_other->hdmd);
     }
     cur = build_lora_mm(output, cur);
 

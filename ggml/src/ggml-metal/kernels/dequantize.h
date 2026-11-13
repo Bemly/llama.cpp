@@ -24,6 +24,22 @@ void dequantize_f32_t4(device const float4 * src, short il, thread type4 & reg) 
 }
 
 template <typename type4x4>
+void dequantize_bf16e(device const bf16e4x4 * src, short il, thread type4x4 & reg) {
+    FOR_UNROLL (short i = 0; i < 4; ++i) {
+        const float4 f = as_type<float4>(uint4(src->b[i]) << 16);
+        reg[i][0] = f.x;
+        reg[i][1] = f.y;
+        reg[i][2] = f.z;
+        reg[i][3] = f.w;
+    }
+}
+
+template <typename type4>
+void dequantize_bf16e_t4(device const bf16e4 * src, short il, thread type4 & reg) {
+    reg = (type4) as_type<float4>(uint4(src->b) << 16);
+}
+
+template <typename type4x4>
 void dequantize_f16(device const half4x4 * src, short il, thread type4x4 & reg) {
     reg = (type4x4)(*src);
 }
@@ -128,55 +144,114 @@ void dequantize_q2_0_t4(device const block_q2_0 * xb, short il, thread type4 & r
     reg = (type4) reg_f;
 }
 
+// PQ2_0: each 2-bit field is OR-ed into the mantissa of 1024.0h, so the half minus 1025 is the
+// signed weight; a 16-bit lane pair covers elements s and s + 8 of the 16 in one operation
 template <typename type4x4>
 void dequantize_pq2_0(device const block_pq2_0 * xb, short il, thread type4x4 & reg) {
-    device const uint8_t * qs = xb->qs;
-    const float d = xb->d;
+    device const ushort * qs = (device const ushort *) xb->qs + 2*il;
+    const uint w = uint(qs[0]) | (uint(qs[1]) << 16);
+    const half d = xb->d;
 
-    const int byte_offset = il * 4;  // il*16 elements = il*4 bytes (4 elements per byte)
-    float4x4 reg_f;
-
-    for (int i = 0; i < 4; i++) {
-        const uint8_t b = qs[byte_offset + i];
-        reg_f[i][0] = ((float)((b >> 0) & 3) - 1.0f) * d;
-        reg_f[i][1] = ((float)((b >> 2) & 3) - 1.0f) * d;
-        reg_f[i][2] = ((float)((b >> 4) & 3) - 1.0f) * d;
-        reg_f[i][3] = ((float)((b >> 6) & 3) - 1.0f) * d;
+    half4x4 r;
+    FOR_UNROLL (short s = 0; s < 8; ++s) {
+        const half2 h = (as_type<half2>(((w >> (2*s)) & 0x00030003u) | 0x64006400u) - half2(1025.0h))*d;
+        r[s/4][s%4]     = h[0];
+        r[s/4 + 2][s%4] = h[1];
     }
-
-    reg = (type4x4) reg_f;
+    reg = (type4x4) r;
 }
 
 template <typename type4>
 void dequantize_pq2_0_t4(device const block_pq2_0 * xb, short il, thread type4 & reg) {
+    const uint b = xb->qs[il];
     const float d = xb->d;
-    const uint8_t b = xb->qs[il];
 
-    float4 reg_f;
-    reg_f[0] = ((float)((b >> 0) & 3) - 1.0f) * d;
-    reg_f[1] = ((float)((b >> 2) & 3) - 1.0f) * d;
-    reg_f[2] = ((float)((b >> 4) & 3) - 1.0f) * d;
-    reg_f[3] = ((float)((b >> 6) & 3) - 1.0f) * d;
+    reg = (type4) ((float4(b & 3u, (b >> 2) & 3u, (b >> 4) & 3u, b >> 6) - 1.0f)*d);
+}
 
-    reg = (type4) reg_f;
+// element e of a PTQ1_0 block: 16 bytes carry trits 0..4 of elements 0..79, the next 8 bytes
+// trits 0..4 of elements 80..119, and qh four trits each of elements 120..127
+inline float ptq1_0_q(device const block_ptq1_0 * xb, int e) {
+    const float pow3f[5] = {1.0f, 3.0f, 9.0f, 27.0f, 81.0f};
+    float b;
+    int n;
+    if (e < 80) {
+        b = xb->qs[e & 15];                n = e >> 4;
+    } else if (e < 120) {
+        b = xb->qs[16 + ((e - 80) & 7)];   n = (e - 80) >> 3;
+    } else {
+        b = xb->qh[(e - 120) & 1];         n = (e - 120) >> 1;
+    }
+    const float c0 = pow3f[n]*(1.0f/256.0f);
+    return floor(3.0f*c0*b) - 3.0f*floor(c0*b);
+}
+
+// trit n of the two bytes held in the low halves of a pair of 16-bit lanes, as TQ1_0 packs them,
+// ((b * 3^n) mod 256) * 3 >> 8, returned as the half pair of trit - 1
+inline half2 ptq1_0_trit2(ushort2 b, ushort p) {
+    const ushort2 t = (((b*p) & ushort2(0xFF))*ushort2(3)) >> 8;
+    return as_type<half2>(t | ushort2(0x6400)) - half2(1025.0h);
+}
+
+// the sixteen elements of a call are regular in il: il 0..4 are trit il of qs[0..15]; il 5 and 6
+// trits 2(il-5) and 2(il-5)+1 of qs[16..23]; il 7 trit 4 of those, then the four trits of each qh
+// byte. Written as eight byte pairs with a power of three each, so lanes on different il run the
+// same code instead of diverging.
+template <typename type4x4>
+void dequantize_ptq1_0(device const block_ptq1_0 * xb, short il, thread type4x4 & reg) {
+    const half d = xb->d;
+    device const ushort * q16 = (device const ushort *) xb->qs; // qs then qh, 13 byte pairs
+
+    const bool lo = il < 5;
+    const bool md = il < 7;
+    const ushort p0 = il == 0 ? 1 : il == 1 ? 3 : il == 2 ? 9 : il == 3 ? 27 : 81; // 3^il below 5
+    const ushort pm = il == 5 ? 1 : 9;                                              // 3^(2(il-5))
+
+    half4x4 r;
+    FOR_UNROLL (short j = 0; j < 8; j++) {
+        const short  src = lo ? j : md ? 8 + (j & 3) : (j < 4 ? 8 + j : 12);
+        const ushort hp  = j < 4 ? 81 : (j == 4 ? 1 : j == 5 ? 3 : j == 6 ? 9 : 27);
+        const ushort p   = lo ? p0 : md ? (j < 4 ? pm : 3*pm) : hp;
+
+        const ushort w = q16[src];
+        const half2  t = ptq1_0_trit2(ushort2(w & 0xFF, w >> 8), p)*d;
+        r[(2*j)/4][(2*j)%4]         = t[0];
+        r[(2*j + 1)/4][(2*j + 1)%4] = t[1];
+    }
+
+    reg = (type4x4) r;
+}
+
+template <typename type4>
+void dequantize_ptq1_0_t4(device const block_ptq1_0 * xb, short il, thread type4 & reg) {
+    const float d = xb->d;
+
+    float4 r;
+    FOR_UNROLL (short k = 0; k < 4; ++k) {
+        r[k] = (ptq1_0_q(xb, 4*il + k) - 1.0f)*d;
+    }
+    reg = (type4) r;
 }
 
 template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
-    // byte-only nibble select (matches CPU dequantize_row_q4_0)
-    device const uint8_t * qb = ((device const uint8_t *)xb + 2);
-    const float d  = xb->d;
-    const float md = -8.f * d;
+    // packed: the block is 18 bytes, so qs is only 2-byte aligned
+    device const packed_ushort4 * qs = (device const packed_ushort4 *)((device const uint16_t *)xb + 1);
+    const float d1 = il ? (xb->d / 16.h) : xb->d;
+    const float d2 = d1 / 256.f;
+    const float md = -8.h * xb->d;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    const ushort4 q0 = ushort4(qs[0]);
+    const ushort4 q1 = ushort4(qs[1]);
 
     float4x4 reg_f;
 
     for (int i = 0; i < 8; i++) {
-        const uint8_t b0 = qb[2*i + 0];
-        const uint8_t b1 = qb[2*i + 1];
-        const uint8_t n0 = il ? (b0 >> 4) : (b0 & 0xF);
-        const uint8_t n1 = il ? (b1 >> 4) : (b1 & 0xF);
-        reg_f[i/2][2*(i%2) + 0] = d * n0 + md;
-        reg_f[i/2][2*(i%2) + 1] = d * n1 + md;
+        const ushort qsi = i < 4 ? q0[i] : q1[i - 4];
+        reg_f[i/2][2*(i%2) + 0] = d1 * (qsi & mask0) + md;
+        reg_f[i/2][2*(i%2) + 1] = d2 * (qsi & mask1) + md;
     }
 
     reg = (type4x4) reg_f;
@@ -201,20 +276,23 @@ void dequantize_q4_0_t4(device const block_q4_0 * xb, short il, thread type4 & r
 
 template <typename type4x4>
 void dequantize_q4_1(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
-    // byte-only nibble select (matches CPU dequantize_row_q4_1)
-    device const uint8_t * qb = ((device const uint8_t *)xb + 4);
-    const float d = xb->d;
-    const float m = xb->m;
+    // packed: the block is 20 bytes, so qs is only 4-byte aligned
+    device const packed_ushort4 * qs = (device const packed_ushort4 *)((device const uint16_t *)xb + 2);
+    const float d1 = il ? (xb->d / 16.h) : xb->d;
+    const float d2 = d1 / 256.f;
+    const float  m = xb->m;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    const ushort4 q0 = ushort4(qs[0]);
+    const ushort4 q1 = ushort4(qs[1]);
 
     float4x4 reg_f;
 
     for (int i = 0; i < 8; i++) {
-        const uint8_t b0 = qb[2*i + 0];
-        const uint8_t b1 = qb[2*i + 1];
-        const uint8_t n0 = il ? (b0 >> 4) : (b0 & 0xF);
-        const uint8_t n1 = il ? (b1 >> 4) : (b1 & 0xF);
-        reg_f[i/2][2*(i%2) + 0] = n0 * d + m;
-        reg_f[i/2][2*(i%2) + 1] = n1 * d + m;
+        const ushort qsi = i < 4 ? q0[i] : q1[i - 4];
+        reg_f[i/2][2*(i%2) + 0] = ((qsi & mask0) * d1) + m;
+        reg_f[i/2][2*(i%2) + 1] = ((qsi & mask1) * d2) + m;
     }
 
     reg = (type4x4) reg_f;
@@ -361,13 +439,16 @@ void dequantize_q5_1_t4(device const block_q5_1 * xb, short il, thread type4 & r
 
 template <typename type4x4>
 void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg) {
-    device const packed_char4 * qs = (device const packed_char4 *) xb->qs;
+    // 4 packed loads instead of 16 byte loads; packed_char4 because qs is only
+    // 2-byte aligned inside the 34-byte block. int offset: AMD miscompiles short here
+    device const packed_char4 * qs = (device const packed_char4 *)((device const int8_t *)xb->qs + 16*(int)il);
     const float d = xb->d;
 
     float4x4 reg_f;
 
-    for (int i = 0; i < 4; ++i) {
-        reg_f[i] = float4(qs[4*il + i]) * d;
+    for (int i = 0; i < 4; i++) {
+        const char4 q = qs[i];
+        reg_f[i] = float4(q.x, q.y, q.z, q.w) * d;
     }
 
     reg = (type4x4) reg_f;
@@ -379,6 +460,19 @@ void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & re
     const float d = xb->d;
 
     reg = (type4) (float4(qs[il]) * d);
+}
+
+// the 34-byte block leaves every other quad off a 4-byte boundary, so a packed char4 load
+// becomes four byte loads; the quads always sit on 2 bytes, so this reads two halves.
+// Faster in attention on both widths and in the 64-lane mat-vec, slower in the 32-lane one
+template <typename type4>
+void dequantize_q8_0_t4_h2(device const block_q8_0 *xb, short il, thread type4 & reg) {
+    device const ushort * qs = (device const ushort *) xb->qs + 2*il;
+    const char2 lo = as_type<char2>(qs[0]);
+    const char2 hi = as_type<char2>(qs[1]);
+    const float d = xb->d;
+
+    reg = (type4) (float4(lo.x, lo.y, hi.x, hi.y) * d);
 }
 
 template <typename type4x4>
@@ -423,15 +517,27 @@ void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg
     float dl, ml;
     uint8_t sc = xb->scales[il];
 
-    q = q + 32*(il/8) + 16*(il&1);
+    // 16-bit loads, high byte folded into the scale (see dequantize_q4_K).
+    // int offset: AMD miscompiles short device address math.
+    const int qoff = 32*((int) il/8) + 16*((int) il & 1);
+    device const uint16_t * qv = (device const uint16_t *)(q + qoff);
     il = (il/2)%4;
 
     half  coef = il>1 ? (il>2 ? 1/64.h : 1/16.h) : (il>0 ? 1/4.h : 1.h);
     uchar mask = il>1 ? (il>2 ? 192    : 48)     : (il>0 ? 12    : 3);
     dl = d * (sc & 0xF) * coef, ml = min * (sc >> 4);
-    for (int i = 0; i < 16; ++i) {
-        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+
+    const ushort mask1 = (ushort) mask << 8;
+    const float  dl2   = dl / 256.f;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; ++i) {
+        reg_f[i/2][2*(i%2) + 0] = dl  * (qv[i] & mask)  - ml;
+        reg_f[i/2][2*(i%2) + 1] = dl2 * (qv[i] & mask1) - ml;
     }
+
+    reg = (type4x4) reg_f;
 }
 
 template <typename type4x4>
@@ -441,9 +547,13 @@ void dequantize_q3_K(device const block_q3_K *xb, short il, thread type4x4 & reg
     device const uint8_t * h = (device const uint8_t *)xb->hmask;
     device const int8_t * scales = (device const int8_t *)xb->scales;
 
-    q = q + 32 * (il/8) + 16 * (il&1);
-    h = h + 16 * (il&1);
-    uint8_t m = 1 << (il/2);
+    // Same 16-bit loads as dequantize_q4_K, over qs and hmask.
+    const int qoff = 32 * ((int) il/8) + 16 * ((int) il & 1);
+    const int hoff = 16 * ((int) il & 1);
+    device const uint16_t * qv = (device const uint16_t *)(q + qoff);
+    device const uint16_t * hv = (device const uint16_t *)(h + hoff);
+    const ushort m0 = 1 << (il/2);
+    const ushort m1 = m0 << 8;
     uint16_t kmask1 = (il/4)>1 ? ((il/4)>2 ? 192 : 48) : \
                                  ((il/4)>0 ? 12  : 3);
     uint16_t kmask2 = il/8 ? 0xF0 : 0x0F;
@@ -458,56 +568,345 @@ void dequantize_q3_K(device const block_q3_K *xb, short il, thread type4x4 & reg
     const uint8_t mask = il>1 ? (il>2 ? 192    : 48)     : (il>0 ? 12    : 3);
     dl *= coef;
 
-    for (int i = 0; i < 16; ++i) {
-        reg[i/4][i%4] = dl * (q[i] & mask) - (h[i] & m ? 0 : ml);
+    const ushort mask1 = (ushort)mask << 8;
+    const float  dl2   = dl / 256.f;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; ++i) {
+        const ushort hi = hv[i];
+        reg_f[i/2][2*(i%2) + 0] = dl  * (qv[i] & mask)  - (hi & m0 ? 0.f : ml);
+        reg_f[i/2][2*(i%2) + 1] = dl2 * (qv[i] & mask1) - (hi & m1 ? 0.f : ml);
     }
+
+    reg = (type4x4) reg_f;
 }
 
-static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
-    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+// uniform: j < 4 comes in as j_lo, known for the whole wave
+template <bool uniform>
+static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q, bool j_lo) {
+    return (uniform ? j_lo : j < 4) ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)), uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
+
+template <bool uniform>
+static inline uchar2 get_scale_min_k4_just2_w(int j, int k, uint w0, uint w1, uint w2, bool j_lo) {
+    const int  a  = j + k;
+    const uint sh = 8*(a & 3);
+
+    const uint lo = (a < 4 ? w0 : w1) >> sh; // byte a
+    const uint hi = (a < 4 ? w1 : w2) >> sh; // byte a+4
+
+    if (uniform ? j_lo : j < 4) {
+        return uchar2{uchar(lo & 63), uchar(hi & 63)};
+    }
+
+    const uint pv = w0 >> sh;                // byte a-4, only reached when j >= 4
+    return uchar2{uchar((hi & 0xF) | ((pv & 0xc0) >> 2)), uchar(((hi & 0xFF) >> 4) | ((lo & 0xc0) >> 2))};
+}
+
+template <bool uniform, typename type4x4>
+void dequantize_q4_K_impl(device const block_q4_K * xb, short il, bool lo, thread type4x4 & reg) {
+    // high nibble picked by a shifted mask and folded into the scale (as in dequantize_q4_0).
+    // int offsets: AMD miscompiles short device address math.
+    // 128-bit load: the block is 144 bytes (9*16) so the window lands 16-byte aligned
+    const int qoff = (int) (il/4) * 32 + 16 * ((int) il & 1);
+    const uint4 qsv = *(device const uint4 *)(xb->qs + qoff);
+
+    // d, dmin and the 12 scale bytes are the block's first 16 bytes, and the block is 16-byte
+    // aligned, so one load replaces the two halves and the three separate scale bytes
+    const uint4 hdr = *(device const uint4 *) xb;
+    const half2 dm  = as_type<half2>(hdr.x);
+
+    short is = (il/4) * 2;
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2_w<uniform>(is, il/2, hdr.y, hdr.z, hdr.w, lo);
+    const float d   = il < 2 ? (float) dm[0] : (float) (dm[0] / 16.h);
+    const float min = dm[1];
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const ushort mask0 = il < 2 ? 0x000F : 0x00F0;
+    const ushort mask1 = mask0 << 8;
+    const float dl2 = dl / 256.f;
+
+    // write straight into reg, the float4x4 staging was redundant
+    for (int i = 0; i < 8; ++i) {
+        const ushort qsi = (i & 1) ? (ushort)(qsv[i/2] >> 16) : (ushort)(qsv[i/2] & 0xFFFF);
+        reg[i/2][2*(i%2) + 0] = dl  * (qsi & mask0) - ml;
+        reg[i/2][2*(i%2) + 1] = dl2 * (qsi & mask1) - ml;
+    }
 }
 
 template <typename type4x4>
 void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
-    device const uchar * q = xb->qs;
-
-    short is = (il/4) * 2;
-    q = q + (il/4) * 32 + 16 * (il&1);
-    il = il & 3;
-    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
-    const float min = xb->dmin;
-    const float dl = d * sc[0];
-    const float ml = min * sc[1];
-
-    const ushort mask = il < 2 ? 0x0F : 0xF0;
-    for (int i = 0; i < 16; ++i) {
-        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
-    }
+    dequantize_q4_K_impl<false>(xb, il, false, reg);
 }
 
-template <typename type4x4>
-void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 & reg) {
-    device const uint8_t * q  = xb->qs;
-    device const uint8_t * qh = xb->qh;
+template <bool uniform, typename type4x4>
+void dequantize_q5_K_impl(device const block_q5_K *xb, short il, bool lo, thread type4x4 & reg) {
+    // 128-bit loads: the block is 176 bytes (11*16) and both windows land 16-byte aligned
+    const int qoff = 32 * (int) (il/4) + 16 * ((int) il & 1);
+    const int hoff = 16 * ((int) il & 1);
+    const uint4 qsv = *(device const uint4 *)(xb->qs + qoff);
+    const uint4 qhv = *(device const uint4 *)(xb->qh + hoff);
 
     short is = (il/4) * 2;
-    q  = q + 32 * (il/4) + 16 * (il&1);
-    qh = qh + 16 * (il&1);
-    uint8_t ul = 1 << (il/2);
+    const ushort ul0 = 1 << (il/2);
+    const ushort ul1 = ul0 << 8;
     il = il & 3;
-    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const uchar2 sc = get_scale_min_k4_just2<uniform>(is, il/2, xb->scales, lo);
     const float d = il < 2 ? xb->d : xb->d / 16.f;
     const float min = xb->dmin;
     const float dl = d * sc[0];
     const float ml = min * sc[1];
 
-    const ushort mask  = il<2 ? 0x0F : 0xF0;
-    const float qh_val = il<2 ? 16.f : 256.f;
-    for (int i = 0; i < 16; ++i) {
-        reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
+    const ushort mask0 = il < 2 ? 0x000F : 0x00F0;
+    const ushort mask1 = mask0 << 8;
+    const float dl2 = dl / 256.f;
+    const float dqh = dl * (il < 2 ? 16.f : 256.f);
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; ++i) {
+        const ushort qsi = (i & 1) ? (ushort)(qsv[i/2] >> 16) : (ushort)(qsv[i/2] & 0xFFFF);
+        const ushort qhi = (i & 1) ? (ushort)(qhv[i/2] >> 16) : (ushort)(qhv[i/2] & 0xFFFF);
+        reg_f[i/2][2*(i%2) + 0] = dl  * (qsi & mask0) + (qhi & ul0 ? dqh : 0.f) - ml;
+        reg_f[i/2][2*(i%2) + 1] = dl2 * (qsi & mask1) + (qhi & ul1 ? dqh : 0.f) - ml;
     }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 & reg) {
+    dequantize_q5_K_impl<false>(xb, il, false, reg);
+}
+
+// for kernels that know j < 4 per wave; a no-op for every other block type
+template <typename block_q, typename type4x4>
+void dequantize_lo(device const block_q * xb, short il, bool lo, thread type4x4 & reg) {}
+
+template <typename type4x4>
+void dequantize_lo(device const block_q4_K * xb, short il, bool lo, thread type4x4 & reg) {
+    dequantize_q4_K_impl<true>(xb, il, lo, reg);
+}
+
+template <typename type4x4>
+void dequantize_lo(device const block_q5_K * xb, short il, bool lo, thread type4x4 & reg) {
+    dequantize_q5_K_impl<true>(xb, il, lo, reg);
+}
+
+// Word-sized reads for the manual GEMM path, where narrow device loads are what the dequant
+// pays for. q8_0 and q4_0 blocks sit on 2 bytes (q4_0 on 4 every other block), q4_1 and q2_K
+// on 4. q3_K and q6_K lose with the alignment branch, so they keep their own dequant.
+template <typename block_q>
+constexpr bool has_dequantize_words() {
+    return is_same<block_q, block_q8_0>::value || is_same<block_q, block_q4_0>::value ||
+           is_same<block_q, block_q4_1>::value || is_same<block_q, block_q2_K>::value ||
+           is_same<block_q, block_q5_0>::value || is_same<block_q, block_q5_1>::value ||
+           is_same<block_q, block_mxfp4>::value;
+}
+
+// 16 bytes on a 4-byte boundary
+static inline uint4 load_words16(device const uint16_t * p) {
+    device const uint * q = (device const uint *) p;
+    return uint4(q[0], q[1], q[2], q[3]);
+}
+
+static inline ushort word_half(uint4 w, int i) {
+    return (i & 1) ? ushort(w[i/2] >> 16) : ushort(w[i/2] & 0xFFFF);
+}
+
+template <typename block_q, typename type4x4>
+void dequantize_words(device const block_q * xb, short il, thread type4x4 & reg) {}
+
+template <typename type4x4>
+void dequantize_words(device const block_q8_0 * xb, short il, thread type4x4 & reg) {
+    // a packed char4 still becomes four byte loads off a 4-byte boundary
+    device const ushort * qs = (device const ushort *) xb->qs + 8*(int)il;
+    const float d = xb->d;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; i++) {
+        const char2 lo = as_type<char2>(qs[2*i + 0]);
+        const char2 hi = as_type<char2>(qs[2*i + 1]);
+        reg_f[i] = float4(lo.x, lo.y, hi.x, hi.y) * d;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_words(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * q16 = (device const uint16_t *) xb;
+    half dh;
+    uint4 w;
+    if ((ulong) xb & 2) {
+        device const uint * q = (device const uint *)(q16 + 1);
+        dh = as_type<half>(q16[0]);
+        w  = uint4(q[0], q[1], q[2], q[3]);
+    } else {
+        // d and the first two quants share a word; the last two quants are read on their own
+        device const uint * q = (device const uint *) q16;
+        const uint a0 = q[0], a1 = q[1], a2 = q[2], a3 = q[3];
+        const uint h  = q16[8];
+        dh = as_type<half>(ushort(a0 & 0xFFFF));
+        w  = uint4((a0 >> 16) | (a1 << 16), (a1 >> 16) | (a2 << 16), (a2 >> 16) | (a3 << 16), (a3 >> 16) | (h << 16));
+    }
+
+    const float d1 = il ? (dh / 16.h) : dh;
+    const float d2 = d1 / 256.f;
+    const float md = -8.h * dh;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; i++) {
+        const ushort qsi = word_half(w, i);
+        reg_f[i/2][2*(i%2) + 0] = d1 * (qsi & mask0) + md;
+        reg_f[i/2][2*(i%2) + 1] = d2 * (qsi & mask1) + md;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_words(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
+    device const uint32_t * q32 = (device const uint32_t *) xb;
+    const half2 dm = as_type<half2>(q32[0]);
+    const uint4 w  = uint4(q32[1], q32[2], q32[3], q32[4]);
+
+    const float d1 = il ? (dm.x / 16.h) : dm.x;
+    const float d2 = d1 / 256.f;
+    const float  m = dm.y;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; i++) {
+        const ushort qsi = word_half(w, i);
+        reg_f[i/2][2*(i%2) + 0] = ((qsi & mask0) * d1) + m;
+        reg_f[i/2][2*(i%2) + 1] = ((qsi & mask1) * d2) + m;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+// The fifth bit goes into the integer next to its nibble, so each weight is still one exact
+// product and one add, as in dequantize_q5_0, with no per-weight shifts of the nibble.
+template <typename type4x4>
+static inline void dequantize_q5_words(uint4 w, uint qh, float d, float m, short il, thread type4x4 & reg) {
+    const float d1 = il ? d/16.f : d;
+    const float d2 = d1/256.f;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+    const uint hq = qh >> (16*il);
+    const short s0 = 4 + 4*il;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; i++) {
+        const uint u  = word_half(w, i);
+        const uint x0 = (u & mask0) | (((hq >> (2*i    )) & 1) << s0);
+        const uint x1 = (u & mask1) | (((hq >> (2*i + 1)) & 1) << (s0 + 8));
+        reg_f[i/2][2*(i%2) + 0] = d1 * x0 + m;
+        reg_f[i/2][2*(i%2) + 1] = d2 * x1 + m;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+// 22-byte blocks: every other one starts 2 past a 4-byte boundary, which puts qh and qs on 4
+template <typename type4x4>
+void dequantize_words(device const block_q5_0 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * q16 = (device const uint16_t *) xb;
+    float d;
+    uint qh;
+    uint4 w;
+    if ((ulong) xb & 2) {
+        device const uint * q = (device const uint *)(q16 + 1);
+        d  = as_type<half>(q16[0]);
+        qh = q[0];
+        w  = uint4(q[1], q[2], q[3], q[4]);
+    } else {
+        // d shares a word with half of qh, and qh with the first two quants
+        device const uint * q = (device const uint *) q16;
+        d  = as_type<half>(ushort(q[0] & 0xFFFF));
+        qh = (q[0] >> 16) | (q[1] << 16);
+        w  = uint4((q[1] >> 16) | (q[2] << 16), (q[2] >> 16) | (q[3] << 16), (q[3] >> 16) | (q[4] << 16), (q[4] >> 16) | (uint(q16[10]) << 16));
+    }
+    dequantize_q5_words(w, qh, d, -16.f*d, il, reg);
+}
+
+// 24-byte blocks: always on 4 bytes
+template <typename type4x4>
+void dequantize_words(device const block_q5_1 * xb, short il, thread type4x4 & reg) {
+    device const uint * q = (device const uint *) xb;
+    const half2 dm = as_type<half2>(q[0]);
+    dequantize_q5_words(uint4(q[2], q[3], q[4], q[5]), q[1], dm.x, dm.y, il, reg);
+}
+
+// 84-byte blocks: always on 4 bytes
+template <typename type4x4>
+void dequantize_words(device const block_q2_K * xb, short il, thread type4x4 & reg) {
+    const half2 dm = as_type<half2>(*((device const uint *) &xb->d));
+    const float d = dm.x;
+    const float min = dm.y;
+    const uint8_t sc = xb->scales[il];
+
+    const int qoff = 32*((int) il/8) + 16*((int) il & 1);
+    const uint4 qw = load_words16((device const uint16_t *)(xb->qs + qoff));
+    il = (il/2)%4;
+
+    half  coef = il>1 ? (il>2 ? 1/64.h : 1/16.h) : (il>0 ? 1/4.h : 1.h);
+    uchar mask = il>1 ? (il>2 ? 192    : 48)     : (il>0 ? 12    : 3);
+    const float dl = d * (sc & 0xF) * coef, ml = min * (sc >> 4);
+
+    const ushort mask1 = (ushort) mask << 8;
+    const float  dl2   = dl / 256.f;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; ++i) {
+        const ushort qv = word_half(qw, i);
+        reg_f[i/2][2*(i%2) + 0] = dl  * (qv & mask)  - ml;
+        reg_f[i/2][2*(i%2) + 1] = dl2 * (qv & mask1) - ml;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+// 17-byte blocks start on any byte, so five words from the boundary below cover one. The fifth
+// can reach 3 bytes past the block, which stays inside the tensor's padded allocation.
+template <typename type4x4>
+void dequantize_words(device const block_mxfp4 * xb, short il, thread type4x4 & reg) {
+    const uint s = (uint) ((ulong) xb & 3);
+    device const uint * q = (device const uint *) ((device const uint8_t *) xb - s);
+    const uint q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3], q4 = q[4];
+
+    // 64-bit shifts, since s == 3 moves a whole word
+    const uint sh = 8*s + 8;
+    const uint4 w = uint4(uint(as_type<ulong>(uint2(q0, q1)) >> sh), uint(as_type<ulong>(uint2(q1, q2)) >> sh),
+                          uint(as_type<ulong>(uint2(q2, q3)) >> sh), uint(as_type<ulong>(uint2(q3, q4)) >> sh));
+
+    const float d = e8m0_to_fp32(uint8_t(q0 >> 8*s));
+    const uint shr = 4*il;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; ++i) {
+        const uint x = w[i] >> shr;
+        reg_f[i][0] = d * kvalues_mxfp4_f[(x      ) & 0x0F];
+        reg_f[i][1] = d * kvalues_mxfp4_f[(x >>  8) & 0x0F];
+        reg_f[i][2] = d * kvalues_mxfp4_f[(x >> 16) & 0x0F];
+        reg_f[i][3] = d * kvalues_mxfp4_f[(x >> 24) & 0x0F];
+    }
+
+    reg = (type4x4) reg_f;
 }
 
 template <typename type4x4>
@@ -774,3 +1173,189 @@ void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & 
 
     reg = (type4x4) reg_f;
 }
+
+constant float turbo_centroids_2bit[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
+// 3-bit centroids for d=128
+constant float turbo_centroids_3bit[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+// Midpoints for 2-bit nearest centroid lookup
+constant float turbo_mid_2bit[3] = { -0.086728f, 0.0f, 0.086728f };
+// Midpoints for 3-bit
+constant float turbo_mid_3bit[7] = { -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f };
+
+// 4-bit PolarQuant centroids (16 levels) — optimal for N(0, 1/sqrt(128))
+constant float turbo_centroids_4bit[16] = {
+    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+     0.006938f,  0.020989f,  0.035597f,  0.051262f,
+     0.068756f,  0.089527f,  0.117195f,  0.173926f
+};
+constant float turbo_mid_4bit[15] = {
+    -0.145560f, -0.103361f, -0.079142f, -0.060009f,
+    -0.043430f, -0.028293f, -0.013963f,  0.000000f,
+     0.013963f,  0.028293f,  0.043430f,  0.060009f,
+     0.079142f,  0.103361f,  0.145560f
+};
+
+// Half-precision 4-bit centroid LUT for vec path
+constant half turbo_centroids_4bit_h[16] = {
+    -0.173926h, -0.117195h, -0.089527h, -0.068756h,
+    -0.051262h, -0.035597h, -0.020989h, -0.006938h,
+     0.006938h,  0.020989h,  0.035597h,  0.051262h,
+     0.068756h,  0.089527h,  0.117195h,  0.173926h
+};
+
+// magnitudes of the 4-bit centroids, positive half only: they are symmetric, so index 8-15 map
+// to mag[idx & 7] and 0-7 to mag[7 - (idx & 7)] with the sign flipped
+constant half turbo_mag_4bit_h[8] = {
+    0.006938h, 0.020989h, 0.035597h, 0.051262h,
+    0.068756h, 0.089527h, 0.117195h, 0.173926h
+};
+
+// Half-precision 2-bit centroid LUT for vec path
+constant half turbo_centroids_2bit_h[4] = {
+    -0.133462h, -0.039994h, 0.039994h, 0.133462h
+};
+
+// Quantize 32 elements into one block_turbo2_0 (NO rotation — rotation happens
+// at the 128-element group level in kernel_set_rows_turbo)
+void quantize_turbo2_0(device const float * src, device block_turbo2_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO2; j++) norm_sq += src[j] * src[j];
+    float norm = sqrt(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    dst.norm = half(norm);
+
+    for (int j = 0; j < QK_TURBO2 / 4; j++) dst.qs[j] = 0;
+
+    for (int j = 0; j < QK_TURBO2; j++) {
+        float val = src[j] * inv_norm;
+        uint8_t idx;
+        if      (val < turbo_mid_2bit[0]) idx = 0;
+        else if (val < turbo_mid_2bit[1]) idx = 1;
+        else if (val < turbo_mid_2bit[2]) idx = 2;
+        else                              idx = 3;
+
+        dst.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+    }
+}
+
+// Quantize 32 elements into one block_turbo3_0 (NO rotation — rotation happens
+// at the 128-element group level in kernel_set_rows_turbo)
+void quantize_turbo3_0(device const float * src, device block_turbo3_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    // Compute norm for this 32-element sub-block
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO3; j++) norm_sq += src[j] * src[j];
+    float norm = sqrt(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    dst.norm = half(norm);
+
+    // Quantize to 3-bit centroids
+    for (int j = 0; j < QK_TURBO3 / 4; j++) dst.qs[j] = 0;
+    for (int j = 0; j < QK_TURBO3 / 8; j++) dst.signs[j] = 0;
+
+    for (int j = 0; j < QK_TURBO3; j++) {
+        float val = src[j] * inv_norm;
+        uint8_t idx;
+        if      (val < turbo_mid_3bit[0]) idx = 0;
+        else if (val < turbo_mid_3bit[1]) idx = 1;
+        else if (val < turbo_mid_3bit[2]) idx = 2;
+        else if (val < turbo_mid_3bit[3]) idx = 3;
+        else if (val < turbo_mid_3bit[4]) idx = 4;
+        else if (val < turbo_mid_3bit[5]) idx = 5;
+        else if (val < turbo_mid_3bit[6]) idx = 6;
+        else                              idx = 7;
+
+        dst.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+        if (idx & 0x4) {
+            dst.signs[j / 8] |= (1 << (j % 8));
+        }
+    }
+}
+
+void quantize_turbo4_0(device const float * src, device block_turbo4_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    // 4-bit PolarQuant: normalize → rotate → quantize to 16 centroids → nibble pack
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
+    float grp_norm = sqrt(norm_sq);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    turbo_rotate_forward(x, turbo_wht_signs1, turbo_wht_signs2);
+
+    for (int j = 0; j < QK_TURBO4 / 2; j++) dst.qs[j] = 0;
+
+    float recon_norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        float val = x[j];
+        uint8_t idx;
+        if      (val < turbo_mid_4bit[ 0]) idx = 0;
+        else if (val < turbo_mid_4bit[ 1]) idx = 1;
+        else if (val < turbo_mid_4bit[ 2]) idx = 2;
+        else if (val < turbo_mid_4bit[ 3]) idx = 3;
+        else if (val < turbo_mid_4bit[ 4]) idx = 4;
+        else if (val < turbo_mid_4bit[ 5]) idx = 5;
+        else if (val < turbo_mid_4bit[ 6]) idx = 6;
+        else if (val < turbo_mid_4bit[ 7]) idx = 7;
+        else if (val < turbo_mid_4bit[ 8]) idx = 8;
+        else if (val < turbo_mid_4bit[ 9]) idx = 9;
+        else if (val < turbo_mid_4bit[10]) idx = 10;
+        else if (val < turbo_mid_4bit[11]) idx = 11;
+        else if (val < turbo_mid_4bit[12]) idx = 12;
+        else if (val < turbo_mid_4bit[13]) idx = 13;
+        else if (val < turbo_mid_4bit[14]) idx = 14;
+        else                               idx = 15;
+
+        dst.qs[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
+        recon_norm_sq += turbo_centroids_4bit[idx] * turbo_centroids_4bit[idx];
+    }
+
+    dst.rnorm = half(0.0f);
+    float recon_norm = sqrt(recon_norm_sq);
+    dst.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
+}
+
+// TurboQuant FA dequant (t4): decode 4 elements of a 128-value block in the
+// WHT-rotated domain (no inverse WHT — the graph un-rotates the attention output).
+// il selects the 4-element chunk (0..31) within the block.
+template <typename type4>
+void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
+    const float norm = (float) xb->norm;
+    // the 4-element chunk shares one qs byte (il) and one signs nibble (il>>1); load once
+    const uint8_t qb = xb->qs[il];
+    const uint8_t sb = xb->signs[il >> 1];
+    const short so = (il & 1) * 4;
+    for (short j = 0; j < 4; j++) {
+        uint8_t low2 = (qb >> (j * 2)) & 0x3;
+        uint8_t hi1  = (sb >> (so + j)) & 0x1;
+        reg[j] = turbo_centroids_3bit[low2 | (hi1 << 2)] * norm;
+    }
+}
+
+template <typename type4>
+void dequantize_turbo2_0_t4(device const block_turbo2_0 * xb, short il, thread type4 & reg) {
+    const float norm = (float) xb->norm;
+    const uint8_t qb = xb->qs[il];  // 4 x 2-bit indices in one byte
+    for (short j = 0; j < 4; j++) {
+        uint8_t idx = (qb >> (j * 2)) & 0x3;
+        reg[j] = turbo_centroids_2bit[idx] * norm;
+    }
+}
+
+template <typename type4>
+void dequantize_turbo4_0_t4(device const block_turbo4_0 * xb, short il, thread type4 & reg) {
+    const float norm = (float) xb->norm;
+    const uint8_t b0 = xb->qs[il*2];      // elements 0,1 (nibbles)
+    const uint8_t b1 = xb->qs[il*2 + 1];  // elements 2,3
+    reg[0] = turbo_centroids_4bit[ b0       & 0xF] * norm;
+    reg[1] = turbo_centroids_4bit[(b0 >> 4) & 0xF] * norm;
+    reg[2] = turbo_centroids_4bit[ b1       & 0xF] * norm;
+    reg[3] = turbo_centroids_4bit[(b1 >> 4) & 0xF] * norm;
+}
+

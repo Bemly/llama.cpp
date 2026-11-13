@@ -1,6 +1,16 @@
 
 #pragma once
 
+// SIMD dots for the Prism group-128 types: PQ2_0 on x86 and ARM, PTQ1_0 and the multi-column dots on x86 only
+#if defined(GGML_CPU_GENERIC) || !(defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64))
+#define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_get_vec_dot_multi_generic ggml_get_vec_dot_multi
+#endif
+#if defined(GGML_CPU_GENERIC) || !(defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64) || \
+                                   defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC))
+#define ggml_vec_dot_pq2_0_q8_0_generic ggml_vec_dot_pq2_0_q8_0
+#endif
+
 // Rename `_generic` functions if no native implementation is available.
 // This effectively selects the generic implementation.
 

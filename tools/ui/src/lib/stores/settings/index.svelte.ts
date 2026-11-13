@@ -9,7 +9,6 @@
 
 import { browser } from '$app/environment';
 import { SETTING_CONFIG_DEFAULT, SETTINGS_KEYS } from '$lib/constants';
-import { ColorMode } from '$lib/enums';
 import { ParameterSyncService } from '$lib/services/parameter-sync.service';
 import { SettingsService } from '$lib/services/settings.service';
 import { deviceStore } from '$lib/stores/device.svelte';
@@ -22,7 +21,7 @@ import {
 	normalizeFloatingPoint,
 	setConfigValue
 } from '$lib/utils';
-import { setMode } from 'mode-watcher';
+import { applyTheme } from '$lib/utils/theme';
 
 class SettingsStore {
 	config = $state<SettingsConfigType>({ ...SETTING_CONFIG_DEFAULT });
@@ -126,7 +125,7 @@ class SettingsStore {
 			setConfigValue(this.config, key, value);
 
 			if (key === SETTINGS_KEYS.THEME) {
-				setMode(value as ColorMode);
+				applyTheme(value);
 			}
 
 			this.userOverrides.delete(key);
@@ -214,7 +213,7 @@ class SettingsStore {
 		this.saveConfig();
 
 		// Apply theme for immediate visual feedback
-		setMode(this.config[SETTINGS_KEYS.THEME] as ColorMode);
+		applyTheme(this.config[SETTINGS_KEYS.THEME]);
 
 		console.log('Settings imported successfully');
 	}
@@ -231,7 +230,7 @@ class SettingsStore {
 			this.migrateLegacyTheme();
 			this.enforceDiscoverCoupling();
 			// Apply the persisted theme from config on initial load
-			setMode(this.config[SETTINGS_KEYS.THEME] as ColorMode);
+			applyTheme(this.config[SETTINGS_KEYS.THEME]);
 			this.isInitialized = true;
 		} catch (error) {
 			console.error('Failed to initialize settings store:', error);
@@ -285,7 +284,7 @@ class SettingsStore {
 	resetTheme() {
 		this.updateConfig(SETTINGS_KEYS.THEME, SETTING_CONFIG_DEFAULT[SETTINGS_KEYS.THEME]);
 
-		setMode(SETTING_CONFIG_DEFAULT[SETTINGS_KEYS.THEME] as ColorMode);
+		applyTheme(SETTING_CONFIG_DEFAULT[SETTINGS_KEYS.THEME]);
 	}
 
 	/**
@@ -335,9 +334,9 @@ class SettingsStore {
 
 				setConfigValue(this.config, key, value);
 
-				// theme lives in mode-watcher, not just in config -> propagate
+				// Apply both the palette and its light/dark mode.
 				if (key === SETTINGS_KEYS.THEME) {
-					setMode(value as ColorMode);
+					applyTheme(value);
 				}
 			}
 		}
@@ -417,7 +416,7 @@ class SettingsStore {
 	updateTheme(newTheme: string) {
 		this.updateConfig(SETTINGS_KEYS.THEME, newTheme);
 
-		setMode(newTheme as ColorMode);
+		applyTheme(newTheme);
 	}
 
 	/**
@@ -535,7 +534,7 @@ class SettingsStore {
 		if (legacyTheme) {
 			this.config[SETTINGS_KEYS.THEME] = legacyTheme;
 			this.saveConfig();
-			setMode(legacyTheme as ColorMode);
+			applyTheme(legacyTheme);
 		}
 	}
 

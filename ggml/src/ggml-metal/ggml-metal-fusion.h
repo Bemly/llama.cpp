@@ -45,6 +45,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SILU_MUL,    // UNARY (silu) + MUL (MLP gate)
     GGML_METAL_FUSION_SOFTPLUS_MUL, // UNARY (softplus) + MUL (SSM dt)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_SCALE_UNARY,   // SCALE + UNARY (silu/sigmoid) [+ SCALE]
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

@@ -78,10 +78,14 @@ add_library(${TARGET}
     debug.h
     download.cpp
     download.h
+    finetune.cpp
+    finetune.h
     fit.cpp
     fit.h
     file-lock.cpp
     file-lock.h
+    tosh-plan.cpp
+    tosh-plan.h
     hf-cache.cpp
     hf-cache.h
     http.h

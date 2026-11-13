@@ -188,6 +188,53 @@ static void test_reasoning_budget_clone_mid_forcing() {
     llama_sampler_free(sampler);
 }
 
+static void test_reasoning_budget_prompt_tokens() {
+    const std::vector<llama_token> start  = {100};
+    const std::vector<llama_token> end    = {101};
+    const std::vector<llama_token> forced = {101};
+
+    // the prompt leaves the block open with a token after the start tag: the end is still forced
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 0, REASONING_BUDGET_IDLE);
+
+        common_reasoning_budget_accept_prompt(sampler, 100);
+        common_reasoning_budget_accept_prompt(sampler, 50);
+
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
+        GGML_ASSERT(get_forced_token(sampler, 101) == 101 && "a prompt token used up the forced end tag");
+
+        llama_sampler_accept(sampler, 101);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+        llama_sampler_free(sampler);
+    }
+
+    // the prompt already closes the block: nothing is left to force
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 0, REASONING_BUDGET_IDLE);
+
+        for (llama_token token : {100, 50, 101, 50}) {
+            common_reasoning_budget_accept_prompt(sampler, token);
+        }
+
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+        llama_sampler_free(sampler);
+    }
+
+    // with budget left the prompt counts like generated text
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 2, REASONING_BUDGET_IDLE);
+
+        common_reasoning_budget_accept_prompt(sampler, 100);
+        common_reasoning_budget_accept_prompt(sampler, 50);
+
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+
+        llama_sampler_free(sampler);
+    }
+}
+
 static void test_reasoning_budget_force_manual() {
     const std::vector<llama_token> start  = {100};
     const std::vector<llama_token> end    = {101};
@@ -509,6 +556,7 @@ int main(void) {
 
     test_reasoning_budget_clone_mid_counting();
     test_reasoning_budget_clone_mid_forcing();
+    test_reasoning_budget_prompt_tokens();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
 

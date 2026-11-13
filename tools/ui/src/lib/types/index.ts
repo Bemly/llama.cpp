@@ -255,3 +255,11 @@ export type { ReasoningEffortLevel } from './reasoning';
 
 // Splash
 export type { SplashDimensions } from './splash';
+export type {
+	ToshCall,
+	ToshChunk,
+	ToshMapLayer,
+	ToshMapRequest,
+	ToshMessageData,
+	ToshSketch
+} from './tosh';

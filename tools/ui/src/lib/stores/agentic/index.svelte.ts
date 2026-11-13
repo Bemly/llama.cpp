@@ -38,6 +38,7 @@ import { AgenticGates } from '$lib/stores/agentic/gates.svelte';
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
 import { mcpStore } from '$lib/stores/mcp/index.svelte';
 import { modelsStore } from '$lib/stores/models/index.svelte';
+import { serverStore } from '$lib/stores/server.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
 import type {
@@ -205,11 +206,13 @@ class AgenticStore {
 
 	getConfig(settings: SettingsConfigType): AgenticConfig {
 		const maxTurns = Number(settings.agenticMaxTurns) || DEFAULT_AGENTIC_CONFIG.maxTurns;
+		const ownTools = mcpStore.hasEnabledServers() || toolsStore.customTools.length > 0;
+
+		// a server with a Tosh agent runs its tools itself for requests that bring none, unless the user added theirs
+		if (serverStore.props?.tosh_agent && !ownTools) return { enabled: false, maxTurns };
+
 		const hasTools =
-			mcpStore.hasEnabledServers() ||
-			toolsStore.serverTools.length > 0 ||
-			toolsStore.browserTools.length > 0 ||
-			toolsStore.customTools.length > 0;
+			ownTools || toolsStore.serverTools.length > 0 || toolsStore.browserTools.length > 0;
 
 		return {
 			enabled: hasTools && DEFAULT_AGENTIC_CONFIG.enabled,

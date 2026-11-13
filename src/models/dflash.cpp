@@ -1029,12 +1029,14 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
 
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
+    const llama_hadamard * embd_hdmd = nullptr;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
         tok_embd = model_other->tok_embd;
+        embd_hdmd = &model_other->hdmd;
     }
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -1057,6 +1059,8 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
     }
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+    inpL = build_hadamard_lookup(tok_embd, inpL, embd_hdmd);
+
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
@@ -1170,6 +1174,7 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+        cur = build_hadamard_input(output, cur, &model_other->hdmd);
     }
 
     cur = build_lora_mm(output, cur, output_s);
@@ -1274,12 +1279,14 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llm_graph_params & params) :
 
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
+    const llama_hadamard * embd_hdmd = nullptr;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
         tok_embd = model_other->tok_embd;
+        embd_hdmd = &model_other->hdmd;
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -1290,6 +1297,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llm_graph_params & params) :
     ggml_tensor * inp_tokens = inp->tokens;
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    inpL = build_hadamard_lookup(tok_embd, inpL, embd_hdmd);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -1376,6 +1384,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llm_graph_params & params) :
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+        cur = build_hadamard_input(output, cur, &model_other->hdmd);
     }
 
     cur = build_lora_mm(output, cur, output_s);

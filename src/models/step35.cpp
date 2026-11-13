@@ -437,6 +437,11 @@ llama_model_step35::graph_mtp::graph_mtp(const llm_graph_params & params)
     cb(Qcur, "mtp_Qcur_pos", il);
     cb(Kcur, "mtp_Kcur_pos", il);
 
+    if (mtp_kv_only()) {
+        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
+        return;
+    }
+
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head_k));
     ggml_tensor * attn_out = build_attn(inp_attn,
             nullptr, nullptr, nullptr,

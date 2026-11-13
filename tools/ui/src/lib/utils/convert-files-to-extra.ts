@@ -1,10 +1,11 @@
-import { convertPDFToImage, convertPDFToText } from './pdf-processing';
+import { convertPDFToImage, convertPDFToText, convertPDFToTextLayer } from './pdf-processing';
 import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
 import { isLikelyTextFile, readFileAsText } from './text-files';
 import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
 import { SETTINGS_KEYS } from '$lib/constants';
 import { AttachmentType, FileTypeCategory, SpecialFileType } from '$lib/enums';
 import { modelsStore } from '$lib/stores/models/index.svelte';
+import { serverStore } from '$lib/stores/server.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type { ChatUploadedFile, DatabaseMessageExtra, FileProcessingResult } from '$lib/types';
 import { getFileTypeCategory } from '$lib/utils';
@@ -139,7 +140,12 @@ export async function parseFilesToMessageExtras(
 				if (shouldProcessAsImages) {
 					// Process PDF as images (only for vision models)
 					try {
-						const images = await convertPDFToImage(file.file);
+						const images = await convertPDFToImage(
+							file.file,
+							Number(settingsStore.getConfig(SETTINGS_KEYS.MAX_IMAGE_RESOLUTION)) ||
+								Number(serverStore.uiSettings?.[SETTINGS_KEYS.MAX_IMAGE_RESOLUTION]) ||
+								0
+						);
 						// kept for the preview's Text view; the model only receives the images
 						const content = file.textContent ?? (await convertPDFToText(file.file).catch(() => ''));
 
@@ -151,6 +157,9 @@ export async function parseFilesToMessageExtras(
 							}
 						);
 
+						// the PDF's own text goes with its pages: what an image blurs, the text layer still says
+						const textLayer = await convertPDFToTextLayer(file.file);
+
 						extras.push({
 							base64Data: base64Data,
 							content,
@@ -158,6 +167,7 @@ export async function parseFilesToMessageExtras(
 							name: file.name,
 							processedAsImages: true,
 							size: file.size,
+							textLayer: textLayer || undefined,
 							type: AttachmentType.PDF
 						});
 					} catch (imageError) {

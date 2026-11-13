@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
+#include "llama-tosh-dmoe.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
@@ -30,6 +31,7 @@
 #include <cassert>
 #include <cctype>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -663,7 +665,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            if (is_dsv4) {
+            // A DFlash draft has no head of its own: its selector runs a top-k over the target's
+            // logits, and a head split by vocabulary leaves no device holding a whole row of them.
+            // The caller sets this when it pairs such a draft with a tensor split.
+            if (is_dsv4 || getenv("TOSH_MIRROR_OUTPUT_HEAD") != nullptr) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
@@ -970,7 +975,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f :
+                    tensor_split[ud->dev_offset + (j + tc.rotation) % ud->n_devices]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -1764,7 +1770,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             splits[i] = free;
         }
     } else {
-        std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+        // a group's share is the sum of its devices'
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] = 0.0f;
+            for (size_t k = 0; k < tensor_group_size; ++k) {
+                splits[i] += tensor_split[i*tensor_group_size + k];
+            }
+        }
     }
 
     // sum and normalize the splits to get the split points
@@ -2219,6 +2231,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+
+    llama_tosh_dmoe_init(layers, hparams);
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -3644,6 +3658,7 @@ const llama_vocab * llama_model_get_vocab(const llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+    llama_tosh_dmoe_shutdown();
     delete model;
 }
 
@@ -4085,7 +4100,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_FUSE_GATE_UP   (llama_model_loader::TENSOR_FUSE_GATE_UP) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
@@ -4103,6 +4119,17 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
     }
 
     layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+
+    // a file with the two projections apart still runs them as one on a 64-lane card, where the
+    // wider matrix measured 4% more prompt throughput and 1.4% more generation on Qwen3.6-35B
+    if (layer.ffn_gate_up_exps == nullptr && !(flags & TENSOR_SKIP)) {
+        const char * simd_width = getenv("TOSH_METAL_SIMD_WIDTH");
+        if (simd_width != nullptr && strcmp(simd_width, "64") == 0 && getenv("TOSH_MOE_GATE_UP_DISABLE") == nullptr) {
+            layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid),
+                    {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED | TENSOR_FUSE_GATE_UP);
+        }
+    }
+
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);

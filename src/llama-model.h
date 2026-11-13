@@ -692,6 +692,9 @@ struct llama_device {
 
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
+    // where this group starts in the global --tensor-split list; groups past the first would
+    // otherwise all read the same leading entries
+    size_t                     dev_offset;
     const struct llama_model * model;
 };
 
@@ -956,6 +959,12 @@ struct llama_model {
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
+    // one per group, so each carries its own offset; the single-group case still uses the above
+    std::vector<llama_meta_device_get_split_state_userdata> get_split_state_uds;
+
+    // devices per tensor-parallel group, 1 when there are no groups
+    size_t tensor_group_size = 1;
+
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
@@ -1044,6 +1053,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_FUSE_GATE_UP;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

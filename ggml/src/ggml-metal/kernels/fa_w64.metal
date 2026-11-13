@@ -1,0 +1,390 @@
+#include "common.h"
+#include "dequantize.h"
+
+// Prefill attention written for a 64-wide simdgroup. The one in fa_tosh.metal fixes the lane group
+// at 16 so a softmax reduction stays inside a simdgroup on either width; here the group is a
+// template parameter, so a wave can reduce over 32 or 64 lanes and walk fewer key chunks.
+// The two cannot share a file: a change to either width stays on its own side.
+//
+// LG lanes cooperate on one query row. Row strides stay padded off the 32-bank period so the
+// concurrent rows land on different banks.
+template<
+    short DK, short DV, short BQ, short BK, short NT, short LG,
+    typename k_t, short NKK, void (*deq_k)(device const k_t *, short, thread float4 &),
+    typename v_t, short NKV, void (*deq_v)(device const v_t *, short, thread float4 &)>
+kernel void kernel_flash_attn_ext_pf_amd_w64(
+        constant ggml_metal_kargs_flash_attn_ext_amd & args [[buffer(0)]],
+        device const char * q     [[buffer(1)]],
+        device const char * k     [[buffer(2)]],
+        device const char * v     [[buffer(3)]],
+        device const char * mask  [[buffer(4)]],
+        device const char * sinks [[buffer(5)]],
+        device const char * pad   [[buffer(6)]],
+        device       char * dst   [[buffer(7)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]]) {
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;
+    constexpr short NQG = NT/LG;
+    constexpr short NQR = BQ/NQG;
+    // A lane group wider than the key block leaves no column per lane, and the array below
+    // comes out zero-length with an error that does not name the cause.
+    static_assert(BK >= LG, "the key block has to cover the lane group");
+    constexpr short NKC = BK/LG;
+    constexpr short NDC = (DV + LG - 1)/LG;  // DK 72 (vision) leaves the top lanes idle
+    // half2 run before flushing to float; it has to divide DK, and 576 (MLA) is not a multiple of 128
+    constexpr short DKF = DK % 128 == 0 ? 128 : (DK % 64 == 0 ? 64 : DK);
+    constexpr short SQS = DK + 4;
+    constexpr short SVS = BK + 4;
+    // int, not short: a 128-key block overflows it (BK*SQS passes 32767) and the array
+    constexpr int   SKV = BK*SQS > DV*SVS ? BK*SQS : DV*SVS;
+
+    threadgroup half sq [BQ*SQS];
+    threadgroup half skv[SKV];     // K rows first, then V transposed over the same memory
+    threadgroup half sp [BQ*SVS];  // softmax weights
+
+    const short kg = tiitg % LG;
+    const short qg = tiitg / LG;
+
+    const int iq1 = tgpig.x*BQ;
+    const int iq2 = tgpig.y;
+    const int iq3 = tgpig.z;
+
+    const int ikv2 = iq2 / (args.ne02 / args.ne_12_2);
+    const int ikv3 = iq3 / (args.ne03 / args.ne_12_3);
+
+    device const char * kp = k + ikv2*args.nb12 + ikv3*args.nb13;
+    device const char * vp = v + ikv2*args.nb22 + ikv3*args.nb23;
+
+    // scale folded into Q so the score pass is a plain dot product
+    for (short c = tiitg; c < BQ*DK4; c += NT) {
+        const short jq = c / DK4;
+        const short ch = c % DK4;
+        float4 qv = 0.0f;
+        if (iq1 + jq < args.ne01) {
+            qv = ((device const float4 *) (q + (iq1 + jq)*args.nb01 + iq2*args.nb02 + iq3*args.nb03))[ch]*args.scale;
+        }
+        *(threadgroup half4 *) (sq + jq*SQS + 4*ch) = (half4) qv;
+    }
+
+    // the mask values a thread needs are exactly the ones it reduces, so they stay
+    // in registers; staging them through LDS measured as costly as the Q*K pass
+    device const half * pmr[NQR];
+    if (args.has_mask) {
+        for (short rr = 0; rr < NQR; ++rr) {
+            const int jq = iq1 + qg + NQG*rr;
+            const int gq = jq < args.ne01 ? jq : args.ne01 - 1;
+            pmr[rr] = (device const half *)
+                (mask + gq*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        }
+    }
+
+    float m   [NQR];
+    float srun[NQR];
+    float acc [NQR][NDC];
+    for (short rr = 0; rr < NQR; ++rr) {
+        m[rr]    = -FLT_MAX/2;
+        srun[rr] = 0.0f;
+        for (short dd = 0; dd < NDC; ++dd) {
+            acc[rr][dd] = 0.0f;
+        }
+    }
+
+    for (int j0 = 0; j0 < args.ne11; j0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // mask and K read together so their loads overlap
+        half  mv[NQR][NKC];
+        float any = 1.0f;
+        if (args.has_mask) {
+            any = 0.0f;
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short cc = 0; cc < NKC; ++cc) {
+                    const short col = kg + LG*cc;
+                    const half x = j0 + col < args.ne11 ? pmr[rr][j0 + col] : (half) -MAXHALF;
+                    mv[rr][cc] = x;
+                    any = max(any, (float) x > -1e30f ? 1.0f : 0.0f);
+                }
+            }
+        }
+
+        for (short c = tiitg; c < BK*DK4; c += NT) {
+            const short jj = c / DK4;
+            const short ch = c % DK4;
+            float4 tv = 0.0f;
+            if (j0 + jj < args.ne11) {
+                device const k_t * kb = (device const k_t *) (kp + (uint64_t)(j0 + jj)*args.nb11);
+                deq_k(kb + ch/NKK, ch%NKK, tv);
+            }
+            *(threadgroup half4 *) (skv + jj*SQS + 4*ch) = (half4) tv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // skip is per query group; the loads and barriers below stay uniform
+        for (ushort o = 1; o < LG; o <<= 1) {
+            any = max(any, simd_shuffle_xor(any, o));
+        }
+        if (any > 0.0f) {
+
+        float sc[NQR][NKC];
+        for (short rr = 0; rr < NQR; ++rr) {
+            for (short cc = 0; cc < NKC; ++cc) {
+                sc[rr][cc] = 0.0f;
+            }
+        }
+        for (short d0 = 0; d0 < DK; d0 += DKF) {
+            half2 pacc[NQR][NKC];
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short cc = 0; cc < NKC; ++cc) {
+                    pacc[rr][cc] = 0.0h;
+                }
+            }
+            FOR_UNROLL (short d = 0; d < DKF; d += 2) {
+                half2 av[NQR];
+                half2 bv[NKC];
+                for (short rr = 0; rr < NQR; ++rr) {
+                    av[rr] = *(threadgroup const half2 *) (sq + (qg + NQG*rr)*SQS + d0 + d);
+                }
+                for (short cc = 0; cc < NKC; ++cc) {
+                    bv[cc] = *(threadgroup const half2 *) (skv + (kg + LG*cc)*SQS + d0 + d);
+                }
+                for (short rr = 0; rr < NQR; ++rr) {
+                    for (short cc = 0; cc < NKC; ++cc) {
+                        pacc[rr][cc] = av[rr]*bv[cc] + pacc[rr][cc];
+                    }
+                }
+            }
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short cc = 0; cc < NKC; ++cc) {
+                    sc[rr][cc] += (float) pacc[rr][cc][0] + (float) pacc[rr][cc][1];
+                }
+            }
+        }
+
+        for (short rr = 0; rr < NQR; ++rr) {
+            const short row = qg + NQG*rr;
+            float mx = -FLT_MAX;
+            for (short cc = 0; cc < NKC; ++cc) {
+                if (args.logit_softcap != 0.0f) {
+                    sc[rr][cc] = args.logit_softcap*precise::tanh(sc[rr][cc]);
+                }
+                if (args.has_mask) {
+                    sc[rr][cc] += (float) mv[rr][cc];
+                } else if (j0 + kg + LG*cc >= args.ne11) {
+                    sc[rr][cc] = -INFINITY;
+                }
+                mx = max(mx, sc[rr][cc]);
+            }
+            for (ushort o = 1; o < LG; o <<= 1) {
+                mx = max(mx, simd_shuffle_xor(mx, o));
+            }
+
+            const float mn   = max(m[rr], mx);
+            const float corr = exp(m[rr] - mn);
+
+            float ls = 0.0f;
+            for (short cc = 0; cc < NKC; ++cc) {
+                const float w = exp(sc[rr][cc] - mn);
+                sp[row*SVS + kg + LG*cc] = (half) w;
+                ls += w;
+            }
+            for (ushort o = 1; o < LG; o <<= 1) {
+                ls += simd_shuffle_xor(ls, o);
+            }
+
+            m[rr]    = mn;
+            srun[rr] = srun[rr]*corr + ls;
+            for (short dd = 0; dd < NDC; ++dd) {
+                acc[rr][dd] *= corr;
+            }
+        }
+
+        }
+
+        // V lands transposed so the P*V pass reads two cache rows in one half2
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short c = tiitg; c < BK*DV4; c += NT) {
+            const short jj = c / DV4;
+            const short ch = c % DV4;
+            float4 tv = 0.0f;
+            if (j0 + jj < args.ne11) {
+                device const v_t * vb = (device const v_t *) (vp + (uint64_t)(j0 + jj)*args.nb21);
+                deq_v(vb + ch/NKV, ch%NKV, tv);
+            }
+            for (short i = 0; i < 4; ++i) {
+                skv[(4*ch + i)*SVS + jj] = (half) tv[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (any == 0.0f) {
+            continue;
+        }
+
+        for (short j = 0; j < BK; j += BK) {
+            half2 pacc[NQR][NDC];
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short dd = 0; dd < NDC; ++dd) {
+                    pacc[rr][dd] = 0.0h;
+                }
+            }
+            FOR_UNROLL (short jj = 0; jj < BK; jj += 2) {
+                half2 pv[NQR];
+                half2 vv[NDC];
+                for (short rr = 0; rr < NQR; ++rr) {
+                    pv[rr] = *(threadgroup const half2 *) (sp + (qg + NQG*rr)*SVS + j + jj);
+                }
+                for (short dd = 0; dd < NDC; ++dd) {
+                    vv[dd] = DV % LG == 0 || kg + LG*dd < DV
+                        ? *(threadgroup const half2 *) (skv + (kg + LG*dd)*SVS + j + jj) : 0.0h;
+                }
+                for (short rr = 0; rr < NQR; ++rr) {
+                    for (short dd = 0; dd < NDC; ++dd) {
+                        pacc[rr][dd] = pv[rr]*vv[dd] + pacc[rr][dd];
+                    }
+                }
+            }
+            for (short rr = 0; rr < NQR; ++rr) {
+                for (short dd = 0; dd < NDC; ++dd) {
+                    acc[rr][dd] += (float) pacc[rr][dd][0] + (float) pacc[rr][dd][1];
+                }
+            }
+        }
+    }
+
+    if (args.has_sinks) {
+        const float sv = ((device const float *) sinks)[iq2];
+        for (short rr = 0; rr < NQR; ++rr) {
+            const float mn   = max(m[rr], sv);
+            const float corr = exp(m[rr] - mn);
+            for (short dd = 0; dd < NDC; ++dd) {
+                acc[rr][dd] *= corr;
+            }
+            srun[rr] = srun[rr]*corr + exp(sv - mn);
+            m[rr]    = mn;
+        }
+    }
+
+    device float * dst1 = (device float *) dst;
+    for (short rr = 0; rr < NQR; ++rr) {
+        const int iq = iq1 + qg + NQG*rr;
+        if (iq >= args.ne01) {
+            continue;
+        }
+        const float inv = srun[rr] > 0.0f ? 1.0f/srun[rr] : 0.0f;
+        const int64_t rid = (int64_t) iq3*args.ne2*args.ne1 + iq2 + (int64_t) iq*args.ne1;
+        for (short dd = 0; dd < NDC; ++dd) {
+            if (DV % LG == 0 || kg + LG*dd < DV) {
+                dst1[rid*DV + kg + LG*dd] = acc[rr][dd]*inv;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_ext_pf_amd_w64<128, 128, 64, 64, 256, 32, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4>) flash_attn_ext_pf_amd_w64_t;
+
+// One instantiation per lane-group width so the two can be compared without rebuilding.
+// 16 reproduces the 32-lane kernel and is the control; 32 and 64 give a wave fewer key
+// chunks to walk and a wider reduction.
+#define FA_AMD_PF_W64_INST(dk, bq, bk, lg, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_pf_amd_dk" #dk "_" nm "_w64_lg" #lg)]] kernel flash_attn_ext_pf_amd_w64_t \
+    kernel_flash_attn_ext_pf_amd_w64<dk, dk, bq, bk, 256, lg, kt, nkk, dkf, vt, nkv, dvf>;
+
+// Widening the group alone also multiplies the query rows a thread carries (NQR = BQ/(NT/LG)),
+// so the single-front sweep cannot tell the group apart from the register pressure. These keep
+// NQR at four by halving BQ as LG doubles, which is the comparison that isolates the group.
+#define FA_AMD_PF_W64_NQR(dk, lg, bq, bk, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_pf_amd_dk" #dk "_" nm "_w64_lg" #lg "q" #bq "k" #bk)]] kernel flash_attn_ext_pf_amd_w64_t \
+    kernel_flash_attn_ext_pf_amd_w64<dk, dk, bq, bk, 256, lg, kt, nkk, dkf, vt, nkv, dvf>;
+
+#define FA_AMD_PF_W64_PAIR(nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR( 64, 16, 64,  96, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(128, 16, 64,  96, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(256, 16, 32,  96, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR( 64, 16, 16, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(128, 16, 16, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(256, 16, 16, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR( 64, 16, 32, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(128, 16, 32, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(256, 16, 64, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR( 64, 32, 32, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR( 64, 64, 16, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(128, 32, 32, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(128, 64, 16, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(256, 32, 16, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_NQR(256, 64,  8, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST( 64, 64, 64, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST( 64, 64, 64, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST( 64, 64, 64, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST(128, 64, 64, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST(128, 64, 64, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST(128, 64, 64, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST(256, 32, 64, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST(256, 32, 64, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST(256, 32, 64, 64, nm, kt, nkk, dkf, vt, nkv, dvf)
+
+FA_AMD_PF_W64_PAIR("kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
+FA_AMD_PF_W64_PAIR("kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_PF_W64_PAIR("kq4_0_vq4_0", block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_PF_W64_PAIR("kq8_0_vf16",  block_q8_0, 8, dequantize_q8_0_t4_h2, half4,      1, dequantize_f16_t4)
+FA_AMD_PF_W64_PAIR("kq4_0_vf16",  block_q4_0, 8, dequantize_q4_0_t4, half4,      1, dequantize_f16_t4)
+FA_AMD_PF_W64_PAIR("kf16_vq8_0",  half4,      1, dequantize_f16_t4,  block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_PF_W64_PAIR("kf16_vq4_0",  half4,      1, dequantize_f16_t4,  block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_PF_W64_PAIR("kq8_0_vq4_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_PF_W64_PAIR("kq4_0_vq8_0", block_q4_0, 8, dequantize_q4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+
+// TurboQuant KV: el prefill de esas combinaciones seguia cayendo al kernel de 32 carriles
+// porque nunca se instancio su gemelo. Mismo grupo de carriles que el resto, 16.
+#define FA_AMD_PF_W64_TURBO(nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST(128, 64, 64, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_W64_INST(256, 32, 64, 16, nm, kt, nkk, dkf, vt, nkv, dvf)
+
+FA_AMD_PF_W64_TURBO("kq8_0_vturbo2", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_W64_TURBO("kq8_0_vturbo3", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_W64_TURBO("kq8_0_vturbo4", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_W64_TURBO("kf16_vturbo2", half4, 1, dequantize_f16_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_W64_TURBO("kf16_vturbo3", half4, 1, dequantize_f16_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_W64_TURBO("kf16_vturbo4", half4, 1, dequantize_f16_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo2_vq8_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_PF_W64_TURBO("kturbo2_vf16", block_turbo2_0, 32, dequantize_turbo2_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_TURBO("kturbo2_vturbo2", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo2_vturbo3", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo2_vturbo4", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo3_vq8_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_PF_W64_TURBO("kturbo3_vf16", block_turbo3_0, 32, dequantize_turbo3_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_TURBO("kturbo3_vturbo2", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo3_vturbo3", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo3_vturbo4", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo4_vq8_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_PF_W64_TURBO("kturbo4_vf16", block_turbo4_0, 32, dequantize_turbo4_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_TURBO("kturbo4_vturbo2", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo4_vturbo3", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo4_vturbo4", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_W64_TURBO("kq4_0_vturbo2", block_q4_0, 8, dequantize_q4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_W64_TURBO("kq4_0_vturbo3", block_q4_0, 8, dequantize_q4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_W64_TURBO("kq4_0_vturbo4", block_q4_0, 8, dequantize_q4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo2_vq4_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo3_vq4_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_PF_W64_TURBO("kturbo4_vq4_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+
+// Asymmetric heads and the 512 head had no 64-lane twin, so on such a card their prefill ran
+// the 32-lane kernel. The template already carries DK and DV apart; only these were missing.
+#define FA_AMD_PF_W64_INST_DV(dk, dv, bq, bk, lg, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_pf_amd_dk" #dk "_dv" #dv "_" nm "_w64_lg" #lg)]] kernel flash_attn_ext_pf_amd_w64_t \
+    kernel_flash_attn_ext_pf_amd_w64<dk, dv, bq, bk, 256, lg, kt, nkk, dkf, vt, nkv, dvf>;
+
+// head 512, symmetric
+FA_AMD_PF_W64_INST(512, 16, 32, 16, "kf16_vf16",  half4,      1, dequantize_f16_t4,  half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST(512, 16, 32, 16, "kq8_0_vf16", block_q8_0, 8, dequantize_q8_0_t4_h2, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST(512, 16, 32, 16, "kq4_0_vf16", block_q4_0, 8, dequantize_q4_0_t4, half4, 1, dequantize_f16_t4)
+
+// MLA: K is 576 (512 latent + 64 rope) and V is 512. The wider groups are here because the
+// sweep that closed the symmetric heads at sixteen never covered an asymmetric one.
+FA_AMD_PF_W64_INST_DV(576, 512, 16, 32, 32, "kf16_vf16",  half4,      1, dequantize_f16_t4,  half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST_DV(576, 512, 16, 64, 64, "kf16_vf16",  half4,      1, dequantize_f16_t4,  half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST_DV(320, 256, 16, 32, 32, "kf16_vf16",  half4,      1, dequantize_f16_t4,  half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST(512, 16, 32, 32, "kf16_vf16",  half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST_DV(576, 512, 16, 32, 16, "kf16_vf16",  half4,      1, dequantize_f16_t4,  half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST_DV(576, 512, 16, 32, 16, "kq8_0_vf16", block_q8_0, 8, dequantize_q8_0_t4_h2, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST_DV(320, 256, 16, 32, 16, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
+FA_AMD_PF_W64_INST_DV(320, 256, 16, 32, 16, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)

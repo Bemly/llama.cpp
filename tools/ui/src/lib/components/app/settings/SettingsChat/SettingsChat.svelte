@@ -17,10 +17,10 @@
 		SETTINGS_KEYS,
 		SETTINGS_SECTION_SLUGS
 	} from '$lib/constants';
-	import { ColorMode } from '$lib/enums/ui.enums';
 	import { modelsStore, serverStore, settingsStore } from '$lib/stores';
 	import type { SettingsSection, SettingsSectionTitle } from '$lib/types';
-	import { setMode } from 'mode-watcher';
+	import { applyTheme } from '$lib/utils/theme';
+	import { onDestroy } from 'svelte';
 	import { fade } from 'svelte/transition';
 	interface Props {
 		initialSection?: string;
@@ -81,9 +81,11 @@
 		}
 	});
 
+	onDestroy(() => applyTheme(settingsStore.config.theme));
+
 	function handleThemeChange(newTheme: string) {
 		localConfig.theme = newTheme;
-		setMode(newTheme as ColorMode);
+		applyTheme(newTheme);
 	}
 
 	function handleConfigChange(key: string, value: string | boolean) {
@@ -98,7 +100,7 @@
 
 	function handleReset() {
 		localConfig = { ...settingsStore.config };
-		setMode(localConfig.theme as ColorMode);
+		applyTheme(localConfig.theme);
 		mobileHeader?.updateCarousel();
 	}
 
@@ -150,6 +152,7 @@
 
 	export function reset() {
 		localConfig = { ...settingsStore.config };
+		applyTheme(localConfig.theme);
 	}
 </script>
 

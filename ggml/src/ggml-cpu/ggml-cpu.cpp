@@ -62,7 +62,9 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
 #endif
 
 #ifdef GGML_USE_CPU_REPACK
-        if (ggml_backend_cpu_repack_buffer_type()) {
+        // GGML_CPU_NO_REPACK keeps CPU weights in their canonical layout so the
+        // scheduler can offload their matmuls to the GPU (tools without --no-repack)
+        if (ggml_backend_cpu_repack_buffer_type() && getenv("GGML_CPU_NO_REPACK") == NULL) {
             bufts.push_back(ggml_backend_cpu_repack_buffer_type());
         }
 #endif
@@ -440,6 +442,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_TOSH_DMOE_PUBLISH:
+        case GGML_OP_TOSH_DMOE_JOIN:
+        case GGML_OP_TOSH_DMOE_OBSERVE:
+            return false;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return
