@@ -56,9 +56,11 @@ bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_t
 // inline: these run once per matmul node during encode, and a cross-TU call there is not free
 static inline bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     static const int ne11_mm_min = 8;
+    // the bf16e tile loader reads whole 16-wide blocks with no K mask, so short bf16 rows stay on mat-vec
+    const int64_t ne00_mm_min = op->src[0]->type == GGML_TYPE_BF16 ? 64 : 32;
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
-           has_simdgroup_mm && op->src[1]->ne[1] > ne11_mm_min && op->src[0]->ne[0] >= 32;
+           has_simdgroup_mm && op->src[1]->ne[1] > ne11_mm_min && op->src[0]->ne[0] >= ne00_mm_min;
 }
 
 static inline bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
