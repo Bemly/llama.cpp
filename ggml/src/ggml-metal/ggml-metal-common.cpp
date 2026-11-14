@@ -36,10 +36,12 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
+    // bf16e tile loader reads whole 16-wide blocks with no K mask; short bf16 rows stay on mat-vec
+    const int64_t ne00_mm_min = op->src[0]->type == GGML_TYPE_BF16 ? 64 : 32;
 
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
-           has_simdgroup_mm && ne11 > 8 && ne00 >= 32;
+           has_simdgroup_mm && ne11 > 8 && ne00 >= ne00_mm_min;
 }
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
