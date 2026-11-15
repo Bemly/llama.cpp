@@ -506,7 +506,27 @@ bool server_http_context::init_listener(const common_params & params) {
                 SRV_ERR("static assets path not found: %s\n", params.public_path.c_str());
                 return false;
             }
-        } else {
+        }
+        // same-port extra UIs (kvmem / strata): PREFIX/ -> directory; API stays at /
+        // Only mount with a trailing slash. Serving index.html at bare /kvmem makes the
+        // browser resolve relative CSS/JS against /, which 404s under --path.
+        for (const auto & mount : params.ui_mounts) {
+            const std::string & prefix = mount.first;
+            const std::string & dir = mount.second;
+            const std::string mounted = params.api_prefix + prefix + "/";
+            if (const auto is_found = srv->set_mount_point(mounted, dir); !is_found) {
+                SRV_ERR("ui-mount path not found: %s -> %s\n", mounted.c_str(), dir.c_str());
+                return false;
+            }
+            // /kvmem -> /kvmem/ so relative assets stay under the mount
+            const std::string bare = params.api_prefix + prefix;
+            const std::string target = mounted;
+            srv->Get(bare, [target](const httplib::Request &, httplib::Response & res) {
+                res.set_redirect(target, httplib::StatusCode::MovedPermanently_301);
+            });
+            SRV_INF("ui-mount %s -> %s (bare %s redirects)\n", mounted.c_str(), dir.c_str(), bare.c_str());
+        }
+        if (params.public_path.empty()) {
 #if defined(LLAMA_UI_HAS_ASSETS)
             static auto handle_gzip_header = [](const httplib::Request & req, httplib::Response & res) {
                 if (!llama_ui_use_gzip()) {

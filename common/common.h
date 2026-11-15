@@ -668,6 +668,8 @@ struct common_params {
     std::string server_connect_code = "";
 
     std::string public_path   = "";                                                                         // NOLINT
+    // extra static UIs on the same port: mount prefix -> directory (e.g. /kvmem, /strata)
+    std::vector<std::pair<std::string, std::string>> ui_mounts;
     std::string tiles_path    = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT

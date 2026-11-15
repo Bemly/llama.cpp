@@ -3385,6 +3385,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STATIC_PATH"));
     add_opt(common_arg(
+        {"--ui-mount"}, "PREFIX:PATH,...",
+        "mount static UI(s) under PREFIX on the same port, e.g. /kvmem:/path,/strata:/other",
+        [](common_params & params, const std::string & value) {
+            auto add_one = [&](std::string item) {
+                const auto colon = item.find(':');
+                if (colon == std::string::npos || colon == 0 || colon + 1 >= item.size()) {
+                    throw std::invalid_argument("invalid --ui-mount, expected PREFIX:PATH");
+                }
+                std::string prefix = item.substr(0, colon);
+                std::string path = item.substr(colon + 1);
+                while (!prefix.empty() && prefix.back() == '/') {
+                    prefix.pop_back();
+                }
+                if (prefix.empty() || prefix[0] != '/') {
+                    throw std::invalid_argument("--ui-mount PREFIX must start with /");
+                }
+                params.ui_mounts.emplace_back(std::move(prefix), std::move(path));
+            };
+            size_t start = 0;
+            while (start <= value.size()) {
+                const auto comma = value.find(',', start);
+                const std::string item = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!item.empty()) {
+                    add_one(item);
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--tiles-path"}, "PATH",
         "folder of map files (PMTiles, fonts, sprites) served at /tiles/, with byte ranges",
         [](common_params & params, const std::string & value) {

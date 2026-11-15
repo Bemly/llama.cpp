@@ -1,5 +1,6 @@
 #include "server-connect.h"
 #include "server-context.h"
+#include "server-compat.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -500,7 +501,11 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 // the API of every server; a router points the handlers in routes at its proxies before calling this
 // agent_key: shown by the Tosh agent to /tools for the servers only it may use, empty without --mcp-agent
 static void server_register_routes(server_http_context & ctx_http, server_routes & routes,
-                                   const common_params & params, server_mcp & mcp_mgr, const std::string & agent_key) {
+                                   const common_params & params, server_mcp & mcp_mgr, const std::string & agent_key,
+                                   server_compat & compat) {
+    // kvmem / HyperCore: enrich health/props, JSON /metrics, empty /slots when disabled
+    compat.wrap_routes(routes);
+
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
@@ -549,6 +554,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+
+    // kvmem console + HyperCore WebUI compatibility routes
+    compat.register_routes(ctx_http, routes, chat_completions, ex_wrapper);
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
@@ -927,7 +935,8 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     // new on every start
     const std::string agent_key = params.mcp_agent.empty() ? "" : tosh_agent_key();
 
-    server_register_routes(ctx_http, routes, params, mcp_mgr, agent_key);
+    server_compat compat(params);
+    server_register_routes(ctx_http, routes, params, mcp_mgr, agent_key, compat);
     server_register_stream_routes(ctx_http,
         models_routes->router_stream_get,
         models_routes->router_streams_lookup,
@@ -1032,7 +1041,8 @@ static int server_run_instance(common_params & params, server_role & role, commo
     // new on every start
     const std::string agent_key = params.mcp_agent.empty() ? "" : tosh_agent_key();
 
-    server_register_routes(ctx_http, routes, params, mcp_mgr, agent_key);
+    server_compat compat(params);
+    server_register_routes(ctx_http, routes, params, mcp_mgr, agent_key, compat);
     server_register_stream_routes(ctx_http,
         server_stream_make_get_handler(),
         server_stream_make_lookup_handler(),
