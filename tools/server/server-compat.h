@@ -22,6 +22,9 @@ struct server_compat {
     // wrap existing route handlers before they are registered
     void wrap_routes(server_routes & routes);
 
+    // record request rows for kvmem/Strata monitors (usage/timings when present)
+    server_http_context::handler_t wrap_chat_completions(server_http_context::handler_t inner);
+
     // register extra paths; chat_completions is the same handler used for /v1/chat/completions
     void register_routes(
             server_http_context & ctx_http,

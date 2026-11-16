@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "common.h"
 #include "log.h"
+#include "tosh-dmoe.h"
 
 #include <algorithm>
 #include <cctype>
@@ -203,12 +204,264 @@ json host_hardware_sample() {
     return out;
 }
 
+std::string to_lower_copy(std::string s) {
+    for (char & c : s) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+    return s;
+}
+
+// Prefer HyperCore JSON unless Accept clearly asks for Prometheus text and not JSON.
+bool wants_prometheus_metrics(const server_http_req & req) {
+    const std::string accept = to_lower_copy(header_get(req, "Accept"));
+    if (accept.empty()) {
+        return false;
+    }
+    const bool wants_json = accept.find("application/json") != std::string::npos;
+    const bool wants_text =
+            accept.find("text/plain") != std::string::npos ||
+            accept.find("openmetrics") != std::string::npos;
+    return wants_text && !wants_json;
+}
+
+struct hw_sample {
+    int64_t sampled_at_ms = 0;
+    json    cpu_percent   = nullptr;
+    bool    has_ram       = false;
+    int64_t ram_total     = 0;
+    int64_t ram_used      = 0;
+    int64_t ram_available = 0;
+    bool    has_vram      = false;
+    int64_t vram_used     = 0;
+    int64_t vram_total    = 0;
+};
+
+hw_sample sample_hardware() {
+    hw_sample s;
+    const json host = host_hardware_sample();
+    s.sampled_at_ms = json_value(host, "sampled_at_ms", now_ms());
+    if (host.contains("cpu_percent") && !host.at("cpu_percent").is_null()) {
+        s.cpu_percent = host.at("cpu_percent");
+    }
+    if (host.contains("ram") && host.at("ram").is_object()) {
+        const json & ram = host.at("ram");
+        if (ram.contains("total_bytes") && ram.contains("used_bytes")) {
+            s.has_ram = true;
+            s.ram_total = ram.value("total_bytes", (int64_t) 0);
+            s.ram_used = ram.value("used_bytes", (int64_t) 0);
+            s.ram_available = ram.value("available_bytes", s.ram_total - s.ram_used);
+        }
+    }
+    size_t vfree = 0;
+    size_t vtotal = 0;
+    if (tosh_vram_read(&vfree, &vtotal) && vtotal > 0) {
+        s.has_vram = true;
+        s.vram_total = (int64_t) vtotal;
+        s.vram_used = (int64_t) (vtotal > vfree ? vtotal - vfree : 0);
+    }
+    return s;
+}
+
+// KVMem monitor.js field names on snapshot.hardware
+json hw_to_kvmem(const hw_sample & s, const std::string & gpu_uuid) {
+    json gpu = {
+            {"name", "Metal"},
+            {"uuid", gpu_uuid},
+            {"utilization_percent", nullptr},
+            {"used_bytes", s.has_vram ? json(s.vram_used) : json(nullptr)},
+            {"total_bytes", s.has_vram ? json(s.vram_total) : json(nullptr)},
+            {"temperature_c", nullptr},
+            {"power_w", nullptr},
+            {"pcie_generation", nullptr},
+            {"pcie_width", nullptr},
+            {"pcie_rx_bytes_per_second", nullptr},
+    };
+    json out = {
+            {"sampled_at_ms", s.sampled_at_ms},
+            {"cpu_percent", s.cpu_percent},
+            {"gpus", json::array({gpu})},
+    };
+    if (s.has_ram) {
+        out["ram_total_bytes"] = s.ram_total;
+        out["ram_used_bytes"] = s.ram_used;
+        out["ram_available_bytes"] = s.ram_available;
+    } else {
+        out["ram_total_bytes"] = nullptr;
+        out["ram_used_bytes"] = nullptr;
+        out["ram_available_bytes"] = nullptr;
+    }
+    return out;
+}
+
+// Strata /metrics hardware block (flat + optional per-GPU)
+json hw_to_strata(const hw_sample & s) {
+    json gpu = {
+            {"index", 0},
+            {"util", nullptr},
+            {"mem_used", s.has_vram ? json(s.vram_used) : json(nullptr)},
+            {"mem_total", s.has_vram ? json(s.vram_total) : json(nullptr)},
+            {"temp", nullptr},
+            {"power", nullptr},
+    };
+    return {
+            {"gpu_util", nullptr},
+            {"gpu_mem_used", s.has_vram ? json(s.vram_used) : json(nullptr)},
+            {"gpu_mem_total", s.has_vram ? json(s.vram_total) : json(nullptr)},
+            {"gpu_temp", nullptr},
+            {"gpu_power", nullptr},
+            {"gpu_pcie_rx_mb", nullptr},
+            {"cpu", s.cpu_percent},
+            {"ram_used", s.has_ram ? json(s.ram_used) : json(nullptr)},
+            {"ram_total", s.has_ram ? json(s.ram_total) : json(nullptr)},
+            {"disk_read_mb", nullptr},
+            {"disk_write_mb", nullptr},
+            {"gpus", json::array({gpu})},
+    };
+}
+
+// launcher hardware: keep nested ram{}, add flat aliases for older UIs
+json hw_to_launcher(const hw_sample & s) {
+    json out = host_hardware_sample();
+    out["sampled_at_ms"] = s.sampled_at_ms;
+    out["cpu_percent"] = s.cpu_percent;
+    if (s.has_ram) {
+        out["ram"] = {
+                {"total_bytes", s.ram_total},
+                {"used_bytes", s.ram_used},
+                {"available_bytes", s.ram_available},
+        };
+        out["ram_total_bytes"] = s.ram_total;
+        out["ram_used_bytes"] = s.ram_used;
+        out["ram_available_bytes"] = s.ram_available;
+    }
+    if (s.has_vram) {
+        out["vram_used_bytes"] = s.vram_used;
+        out["vram_total_bytes"] = s.vram_total;
+    } else {
+        out["vram_used_bytes"] = nullptr;
+        out["vram_total_bytes"] = nullptr;
+    }
+    return out;
+}
+
+void apply_stats_from_json(int & prompt_tokens, int & cached_tokens, int & generated_tokens,
+                           double & decode_tps, double & prefill_tps, int & limit, const json & body) {
+    if (!body.is_object()) {
+        return;
+    }
+    if (body.contains("usage") && body.at("usage").is_object()) {
+        const json & u = body.at("usage");
+        prompt_tokens = json_value(u, "prompt_tokens", prompt_tokens);
+        generated_tokens = json_value(u, "completion_tokens", generated_tokens);
+        if (u.contains("prompt_tokens_details") && u.at("prompt_tokens_details").is_object()) {
+            cached_tokens = json_value(u.at("prompt_tokens_details"), "cached_tokens", cached_tokens);
+        }
+    }
+    if (body.contains("timings") && body.at("timings").is_object()) {
+        const json & t = body.at("timings");
+        if (t.contains("prompt_n")) {
+            // prompt_n is newly processed tokens; prefer usage.prompt_tokens when set
+            if (prompt_tokens <= 0) {
+                prompt_tokens = json_value(t, "prompt_n", prompt_tokens) + json_value(t, "cache_n", 0);
+            }
+        }
+        if (t.contains("cache_n")) {
+            cached_tokens = json_value(t, "cache_n", cached_tokens);
+        }
+        if (t.contains("predicted_n")) {
+            generated_tokens = json_value(t, "predicted_n", generated_tokens);
+        }
+        prefill_tps = json_value(t, "prompt_per_second", prefill_tps);
+        decode_tps = json_value(t, "predicted_per_second", decode_tps);
+    }
+    if (body.contains("tokens_predicted")) {
+        generated_tokens = json_value(body, "tokens_predicted", generated_tokens);
+    }
+    if (body.contains("tokens_evaluated")) {
+        prompt_tokens = json_value(body, "tokens_evaluated", prompt_tokens);
+    }
+    if (body.contains("tokens_cached")) {
+        cached_tokens = json_value(body, "tokens_cached", cached_tokens);
+    }
+    if (body.contains("generation_settings") && body.at("generation_settings").is_object()) {
+        limit = json_value(body.at("generation_settings"), "n_predict", limit);
+    }
+}
+
+// Prefer a JSON object with usage/timings; for SSE, scan data: lines.
+json extract_stats_payload(const std::string & body) {
+    if (body.empty()) {
+        return nullptr;
+    }
+    try {
+        json j = json::parse(body);
+        if (j.is_object()) {
+            return j;
+        }
+    } catch (...) {
+    }
+
+    json best = nullptr;
+    size_t pos = 0;
+    while (pos < body.size()) {
+        size_t line_end = body.find('\n', pos);
+        if (line_end == std::string::npos) {
+            line_end = body.size();
+        }
+        std::string line = body.substr(pos, line_end - pos);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        pos = line_end + 1;
+        if (line.rfind("data:", 0) != 0) {
+            continue;
+        }
+        std::string payload = line.substr(5);
+        while (!payload.empty() && (payload.front() == ' ' || payload.front() == '\t')) {
+            payload.erase(payload.begin());
+        }
+        if (payload.empty() || payload == "[DONE]") {
+            continue;
+        }
+        try {
+            json j = json::parse(payload);
+            if (!j.is_object()) {
+                continue;
+            }
+            if (j.contains("usage") || j.contains("timings") || j.contains("tokens_predicted")) {
+                best = std::move(j);
+            } else if (best.is_null()) {
+                best = std::move(j);
+            }
+        } catch (...) {
+        }
+    }
+    return best;
+}
+
+bool request_has_media(const server_http_req & req) {
+    try {
+        const json body = json::parse(req.body.empty() ? "{}" : req.body);
+        if (!body.contains("messages") || !body.at("messages").is_array()) {
+            return false;
+        }
+        for (const auto & m : body.at("messages")) {
+            if (m.contains("content") && m.at("content").is_array()) {
+                return true;
+            }
+        }
+    } catch (...) {
+    }
+    return false;
+}
+
 struct wrapping_res : server_http_res {
     server_http_res_ptr inner;
-    std::function<void()> on_done;
+    std::function<void(const std::string & body)> on_done;
+    std::string collected;
     bool finished = false;
 
-    wrapping_res(server_http_res_ptr i, std::function<void()> done)
+    wrapping_res(server_http_res_ptr i, std::function<void(const std::string &)> done)
         : inner(std::move(i)), on_done(std::move(done)) {
         content_type = inner->content_type;
         status = inner->status;
@@ -217,12 +470,21 @@ struct wrapping_res : server_http_res {
         if (inner->is_stream()) {
             next = [this](std::string & out) {
                 const bool more = inner->next(out);
+                if (!out.empty()) {
+                    collected.append(out);
+                    // keep a tail large enough for final usage/timings chunks
+                    constexpr size_t k_max = 256 * 1024;
+                    if (collected.size() > k_max) {
+                        collected.erase(0, collected.size() - k_max);
+                    }
+                }
                 if (!more) {
                     finish();
                 }
                 return more;
             };
         } else {
+            collected = data;
             finish();
         }
     }
@@ -233,7 +495,7 @@ struct wrapping_res : server_http_res {
         }
         finished = true;
         if (on_done) {
-            on_done();
+            on_done(collected);
         }
     }
 
@@ -294,6 +556,7 @@ struct server_compat::impl {
     json assist_log = json::array();
 
     server_http_context::handler_t prometheus_metrics;
+    server_http_context::handler_t prometheus_safe;
 
     explicit impl(const common_params & p) : params(p) {
         instance_id = "llama-" + random_token().substr(0, 12);
@@ -466,38 +729,28 @@ struct server_compat::impl {
     }
 
     json build_snapshot() {
-        std::lock_guard<std::mutex> lock(mutex);
         json active_j = json::array();
         json recent_j = json::array();
-        for (const auto & r : active) {
-            active_j.push_back(row_to_json(r));
+        std::string gpu_uuid;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            gpu_uuid = instance_id;
+            for (const auto & r : active) {
+                active_j.push_back(row_to_json(r));
+            }
+            for (const auto & r : recent) {
+                recent_j.push_back(row_to_json(r));
+            }
         }
-        for (const auto & r : recent) {
-            recent_j.push_back(row_to_json(r));
-        }
-
-        json gpus = json::array();
-        gpus.push_back({
-                {"name", "Metal"},
-                {"uuid", instance_id},
-                {"util", nullptr},
-                {"vram_used_bytes", nullptr},
-                {"vram_total_bytes", nullptr},
-                {"temp_c", nullptr},
-                {"power_w", nullptr},
-        });
-
+        const hw_sample hw = sample_hardware();
         return {
                 {"schema_version", 1},
                 {"backend", "llamacpp"},
-                {"server_instance", instance_id},
-                {"sampled_at_ms", now_ms()},
+                {"server_instance", gpu_uuid},
+                {"sampled_at_ms", hw.sampled_at_ms},
                 {"active", active_j},
                 {"recent", recent_j},
-                {"hardware", {
-                        {"sampled_at_ms", now_ms()},
-                        {"gpus", gpus},
-                }},
+                {"hardware", hw_to_kvmem(hw, gpu_uuid)},
                 {"kvmem", {
                         {"host_payload_bytes", nullptr},
                         {"ssd_payload_bytes", nullptr},
@@ -506,50 +759,68 @@ struct server_compat::impl {
     }
 
     json build_metrics(bool all_requests) {
-        std::lock_guard<std::mutex> lock(mutex);
-        json live = {
-                {"state", active.empty() ? (engine_stopped ? "unloaded" : "idle") : "generating"},
-                {"queued", 0},
-                {"phase", active.empty() ? json(nullptr) : json("answering")},
-                {"prompt_tokens", json(nullptr)},
-                {"prompt_read", json(nullptr)},
-                {"prompt_total", json(nullptr)},
-                {"generated", active.empty() ? json(nullptr) : json(active.front().generated_tokens)},
-                {"max_tokens", json(nullptr)},
-                {"elapsed_s", json(nullptr)},
-                {"tok_s", active.empty() ? json(nullptr) : json(active.front().decode_tps)},
-                {"tok_s_mean", json(nullptr)},
-                {"prefill_tok_s_mean", json(nullptr)},
-                {"tok_s_window_s", json(nullptr)},
-        };
-
+        json live;
         json requests = json::array();
-        size_t n = 0;
-        const size_t limit = all_requests ? recent.size() : std::min(recent.size(), size_t(12));
-        for (const auto & r : recent) {
-            if (n >= limit) {
-                break;
+        size_t recent_n = 0;
+        int total_prompt = 0;
+        int total_output = 0;
+        int total_reused = 0;
+        std::string model;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            model = params.model_alias.empty() ? params.model.path : *params.model_alias.begin();
+            live = {
+                    {"state", active.empty() ? (engine_stopped ? "unloaded" : "idle") : "generating"},
+                    {"queued", 0},
+                    {"phase", active.empty() ? json(nullptr) : json("answering")},
+                    {"prompt_tokens", active.empty() ? json(nullptr) : json(active.front().prompt_tokens)},
+                    {"prompt_read", json(nullptr)},
+                    {"prompt_total", json(nullptr)},
+                    {"generated", active.empty() ? json(nullptr) : json(active.front().generated_tokens)},
+                    {"max_tokens", active.empty() || active.front().limit <= 0 ? json(nullptr) : json(active.front().limit)},
+                    {"elapsed_s", active.empty() ? json(nullptr)
+                                                  : json((now_ms() - active.front().started_at_ms) / 1000.0)},
+                    {"tok_s", active.empty() || active.front().decode_tps <= 0 ? json(nullptr)
+                                                                              : json(active.front().decode_tps)},
+                    {"tok_s_mean", json(nullptr)},
+                    {"prefill_tok_s_mean",
+                     active.empty() || active.front().prefill_tps <= 0 ? json(nullptr)
+                                                                      : json(active.front().prefill_tps)},
+                    {"tok_s_window_s", json(nullptr)},
+            };
+
+            const size_t limit = all_requests ? recent.size() : std::min(recent.size(), size_t(12));
+            size_t n = 0;
+            for (const auto & r : recent) {
+                total_prompt += r.prompt_tokens;
+                total_output += r.generated_tokens;
+                total_reused += r.cached_tokens;
+                if (n < limit) {
+                    requests.push_back({
+                            {"id", r.id},
+                            {"status", r.status},
+                            {"prompt_tokens", r.prompt_tokens},
+                            {"reused", r.cached_tokens},
+                            {"output_tokens", r.generated_tokens},
+                            {"decode_tok_s", r.decode_tps > 0 ? json(r.decode_tps) : json(nullptr)},
+                            {"prompt_ms", nullptr},
+                            {"decode_ms", r.decode_tps > 0 && r.generated_tokens > 0
+                                                   ? json(1000.0 * r.generated_tokens / r.decode_tps)
+                                                   : json(nullptr)},
+                            {"duration_s", r.elapsed_ms / 1000.0},
+                    });
+                    ++n;
+                }
             }
-            requests.push_back({
-                    {"id", r.id},
-                    {"status", r.status},
-                    {"prompt_tokens", r.prompt_tokens},
-                    {"reused", r.cached_tokens},
-                    {"output_tokens", r.generated_tokens},
-                    {"decode_tok_s", r.decode_tps},
-                    {"prompt_ms", nullptr},
-                    {"decode_ms", r.decode_tps > 0 && r.generated_tokens > 0
-                                         ? json(1000.0 * r.generated_tokens / r.decode_tps)
-                                         : json(nullptr)},
-                    {"duration_s", r.elapsed_ms / 1000.0},
-            });
-            ++n;
+            recent_n = recent.size();
         }
 
-        const auto hw = host_hardware_sample();
+        const hw_sample hw = sample_hardware();
+        json hardware = hw_to_strata(hw);
+        hardware["tok_s"] = live["tok_s"];
         return {
                 {"engine", {
-                        {"model", params.model_alias.empty() ? params.model.path : *params.model_alias.begin()},
+                        {"model", model},
                         {"max_context", params.n_ctx},
                         {"images", false},
                         {"version", "llama.cpp"},
@@ -562,24 +833,16 @@ struct server_compat::impl {
                         {"prompt_tokens", 0},
                         {"reused_tokens", 0},
                 }},
-                {"requests_kept", recent.size()},
+                {"requests_kept", recent_n},
                 {"totals", {
-                        {"requests", recent.size()},
-                        {"prompt_tokens", 0},
-                        {"output_tokens", 0},
-                        {"reused", 0},
+                        {"requests", recent_n},
+                        {"prompt_tokens", total_prompt},
+                        {"output_tokens", total_output},
+                        {"reused", total_reused},
                         {"prompt_ms", 0},
                         {"decode_ms", 0},
                 }},
-                {"hardware", {
-                        {"gpu_util", nullptr},
-                        {"gpu_mem_used", nullptr},
-                        {"gpu_temp", nullptr},
-                        {"gpu_power", nullptr},
-                        {"gpu_pcie_rx_mb", nullptr},
-                        {"tok_s", live["tok_s"]},
-                        {"cpu", hw.contains("cpu_percent") ? hw.at("cpu_percent") : json(nullptr)},
-                }},
+                {"hardware", hardware},
                 {"hardware_static", json::object()},
                 {"history", json::object()},
                 {"time", now_ms() / 1000.0},
@@ -588,29 +851,37 @@ struct server_compat::impl {
         };
     }
 
-    void begin_request(const std::string & id, const std::string & instance, bool has_media) {
+    std::string begin_request(const std::string & id, const std::string & instance, bool has_media,
+                              const std::string & endpoint) {
         std::lock_guard<std::mutex> lock(mutex);
         req_row r;
         r.id = id.empty() ? random_token().substr(0, 16) : id;
         r.instance = instance.empty() ? instance_id : instance;
+        r.endpoint = endpoint.empty() ? "/v1/chat/completions" : endpoint;
         r.started_at_ms = now_ms();
         r.status = "generating";
         r.phase = "answering";
         r.has_media = has_media;
+        const std::string out_id = r.id;
         active.push_back(std::move(r));
         while (active.size() > k_active_max) {
             active.pop_front();
         }
+        return out_id;
     }
 
-    void finish_request(const std::string & id, const std::string & status) {
+    void finish_request(const std::string & id, const std::string & status, const json & stats_body = nullptr) {
         std::lock_guard<std::mutex> lock(mutex);
         for (auto it = active.begin(); it != active.end(); ++it) {
             if (it->id == id) {
+                if (!stats_body.is_null()) {
+                    apply_stats_from_json(it->prompt_tokens, it->cached_tokens, it->generated_tokens,
+                                          it->decode_tps, it->prefill_tps, it->limit, stats_body);
+                }
                 it->status = status;
                 it->finished_at_ms = now_ms();
                 it->elapsed_ms = it->finished_at_ms - it->started_at_ms;
-                if (it->elapsed_ms > 0 && it->generated_tokens > 0) {
+                if (it->decode_tps <= 0 && it->elapsed_ms > 0 && it->generated_tokens > 0) {
                     it->decode_tps = 1000.0 * it->generated_tokens / double(it->elapsed_ms);
                 }
                 recent.push_front(*it);
@@ -752,10 +1023,38 @@ void server_compat::wrap_routes(server_routes & routes) {
         };
     }
 
-    routes.get_metrics = [&c](const server_http_req & req) {
+    auto prometheus_or_empty = [&c](const server_http_req & req) -> server_http_res_ptr {
+        if (!c.prometheus_metrics) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->content_type = "text/plain; version=0.0.4";
+            res->data = "# HELP llamacpp:requests_processing Number of requests processing\n"
+                        "# TYPE llamacpp:requests_processing gauge\n"
+                        "llamacpp:requests_processing 0\n";
+            return res;
+        }
+        auto res = c.prometheus_metrics(req);
+        // router with no model returns 400; scrapers still need valid prometheus text
+        if (!res || res->status < 200 || res->status >= 400) {
+            auto empty = std::make_unique<server_http_res>();
+            empty->status = 200;
+            empty->content_type = "text/plain; version=0.0.4";
+            empty->data = "# HELP llamacpp:requests_processing Number of requests processing\n"
+                          "# TYPE llamacpp:requests_processing gauge\n"
+                          "llamacpp:requests_processing 0\n";
+            return empty;
+        }
+        return res;
+    };
+
+    routes.get_metrics = [&c, prometheus_or_empty](const server_http_req & req) {
+        if (wants_prometheus_metrics(req)) {
+            return prometheus_or_empty(req);
+        }
         const bool all = req.query_string.find("requests=all") != std::string::npos;
         return json_res(200, c.build_metrics(all));
     };
+    c.prometheus_safe = prometheus_or_empty;
 
     {
         auto orig = routes.get_slots;
@@ -766,6 +1065,30 @@ void server_compat::wrap_routes(server_routes & routes) {
             return orig(req);
         };
     }
+}
+
+server_http_context::handler_t server_compat::wrap_chat_completions(server_http_context::handler_t inner) {
+    auto & c = *pimpl;
+    return [&c, inner = std::move(inner)](const server_http_req & req) -> server_http_res_ptr {
+        std::string id = header_get(req, "X-KVMem-Request");
+        if (id.empty()) {
+            id = random_token().substr(0, 16);
+        }
+        const std::string instance = header_get(req, "X-KVMem-Instance");
+        const std::string endpoint = req.path.empty() ? "/v1/chat/completions" : req.path;
+        const bool has_media = request_has_media(req);
+        id = c.begin_request(id, instance, has_media, endpoint);
+        auto res = inner(req);
+        if (!res) {
+            c.finish_request(id, "error");
+            return json_res(500, {{"error", {{"message", "empty chat handler response"}}}});
+        }
+        const int status = res->status;
+        const std::string finish_status = (status >= 200 && status < 400) ? "completed" : "error";
+        return server_http_res_ptr(std::make_unique<wrapping_res>(std::move(res), [&c, id, finish_status](const std::string & body) {
+            c.finish_request(id, finish_status, extract_stats_payload(body));
+        }));
+    };
 }
 
 void server_compat::register_routes(
@@ -780,10 +1103,10 @@ void server_compat::register_routes(
         return wrap(std::move(h));
     };
 
-    // prometheus moved off /metrics
-    if (c.prometheus_metrics) {
-        ctx_http.get("/metrics.prom", W(c.prometheus_metrics));
-        ctx_http.get("/metrics/prometheus", W(c.prometheus_metrics));
+    // prometheus moved off /metrics (safe wrapper tolerates router-without-model)
+    if (c.prometheus_safe) {
+        ctx_http.get("/metrics.prom", W(c.prometheus_safe));
+        ctx_http.get("/metrics/prometheus", W(c.prometheus_safe));
     }
 
     ctx_http.get("/api/monitor/snapshot", W([&c](const server_http_req &) {
@@ -818,7 +1141,7 @@ void server_compat::register_routes(
     }));
 
     ctx_http.get("/api/launcher/hardware", W([](const server_http_req &) {
-        return json_res(200, host_hardware_sample());
+        return json_res(200, hw_to_launcher(sample_hardware()));
     }));
 
     ctx_http.get("/api/launcher/logs", W([&c](const server_http_req & req) {
@@ -877,6 +1200,7 @@ void server_compat::register_routes(
         return json_res(200, {{"ok", true}});
     }));
 
+    // chat_completions is already wrap_chat_completions()'d by the caller
     ctx_http.post("/api/chat/completions", W([&c, chat_completions](const server_http_req & req) -> server_http_res_ptr {
         if (!c.token_ok(req)) {
             return json_res(401, {{"error", {{"message", "unauthorized"}}}});
@@ -884,29 +1208,7 @@ void server_compat::register_routes(
         if (c.engine_stopped) {
             return json_res(409, {{"error", {{"message", "engine stopped"}}}});
         }
-        std::string id = header_get(req, "X-KVMem-Request");
-        if (id.empty()) {
-            id = random_token().substr(0, 16);
-        }
-        const std::string instance = header_get(req, "X-KVMem-Instance");
-        bool has_media = false;
-        try {
-            const json body = json::parse(req.body.empty() ? "{}" : req.body);
-            if (body.contains("messages")) {
-                for (const auto & m : body.at("messages")) {
-                    if (m.contains("content") && m.at("content").is_array()) {
-                        has_media = true;
-                        break;
-                    }
-                }
-            }
-        } catch (...) {
-        }
-        c.begin_request(id, instance, has_media);
-        auto inner = chat_completions(req);
-        return server_http_res_ptr(std::make_unique<wrapping_res>(std::move(inner), [&c, id]() {
-            c.finish_request(id, "completed");
-        }));
+        return chat_completions(req);
     }));
 
     // HyperCore surface

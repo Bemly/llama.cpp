@@ -518,6 +518,8 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
     // also without an agent, so that X-Tosh-Agent: on is refused instead of silently answered raw
     auto chat_completions = tosh_agent_handler(routes.post_chat_completions, mcp_mgr, params, agent_key);
+    // kvmem/Strata monitors: record every chat completion (ToshLLM + stock webui use /v1)
+    chat_completions = compat.wrap_chat_completions(std::move(chat_completions));
     ctx_http.post("/chat/completions",         ex_wrapper(chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(chat_completions));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
