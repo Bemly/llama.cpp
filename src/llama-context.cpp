@@ -150,12 +150,6 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-static const llm_fused_op_probe llm_fused_op_lid_probe = {
-    /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
-    /*.name             =*/ "Lightning Indexer",
-    /*.n_tokens_per_seq =*/ 1,
-};
-
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
@@ -209,6 +203,14 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+
+    // delta-net rollback keeps one state and the inputs of the last ubatch; the gdn op replays the kept tokens before the new ones
+    cparams.rs_replay = cparams.n_rs_seq > 0 && (
+            model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP ||
+            model.arch == LLM_ARCH_CLOVER_MOE ||
+            // KDA
+            model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
+            model.arch == LLM_ARCH_BAILINGMOE3);
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -355,9 +357,6 @@ llama_context::llama_context(
         cparams.auto_fa    = false;
     }
 
-    cparams.fused_lid = true;
-    cparams.auto_flid = false;
-
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
@@ -426,6 +425,15 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * LLAMA_MOE_RANDOM_ROUTING = getenv("LLAMA_MOE_RANDOM_ROUTING");
+        cparams.moe_random_routing = LLAMA_MOE_RANDOM_ROUTING ? (atoi(LLAMA_MOE_RANDOM_ROUTING) != 0) : false;
+
+        if (cparams.moe_random_routing && hparams.n_expert > 0) {
+            LLAMA_LOG_WARN("%s: MoE random routing enabled - the output is not valid, use for benchmarks only\n", __func__);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -456,6 +464,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+    LLAMA_LOG_INFO("%s: rs_replay             = %s\n",   __func__, cparams.rs_replay ? "true" : "false");
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
 
@@ -756,12 +765,6 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_kv_rows = cparams.flash_attn;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
-    }
-
-    if (cparams.auto_flid) {
-        LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
-        resolve(llm_fused_op_lid_probe, cparams.fused_lid);
-        cparams.auto_flid = false;
     }
 
     if (cparams.auto_fhc) {
@@ -2104,7 +2107,11 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     const llama_ubatch ubatch = balloc->split_simple(n_tokens);
 
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
-    GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
+    if (n_tokens > cparams.n_ubatch) {
+        LLAMA_LOG_ERROR("%s: the encoder reads the batch in one pass, n_tokens = %u > n_ubatch = %u, increase n_ubatch (-ub)\n",
+                __func__, n_tokens, cparams.n_ubatch);
+        return -1;
+    }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
@@ -3077,39 +3084,29 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes() const {
-    uint32_t res;
+    uint32_t res = std::max<uint32_t>(1024u, model.graph_nodes_per_tensor()*model.n_tensors());
     if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
         model.arch == LLM_ARCH_HRM_TEXT) {
-        res = std::max<uint32_t>(1024u, 64u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
-        model.arch == LLM_ARCH_KIMI_LINEAR ||
-        model.arch == LLM_ARCH_METIS16 ||
-        model.arch == LLM_ARCH_BAILINGMOE3 ||
-        model.arch == LLM_ARCH_QWEN35 ||
-        model.arch == LLM_ARCH_QWEN35MOE ||
-        model.arch == LLM_ARCH_CLEF ||
-        model.arch == LLM_ARCH_CLOVER_MOE ||
-        model.arch == LLM_ARCH_QWEN4EXP ||
-        model.arch == LLM_ARCH_DEEPSEEK4 ||
-        model.arch == LLM_ARCH_DEEPSEEK41 ||
-        model.arch == LLM_ARCH_XING4_0 ||
+        res = std::max<uint32_t>(res, std::max<uint32_t>(1024u, 64u * model.n_tensors()));
+    } else if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR ||
+        model.arch == LLM_ARCH_METIS16 || model.arch == LLM_ARCH_BAILINGMOE3 ||
+        model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_CLEF || model.arch == LLM_ARCH_CLOVER_MOE ||
+        model.arch == LLM_ARCH_QWEN4EXP || model.arch == LLM_ARCH_DEEPSEEK4 ||
+        model.arch == LLM_ARCH_DEEPSEEK41 || model.arch == LLM_ARCH_XING4_0 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
-        model.arch == LLM_ARCH_NANBEIGE ||
-        model.arch == LLM_ARCH_MINIMAX_01 ||
-        model.arch == LLM_ARCH_MINIMAX_M3 ||
-        model.arch == LLM_ARCH_HY_V4) {
-        res = std::max<uint32_t>(1024u, 32u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
-        // DFlash2's convolutions and selector are shape work rather than matmuls,
-        // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
-        res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
-    } else {
-        // the backward pass and the optimizer step add several nodes per tensor of the forward graph
-        res = cparams.training ? std::max<uint32_t>(2048u, 32u*model.n_tensors())
-                               : std::max<uint32_t>(1024u, 8u*model.n_tensors());
-        for (const auto & lora : model.loras) {
-            res += lora->get_n_nodes();
-        }
+        model.arch == LLM_ARCH_NANBEIGE || model.arch == LLM_ARCH_MINIMAX_01 ||
+        model.arch == LLM_ARCH_MINIMAX_M3 || model.arch == LLM_ARCH_HY_V4) {
+        res = std::max<uint32_t>(res, std::max<uint32_t>(1024u, 32u * model.n_tensors()));
+    }
+    for (const auto & lora : model.loras) {
+        res += lora->get_n_nodes();
+    }
+
+    // the MoE cache adds a lookup to each MoE layer, and a second expert path with a CPU share (up to ~16 tensors per layer),
+    // which the per-tensor estimates above do not cover for models with few tensors per layer
+    if (cparams.moe_cache_size > 0) {
+        res += 32u*model.hparams.n_layer_all;
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
@@ -3259,7 +3256,6 @@ llm_graph_params llama_context::graph_params(
                           llm_graph_type   gtype) const {
     return {
         /*.model       =*/ &model,
-        /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
@@ -3270,8 +3266,6 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
-        /*.prec_policy =*/ &model.prec_policy,
-        /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.layer_inp_dev =*/ layer_inp_dev,
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
@@ -3349,6 +3343,12 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
     const ggml_tensor * node = ggml_graph_node(graph, 0);
     if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        return false;
+    }
+
+    // Later loop passes can select different experts from the same device copy.
+    // TODO: copy only the experts needed by each pass (see #32807 and #32809).
+    if (lctx->model.arch == LLM_ARCH_INKLING2_LOOP) {
         return false;
     }
 
@@ -4564,7 +4564,7 @@ void llama_context::opt_epoch_iter(
         const std::vector<llama_token> & tokens,
         const std::vector<llama_token> & labels_sparse,
         const std::vector<int32_t>     & masks_sparse,
-        llama_batch                    & batch,
+        llama_batch_ext                & batch,
         ggml_opt_epoch_callback          callback,
         bool                             train,
         int64_t                          idata_in_loop,
@@ -4582,12 +4582,8 @@ void llama_context::opt_epoch_iter(
         if (training_should_stop.load(std::memory_order_acquire)) {
             return;
         }
-        // with the masked loss only the positions it counts need logits: the vocabulary head and the loss then run
-        // on those rows alone. Every ubatch keeps at least one output so its graph has a loss
         const bool only_masked = opt_loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_MASKED &&
                                  masks_sparse.size() >= pos_ctx + n_batch && getenv("LLAMA_TRAIN_ALL_LOGITS") == nullptr;
-        // a datapoint is padded to the context, and causal attention leaves the positions after the last trained
-        // one without effect on the loss: a single-batch context stops there, rounded up to 64
         uint32_t n_tok = n_batch;
         if (only_masked && n_batch == n_ctx && n_ubatch == n_batch && getenv("LLAMA_TRAIN_FULL_CONTEXT") == nullptr) {
             uint32_t last = 0;
@@ -4598,33 +4594,33 @@ void llama_context::opt_epoch_iter(
             }
             n_tok = std::min(n_batch, std::max<uint32_t>(64, GGML_PAD(last, 64)));
         }
-        batch.n_tokens = n_tok;
+
+        batch.clear();
         for (uint32_t pos_batch = 0; pos_batch < n_tok; ++pos_batch) {
-            batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];
-            batch.pos     [pos_batch]    = pos_ctx + pos_batch;
-            batch.n_seq_id[pos_batch]    = 1;
-            batch.seq_id  [pos_batch][0] = 0;
-            batch.logits  [pos_batch]    = !only_masked || masks_sparse[pos_ctx + pos_batch] == 1;
+            const int32_t   idx = batch.add_token(0);
+            const llama_pos pos = pos_ctx + pos_batch;
+            if (idx < 0 || !batch.set_token_id(idx, tokens[pos_ctx + pos_batch])) {
+                LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+                return;
+            }
+            batch.set_token_pos(idx, &pos);
+            batch.set_output(idx, !only_masked || masks_sparse[pos_ctx + pos_batch] == 1);
         }
         if (only_masked) {
             for (uint32_t u0 = 0; u0 < n_tok; u0 += n_ubatch) {
                 bool any = false;
                 for (uint32_t i = u0; i < std::min(n_tok, u0 + n_ubatch); ++i) {
-                    any = any || batch.logits[i];
+                    any = any || batch.tokens[i].output;
                 }
                 if (!any) {
-                    batch.logits[std::min(n_tok, u0 + n_ubatch) - 1] = true;
+                    batch.set_output(std::min(n_tok, u0 + n_ubatch) - 1, true);
                 }
             }
         }
 
-        // TODO: use llama_batch_ext here
-        {
-            llama_batch_compat compat(this, batch);
-            if (!balloc->init(*compat.batch_ext, model.vocab, !only_masked)) {
-                LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-                return;
-            }
+        if (!balloc->init(batch, model.vocab, !only_masked)) {
+            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+            return;
         }
 
         const uint32_t n_tokens_all = balloc->get_n_tokens();
@@ -4633,10 +4629,7 @@ void llama_context::opt_epoch_iter(
 
         embd_seq.clear();
 
-        uint32_t n_outputs_all = 0;
-        for (uint32_t i = 0; i < n_tok; ++i) {
-            n_outputs_all += batch.logits[i] != 0;
-        }
+        const uint32_t n_outputs_all = balloc->get_n_outputs();
 
         auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
@@ -4778,7 +4771,7 @@ void llama_context::opt_epoch(
 
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
 
-    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    llama_batch_ext batch(this);
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
     std::vector<int32_t>      masks_sparse(n_ctx);
@@ -4835,8 +4828,6 @@ void llama_context::opt_epoch(
             break;
         }
     }
-
-    llama_batch_free(batch);
 }
 
 int64_t llama_context::opt_get_iter() {

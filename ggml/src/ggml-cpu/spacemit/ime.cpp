@@ -995,7 +995,8 @@ class tensor_traits_common : public tensor_traits_base {
                         spacemit_kernels::rvv::forward_rms_norm_f32(params, op);
                         return true;
                     default:
-                        GGML_ABORT("fatal error");
+                        ggml_compute_forward_rms_norm(params, op);
+                        return true;
                 }
             case GGML_OP_ADD:
                 switch (op->src[0]->type) {
@@ -1155,7 +1156,8 @@ class tensor_traits_common : public tensor_traits_base {
                 }
                 return true;
             case GGML_OP_GATED_DELTA_NET:
-                if (params->use_ref) {
+                // the generic kernel does the replay of pending tokens (op param 1)
+                if (params->use_ref || ggml_get_op_params_i32(op, 1) != 0) {
                     return false;
                 }
                 switch (op->src[0]->type) {

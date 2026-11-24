@@ -509,6 +509,45 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
     reg[3] = d * kvalues_mxfp4_f[(q2[4*il4 + 3] >> shr) & 0x0F];
 }
 
+// NVFP4: 64 weights per block split into four 16-weight sub-blocks, each with its own UE4M3 scale.
+// the 16 weights of a sub-block are the low nibbles of its 8 bytes followed by the high nibbles
+template <typename type4x4>
+void dequantize_nvfp4(device const block_nvfp4 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q = (device const uint8_t *)xb->qs + 8*il;
+
+    const float d = ue4m3_to_fp32(xb->d[il]);
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; ++i) {
+        device const uint8_t * qb = q + 4*(i % 2);
+        const uint8_t shr = i < 2 ? 0 : 4;
+
+        reg_f[i][0] = d * kvalues_mxfp4_f[(qb[0] >> shr) & 0x0F];
+        reg_f[i][1] = d * kvalues_mxfp4_f[(qb[1] >> shr) & 0x0F];
+        reg_f[i][2] = d * kvalues_mxfp4_f[(qb[2] >> shr) & 0x0F];
+        reg_f[i][3] = d * kvalues_mxfp4_f[(qb[3] >> shr) & 0x0F];
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4>
+void dequantize_nvfp4_t4(device const block_nvfp4 * xb, short il, thread type4 & reg) {
+    const short s   = il/4; // sub-block
+    const short il4 = il%4; // 4-weight chunk within the sub-block
+
+    device const uint8_t * q = (device const uint8_t *)xb->qs + 8*s + 4*(il4 % 2);
+
+    const float d = ue4m3_to_fp32(xb->d[s]);
+    const uint8_t shr = il4 >= 2 ? 4 : 0;
+
+    reg[0] = d * kvalues_mxfp4_f[(q[0] >> shr) & 0x0F];
+    reg[1] = d * kvalues_mxfp4_f[(q[1] >> shr) & 0x0F];
+    reg[2] = d * kvalues_mxfp4_f[(q[2] >> shr) & 0x0F];
+    reg[3] = d * kvalues_mxfp4_f[(q[3] >> shr) & 0x0F];
+}
+
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -631,10 +670,11 @@ void dequantize_q4_K_impl(device const block_q4_K * xb, short il, bool lo, threa
     const float dl2 = dl / 256.f;
 
     // write straight into reg, the float4x4 staging was redundant
+    using value_t = typename value_type<type4x4>::type;
     for (int i = 0; i < 8; ++i) {
         const ushort qsi = (i & 1) ? (ushort)(qsv[i/2] >> 16) : (ushort)(qsv[i/2] & 0xFFFF);
-        reg[i/2][2*(i%2) + 0] = dl  * (qsi & mask0) - ml;
-        reg[i/2][2*(i%2) + 1] = dl2 * (qsi & mask1) - ml;
+        reg[i/2][2*(i%2) + 0] = (value_t) (dl  * (qsi & mask0) - ml);
+        reg[i/2][2*(i%2) + 1] = (value_t) (dl2 * (qsi & mask1) - ml);
     }
 }
 
@@ -935,10 +975,10 @@ void dequantize_q6_K(device const block_q6_K *xb, short il, thread type4x4 & reg
         const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
         const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
         const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
-        reg[i][0] = dl0 *  ((half)(q & 0xFF))       - ml;
-        reg[i][1] = dl1 * ((float)(q & 0xFF00))     - ml;
-        reg[i][2] = dl2 * ((float)(q & 0xFF0000))   - ml;
-        reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+        reg[i][0] = (typename value_type<type4x4>::type) (dl0 *  ((half)(q & 0xFF))       - ml);
+        reg[i][1] = (typename value_type<type4x4>::type) (dl1 * ((float)(q & 0xFF00))     - ml);
+        reg[i][2] = (typename value_type<type4x4>::type) (dl2 * ((float)(q & 0xFF0000))   - ml);
+        reg[i][3] = (typename value_type<type4x4>::type) (dl3 * ((float)(q & 0xFF000000)) - ml);
     }
 }
 
@@ -958,12 +998,12 @@ void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x
     constant uint8_t * grid = (constant uint8_t *)(iq2xxs_grid + aux8[2*il+0]);
     uint8_t signs = ksigns_iq2xs[(aux32_s >> 14*il) & 127];
     for (int i = 0; i < 8; ++i) {
-        reg[i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
+        reg[i/4][i%4] = (typename value_type<type4x4>::type) (dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f));
     }
     grid = (constant uint8_t *)(iq2xxs_grid + aux8[2*il+1]);
     signs = ksigns_iq2xs[(aux32_s >> (14*il+7)) & 127];
     for (int i = 0; i < 8; ++i) {
-        reg[2+i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
+        reg[2+i/4][i%4] = (typename value_type<type4x4>::type) (dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f));
     }
 }
 
@@ -979,12 +1019,12 @@ void dequantize_iq2_xs(device const block_iq2_xs * xb, short il, thread type4x4 
     constant uint8_t * grid = (constant uint8_t *)(iq2xs_grid + (q2[2*il+0] & 511));
     uint8_t signs = ksigns_iq2xs[q2[2*il+0] >> 9];
     for (int i = 0; i < 8; ++i) {
-        reg[i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
+        reg[i/4][i%4] = (typename value_type<type4x4>::type) (dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f));
     }
     grid = (constant uint8_t *)(iq2xs_grid + (q2[2*il+1] & 511));
     signs = ksigns_iq2xs[q2[2*il+1] >> 9];
     for (int i = 0; i < 8; ++i) {
-        reg[2+i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
+        reg[2+i/4][i%4] = (typename value_type<type4x4>::type) (dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f));
     }
 }
 
@@ -1003,15 +1043,15 @@ void dequantize_iq3_xxs(device const block_iq3_xxs * xb, short il, thread type4x
     constant uint8_t * grid2 = (constant uint8_t *)(iq3xxs_grid + q3[4*il+1]);
     uint8_t signs = ksigns_iq2xs[(aux32 >> 14*il) & 127];
     for (int i = 0; i < 4; ++i) {
-        reg[0][i] = dl * grid1[i] * (signs & kmask_iq2xs[i+0] ? -1.f : 1.f);
-        reg[1][i] = dl * grid2[i] * (signs & kmask_iq2xs[i+4] ? -1.f : 1.f);
+        reg[0][i] = (typename value_type<type4x4>::type) (dl * grid1[i] * (signs & kmask_iq2xs[i+0] ? -1.f : 1.f));
+        reg[1][i] = (typename value_type<type4x4>::type) (dl * grid2[i] * (signs & kmask_iq2xs[i+4] ? -1.f : 1.f));
     }
     grid1 = (constant uint8_t *)(iq3xxs_grid + q3[4*il+2]);
     grid2 = (constant uint8_t *)(iq3xxs_grid + q3[4*il+3]);
     signs = ksigns_iq2xs[(aux32 >> (14*il+7)) & 127];
     for (int i = 0; i < 4; ++i) {
-        reg[2][i] = dl * grid1[i] * (signs & kmask_iq2xs[i+0] ? -1.f : 1.f);
-        reg[3][i] = dl * grid2[i] * (signs & kmask_iq2xs[i+4] ? -1.f : 1.f);
+        reg[2][i] = (typename value_type<type4x4>::type) (dl * grid1[i] * (signs & kmask_iq2xs[i+0] ? -1.f : 1.f));
+        reg[3][i] = (typename value_type<type4x4>::type) (dl * grid2[i] * (signs & kmask_iq2xs[i+4] ? -1.f : 1.f));
     }
 }
 
@@ -1029,14 +1069,14 @@ void dequantize_iq3_s(device const block_iq3_s * xb, short il, thread type4x4 & 
     constant uint8_t * grid1 = (constant uint8_t *)(iq3s_grid + (qs[4*il+0] | ((qh << 8) & 256)));
     constant uint8_t * grid2 = (constant uint8_t *)(iq3s_grid + (qs[4*il+1] | ((qh << 7) & 256)));
     for (int i = 0; i < 4; ++i) {
-        reg[0][i] = dl * grid1[i] * select(1, -1, signs[0] & kmask_iq2xs[i+0]);
-        reg[1][i] = dl * grid2[i] * select(1, -1, signs[0] & kmask_iq2xs[i+4]);
+        reg[0][i] = (typename value_type<type4x4>::type) (dl * grid1[i] * select(1, -1, signs[0] & kmask_iq2xs[i+0]));
+        reg[1][i] = (typename value_type<type4x4>::type) (dl * grid2[i] * select(1, -1, signs[0] & kmask_iq2xs[i+4]));
     }
     grid1 = (constant uint8_t *)(iq3s_grid + (qs[4*il+2] | ((qh << 6) & 256)));
     grid2 = (constant uint8_t *)(iq3s_grid + (qs[4*il+3] | ((qh << 5) & 256)));
     for (int i = 0; i < 4; ++i) {
-        reg[2][i] = dl * grid1[i] * select(1, -1, signs[1] & kmask_iq2xs[i+0]);
-        reg[3][i] = dl * grid2[i] * select(1, -1, signs[1] & kmask_iq2xs[i+4]);
+        reg[2][i] = (typename value_type<type4x4>::type) (dl * grid1[i] * select(1, -1, signs[1] & kmask_iq2xs[i+0]));
+        reg[3][i] = (typename value_type<type4x4>::type) (dl * grid2[i] * select(1, -1, signs[1] & kmask_iq2xs[i+4]));
     }
 }
 
@@ -1054,8 +1094,8 @@ void dequantize_iq2_s(device const block_iq2_s * xb, short il, thread type4x4 & 
     constant uint8_t * grid1 = (constant uint8_t *)(iq2s_grid + (qs[0] | ((qh << 8) & 0x300)));
     constant uint8_t * grid2 = (constant uint8_t *)(iq2s_grid + (qs[1] | ((qh << 6) & 0x300)));
     for (int i = 0; i < 8; ++i) {
-        reg[i/4+0][i%4] = dl * grid1[i] * select(1, -1, signs[0] & kmask_iq2xs[i]);
-        reg[i/4+2][i%4] = dl * grid2[i] * select(1, -1, signs[1] & kmask_iq2xs[i]);
+        reg[i/4+0][i%4] = (typename value_type<type4x4>::type) (dl * grid1[i] * select(1, -1, signs[0] & kmask_iq2xs[i]));
+        reg[i/4+2][i%4] = (typename value_type<type4x4>::type) (dl * grid2[i] * select(1, -1, signs[1] & kmask_iq2xs[i]));
     }
 }
 
@@ -1073,10 +1113,10 @@ void dequantize_iq1_s(device const block_iq1_s * xb, short il, thread type4x4 & 
     constant uint8_t * grid1 = (constant uint8_t *)(iq1s_grid_gpu + (qs[0] | ((h << 8) & 0x700)));
     constant uint8_t * grid2 = (constant uint8_t *)(iq1s_grid_gpu + (qs[1] | ((h << 5) & 0x700)));
     for (int i = 0; i < 4; ++i) {
-        reg[0][i] = dl * (grid1[i] & 0xf) + ml;
-        reg[1][i] = dl * (grid1[i] >>  4) + ml;
-        reg[2][i] = dl * (grid2[i] & 0xf) + ml;
-        reg[3][i] = dl * (grid2[i] >>  4) + ml;
+        reg[0][i] = (typename value_type<type4x4>::type) (dl * (grid1[i] & 0xf) + ml);
+        reg[1][i] = (typename value_type<type4x4>::type) (dl * (grid1[i] >>  4) + ml);
+        reg[2][i] = (typename value_type<type4x4>::type) (dl * (grid2[i] & 0xf) + ml);
+        reg[3][i] = (typename value_type<type4x4>::type) (dl * (grid2[i] >>  4) + ml);
     }
 }
 
@@ -1100,10 +1140,10 @@ void dequantize_iq1_m(device const block_iq1_m * xb, short il, thread type4x4 & 
     constant uint8_t * grid1 = (constant uint8_t *)(iq1s_grid_gpu + (qs[0] | ((qh[0] << 8) & 0x700)));
     constant uint8_t * grid2 = (constant uint8_t *)(iq1s_grid_gpu + (qs[1] | ((qh[0] << 4) & 0x700)));
     for (int i = 0; i < 4; ++i) {
-        reg[0][i] = dl * (grid1[i] & 0xf) + ml1;
-        reg[1][i] = dl * (grid1[i] >>  4) + ml1;
-        reg[2][i] = dl * (grid2[i] & 0xf) + ml2;
-        reg[3][i] = dl * (grid2[i] >>  4) + ml2;
+        reg[0][i] = (typename value_type<type4x4>::type) (dl * (grid1[i] & 0xf) + ml1);
+        reg[1][i] = (typename value_type<type4x4>::type) (dl * (grid1[i] >>  4) + ml1);
+        reg[2][i] = (typename value_type<type4x4>::type) (dl * (grid2[i] & 0xf) + ml2);
+        reg[3][i] = (typename value_type<type4x4>::type) (dl * (grid2[i] >>  4) + ml2);
     }
 }
 
@@ -1115,10 +1155,10 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
     thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
     for (int i = 0; i < 4; ++i) {
         aux32 = ((q4[2*i] | (q4[2*i+1] << 16)) >> 4*il) & 0x0f0f0f0f;
-        reg[i][0] = d * kvalues_iq4nl_f[q8[0]];
-        reg[i][1] = d * kvalues_iq4nl_f[q8[1]];
-        reg[i][2] = d * kvalues_iq4nl_f[q8[2]];
-        reg[i][3] = d * kvalues_iq4nl_f[q8[3]];
+        reg[i][0] = (typename value_type<type4x4>::type) (d * kvalues_iq4nl_f[q8[0]]);
+        reg[i][1] = (typename value_type<type4x4>::type) (d * kvalues_iq4nl_f[q8[1]]);
+        reg[i][2] = (typename value_type<type4x4>::type) (d * kvalues_iq4nl_f[q8[2]]);
+        reg[i][3] = (typename value_type<type4x4>::type) (d * kvalues_iq4nl_f[q8[3]]);
     }
 }
 
@@ -1148,10 +1188,10 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
     thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
     for (int i = 0; i < 4; ++i) {
         aux32 = (q4[i] >> 4*il) & 0x0f0f0f0f;
-        reg[i][0] = d * kvalues_iq4nl_f[q8[0]];
-        reg[i][1] = d * kvalues_iq4nl_f[q8[1]];
-        reg[i][2] = d * kvalues_iq4nl_f[q8[2]];
-        reg[i][3] = d * kvalues_iq4nl_f[q8[3]];
+        reg[i][0] = (typename value_type<type4x4>::type) (d * kvalues_iq4nl_f[q8[0]]);
+        reg[i][1] = (typename value_type<type4x4>::type) (d * kvalues_iq4nl_f[q8[1]]);
+        reg[i][2] = (typename value_type<type4x4>::type) (d * kvalues_iq4nl_f[q8[2]]);
+        reg[i][3] = (typename value_type<type4x4>::type) (d * kvalues_iq4nl_f[q8[3]]);
     }
 }
 

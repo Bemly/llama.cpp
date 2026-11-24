@@ -905,6 +905,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     const int ne30 = op->src[3]->ne[0]; // G
     // state is src[5], 4D [S_v, S_v, H_v, n_seqs] (s0 only); K is op param 0.
     const int K = ggml_get_op_params_i32(op, 0);
+    // replay of pending tokens, see ggml_gated_delta_net_ext
+    const bool replay = op->src[6] != nullptr;
 
     const int nsg = op->src[2]->ne[0]/32;
 
@@ -1261,11 +1263,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
 
-    const bool has_tensor    = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
-    const bool use_mm_manual = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->use_mm_manual;
-    const bool use_mm_double_buffer = use_mm_manual && TOSH_ENV("GGML_METAL_MM_DOUBLE_BUFFER_DISABLE") == nullptr;
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+    const bool has_tensor = props_dev->has_tensor;
 
-    const bool bc_out = has_tensor
+    const bool prec_bf16 = props_dev->has_bfloat && ggml_metal_op_mul_mat_prec_type_supported(tsrc0) &&
+        ggml_prec_get_src(op, 1) == GGML_PREC_BF16 && tsrc1 == GGML_TYPE_F32 &&
+        (has_tensor ? tsrc0 == GGML_TYPE_F32 : true);
+    const bool prec_f32 = ggml_metal_op_mul_mat_prec_type_supported(tsrc0) &&
+        ggml_prec_get_src(op, 1) == GGML_PREC_F32 && tsrc1 == GGML_TYPE_F32 &&
+        (tsrc0 != GGML_TYPE_BF16 || props_dev->has_bfloat);
+    const bool use_tensor = has_tensor && !prec_f32 && ggml_metal_op_mul_mat_prec_type_supported(tsrc0) &&
+        (tsrc0 != GGML_TYPE_BF16 || props_dev->has_bfloat);
+
+    const bool use_mm_manual = props_dev->use_mm_manual && !use_tensor;
+    const bool use_mm_double_buffer = use_mm_manual && !prec_f32 && TOSH_ENV("GGML_METAL_MM_DOUBLE_BUFFER_DISABLE") == nullptr;
+
+    const bool bc_out = use_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
 
@@ -1366,7 +1379,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     }();
     const int wide_ext_floor = wide_ext_floor_env ? wide_ext_floor_env : 2048;
 
-    bool wide = use_mm_manual && !has_tensor && !narrow && tsrc1 == GGML_TYPE_F32 && wide_width_ok &&
+    bool wide = use_mm_manual && !has_tensor && !prec_f32 && !prec_bf16 && !narrow && tsrc1 == GGML_TYPE_F32 && wide_width_ok &&
                 op->ne[1] >= wide_floor && (op->ne[0] >= ne0_floor || TOSH_ENV("TOSH_MM_NE0_FLOOR_DISABLE") != nullptr) &&
                 TOSH_ENV("TOSH_MM_WIDE_DISABLE") == nullptr;
     if (wide) {
@@ -1427,49 +1440,67 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int w64_floor = w64_floor_env ? w64_floor_env :
                           (tsrc0 == GGML_TYPE_IQ4_NL ? 384 : 0);
 
-    const bool w64 = simd_width == 64 && use_mm_manual && !has_tensor &&
+    const bool w64 = simd_width == 64 && use_mm_manual && !has_tensor && !prec_f32 && !prec_bf16 &&
                      op->ne[1] >= w64_floor &&
                      TOSH_ENV("TOSH_MM_W64_DISABLE") == nullptr;
 
     // a gradient can pass the half range: its f32 operand goes through the bfloat tile instead
-    const bool grad_bf16 = acc_f32 && !w64 && ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT &&
+    const bool grad_bf16 = acc_f32 && !w64 && !prec_f32 && !prec_bf16 && ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT &&
                            ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat &&
                            tsrc1 == GGML_TYPE_F32 && (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16) &&
                            !(wide && tsrc0 == GGML_TYPE_F32) &&
                            TOSH_ENV("TOSH_MM_GRAD_BF16_DISABLE") == nullptr;
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1),
-             grad_bf16 ? "_gb" : "", wide ? "_w" : "", w64 ? "_w64" : "");
+    if (!use_tensor && prec_bf16 && tsrc0 == GGML_TYPE_BF16) {
+        snprintf(base, 256, "kernel_mul_mm_bf16_f32");
+    } else if (!use_tensor && prec_bf16 && (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16)) {
+        snprintf(base, 256, "kernel_mul_mm_%s_f32_gb", ggml_type_name(tsrc0));
+    } else if (use_tensor || prec_f32 || prec_bf16) {
+        snprintf(base, 256, "kernel_mul_mm%s_%s_%s%s", use_tensor ? "_tensor" : "",
+                 ggml_type_name(tsrc0), ggml_type_name(tsrc1),
+                 prec_f32 ? "_prec_f32" : (prec_bf16 ? "_prec_bf16" : ""));
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1),
+                 grad_bf16 ? "_gb" : "", wide ? "_w" : "", w64 ? "_w64" : "");
+    }
     // measured on 32 lanes only; the 64-lane tile lives in its own kernel
     const bool uniform_scale = (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K) && wide && !w64 &&
                                use_mm_manual && !has_tensor && simd_width == 32 &&
                                TOSH_ENV("TOSH_MM_UNIFORM_SCALE_DISABLE") == nullptr;
 
-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_mm=%d_db=%d_af=%d_us=%d",
-             base, bc_inp, bc_out, ne12, ne13, r2, r3, use_mm_manual + 2*narrow, use_mm_double_buffer, acc_f32, uniform_scale);
+    if (use_tensor) {
+        snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
+                 base, bc_inp, bc_out, ne12, ne13, r2, r3);
+    } else {
+        snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_mm=%d_db=%d_af=%d_us=%d",
+                 base, bc_inp, bc_out, ne12, ne13, r2, r3, use_mm_manual + 2*narrow, use_mm_double_buffer, acc_f32, uniform_scale);
+    }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
-        ggml_metal_cv_set_bool(cv, narrow, FC_MUL_MM + 9);
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
         ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
         ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
-        ggml_metal_cv_set_bool(cv, use_mm_manual,        FC_MUL_MM + 8);
-        ggml_metal_cv_set_bool(cv, use_mm_double_buffer, FC_MUL_MM + 10);
-        ggml_metal_cv_set_bool(cv, acc_f32,              FC_MUL_MM + 11);
-        ggml_metal_cv_set_bool(cv, uniform_scale,        FC_MUL_MM + 12);
+
+        if (!use_tensor) {
+            ggml_metal_cv_set_bool(cv, narrow,               FC_MUL_MM + 9);
+            ggml_metal_cv_set_bool(cv, use_mm_manual,        FC_MUL_MM + 8);
+            ggml_metal_cv_set_bool(cv, use_mm_double_buffer, FC_MUL_MM + 10);
+            ggml_metal_cv_set_bool(cv, acc_f32,              FC_MUL_MM + 11);
+            ggml_metal_cv_set_bool(cv, uniform_scale,        FC_MUL_MM + 12);
+        }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
 
-    if (has_tensor) {
+    if (use_tensor) {
         res.nr0 = NRA;
         res.nr1 = NRB;
 
@@ -1479,7 +1510,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.nr0 = 64;
         res.nr1 = use_mm_manual ? (narrow ? 32 : 64) : 32;
 
-        res.smem = use_mm_double_buffer ? 16384 : ((bc_out || use_mm_manual) ? 8192 : (4096 + 2048));
+        const size_t tile_size = prec_f32 ? 16384 : 8192;
+        res.smem = use_mm_double_buffer ? 2*tile_size : ((bc_out || use_mm_manual) ? tile_size : (prec_f32 ? 12288 : 6144));
     }
 
     res.nsg = (!has_tensor && use_mm_manual) ? ((wide || narrow) ? 4 : 8) : N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
@@ -2017,6 +2049,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
                     w64 = true;
                 }
+            } break;
+        case GGML_TYPE_NVFP4:
+            {
+                nsg = N_SG_NVFP4;
+                nr0 = N_R0_NVFP4;
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -2600,9 +2637,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+
+    const bool prec_bf16 = props_dev->has_bfloat && ggml_metal_op_mul_mat_prec_type_supported(tsrc0) &&
+        ggml_prec_get_src(op, 1) == GGML_PREC_BF16 && tsrc1 == GGML_TYPE_F32 &&
+        tsrc0 != GGML_TYPE_MXFP4 && tsrc0 != GGML_TYPE_NVFP4 &&
+        (props_dev->has_tensor || tsrc0 != GGML_TYPE_BF16);
+
+    const bool prec_f32 = ggml_metal_op_mul_mat_prec_type_supported(tsrc0) &&
+        ggml_prec_get_src(op, 1) == GGML_PREC_F32 && tsrc1 == GGML_TYPE_F32 &&
+        (tsrc0 != GGML_TYPE_BF16 || props_dev->has_bfloat);
+    const bool use_tensor = props_dev->has_tensor && !prec_f32 && ggml_metal_op_mul_mat_prec_type_supported(tsrc0) &&
+        ((tsrc0 != GGML_TYPE_BF16 && tsrc0 != GGML_TYPE_MXFP4 && tsrc0 != GGML_TYPE_NVFP4) || props_dev->has_bfloat);
+
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
-    const bool use_mm_manual = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->use_mm_manual;
+    const bool use_mm_manual = props_dev->use_mm_manual && !use_tensor;
 
     // src1 prec: upstream rejects GGML_PREC_F32 in supports_op (ggml_metal_supports_mul_mat_src1_prec),
     // so the amax variant toshllm carried is never selected here; the constant itself is gone from
@@ -2617,33 +2667,48 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
 
     // the 64-lane twin lives in mul_mm_w64.metal, beside the dense one
     const int simd_width_id = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
-    const bool w64 = simd_width_id == 64 && use_mm_manual &&
+    const bool w64 = simd_width_id == 64 && use_mm_manual && !prec_f32 && !prec_bf16 &&
                      TOSH_ENV("TOSH_MMID_W64_DISABLE") == nullptr;
 
     // the narrow mxfp4 kernel is bfloat when the device has the type, and the manual path keeps
     // its packed sums in that type; the wide and 64-lane variants are already half, and so is the
     // narrow one without bfloat
-    const bool half_id = use_mm_manual && !wide && !w64 && tsrc0 == GGML_TYPE_MXFP4 && tsrc1 == GGML_TYPE_F32 &&
+    const bool half_id = use_mm_manual && !wide && !w64 && !prec_f32 && !prec_bf16 &&
+                         tsrc0 == GGML_TYPE_MXFP4 && tsrc1 == GGML_TYPE_F32 &&
                          ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat &&
                          TOSH_ENV("TOSH_MMID_HALF_DISABLE") == nullptr;
 
-    snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), wide ? "_w" : "", w64 ? "_w64" : "", half_id ? "_h" : "");
-    snprintf(name, 256, "%s_bci=%d_mm=%d_af=%d", base, bc_inp, use_mm_manual, acc_f32);
+    if (!use_tensor && prec_bf16 && tsrc0 == GGML_TYPE_BF16) {
+        snprintf(base, 256, "kernel_mul_mm_id_bf16_f32");
+    } else if (use_tensor || prec_f32 || prec_bf16) {
+        snprintf(base, 256, "kernel_mul_mm_id%s_%s_%s%s", use_tensor ? "_tensor" : "",
+                 ggml_type_name(tsrc0), ggml_type_name(tsrc1),
+                 prec_f32 ? "_prec_f32" : (prec_bf16 ? "_prec_bf16" : ""));
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), wide ? "_w" : "", w64 ? "_w64" : "", half_id ? "_h" : "");
+    }
+    if (use_tensor) {
+        snprintf(name, 256, "%s_bci=%d", base, bc_inp);
+    } else {
+        snprintf(name, 256, "%s_bci=%d_mm=%d_af=%d", base, bc_inp, use_mm_manual, acc_f32);
+    }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
         ggml_metal_cv_set_bool(cv, bc_inp,        FC_MUL_MM + 0);
-        ggml_metal_cv_set_bool(cv, use_mm_manual, FC_MUL_MM + 8);
-        ggml_metal_cv_set_bool(cv, acc_f32,       FC_MUL_MM + 11);
+        if (!use_tensor) {
+            ggml_metal_cv_set_bool(cv, use_mm_manual, FC_MUL_MM + 8);
+            ggml_metal_cv_set_bool(cv, acc_f32,       FC_MUL_MM + 11);
+        }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 8192;
+    res.smem = prec_f32 ? 16384 : 8192;
     res.nr0  = 64;
     res.nr1  = wide ? 64 : 32;
 
@@ -2802,6 +2867,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
+            } break;
+        case GGML_TYPE_NVFP4:
+            {
+                nsg = N_SG_NVFP4;
+                nr0 = N_R0_NVFP4;
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -4250,6 +4320,71 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d(ggml_met
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_CONV_2D);
+
+    GGML_ASSERT(ggml_is_contiguous(op->src[0]));
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type         == GGML_TYPE_F32);
+
+    char base[256];
+    char name[256];
+
+    const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+
+    if (has_tensor) {
+        // nr0 output positions per threadgroup, nr1 output channels, same tiles as kernel_mul_mm
+        snprintf(base, 256, "kernel_conv_2d_mm_tensor_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
+        snprintf(name, 256, "%s", base);
+
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+        if (!res.pipeline) {
+            res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        }
+
+        res.nr0  = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
+        res.nr1  = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+        res.nsg  = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+        res.smem = res.nr0 * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
+
+        return res;
+    }
+
+    const int nr0 = op->src[0]->ne[3] <= 32 ? 32 : 64;
+    const int nr1 = 2048/nr0;
+
+    snprintf(base, 256, "kernel_conv_2d_mm_%s_%s_%dx%d", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), nr0, nr1);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.nr0 = nr0;
+    res.nr1 = nr1;
+    res.nsg = N_SG_CONV_2D;
+
+    res.smem = nr0*nr1*sizeof(float);
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_mm_reduce(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_CONV_2D);
+    GGML_UNUSED(op);
+
+    const char * name = "kernel_conv_2d_mm_reduce";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
     }
 
     return res;
